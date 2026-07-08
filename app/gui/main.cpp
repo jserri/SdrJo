@@ -1,0 +1,277 @@
+//
+// SdrJo GUI: finestra principale con spettro, waterfall, controllo del
+// dispositivo e gestione dei moduli plugin.
+//
+// NOTA: questa GUI e' pensata per Windows (build con MSVC o MSYS2) ma
+// compila anche su Linux/macOS. Su questo host di sviluppo non e' stata
+// eseguita: vedi README per le istruzioni di build su Windows.
+//
+#include <imgui.h>
+#include <imgui_impl_glfw.h>
+#include <imgui_impl_opengl3.h>
+#include <GLFW/glfw3.h>
+
+#include <sdrjo/dsp/fft.hpp>
+#include <sdrjo/module/module_loader.hpp>
+#include <sdrjo/source/sample_source.hpp>
+#include <sdrjo/source/file_source.hpp>
+#if defined(SDRJO_HAVE_RTLSDR)
+#include <sdrjo/source/rtl_sdr_source.hpp>
+#endif
+#include <sdrjo/util/ring_buffer.hpp>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+namespace {
+
+constexpr size_t kFftSize = 4096;
+constexpr int kWaterfallRows = 256;
+
+struct AppState : public sdrjo::IModuleHost {
+    std::unique_ptr<sdrjo::ISampleSource> source;
+    sdrjo::RingBuffer<sdrjo::cfloat> iqRing{1 << 20};
+
+    double freqMHz = 100.0;
+    double sampleRate = 2.4e6;
+    float gainDb = -1.0f; // <0 = AGC
+
+    std::vector<float> spectrum = std::vector<float>(kFftSize, -120.0f);
+    std::vector<float> waterfall =
+        std::vector<float>(kFftSize * kWaterfallRows, -120.0f);
+    int waterfallHead = 0;
+    GLuint waterfallTex = 0;
+
+    std::vector<sdrjo::LoadedModule> modules;
+    std::vector<std::string> logLines;
+    std::mutex logMutex;
+
+    // ---- IModuleHost ----
+    void log(const std::string& mod, const std::string& text) override
+    {
+        std::lock_guard<std::mutex> lk(logMutex);
+        logLines.push_back("[" + mod + "] " + text);
+        if (logLines.size() > 500)
+            logLines.erase(logLines.begin(), logLines.begin() + 100);
+    }
+
+    void playAudio(const float*, size_t, double) override
+    {
+        // TODO: uscita audio (WASAPI su Windows / miniaudio multipiattaforma).
+    }
+
+    bool requestTune(double freqHz, double rateHz) override
+    {
+        if (!source) return false;
+        source->setCenterFrequency(freqHz);
+        source->setSampleRate(rateHz);
+        freqMHz = freqHz / 1e6;
+        sampleRate = rateHz;
+        return true;
+    }
+};
+
+void updateSpectrum(AppState& app)
+{
+    static std::vector<sdrjo::cfloat> chunk(kFftSize);
+    while (app.iqRing.available() >= kFftSize) {
+        app.iqRing.read(chunk.data(), kFftSize);
+        sdrjo::dsp::powerSpectrumDb(chunk.data(), kFftSize, app.spectrum.data());
+
+        // Riga nel waterfall circolare.
+        std::memcpy(&app.waterfall[size_t(app.waterfallHead) * kFftSize],
+                    app.spectrum.data(), kFftSize * sizeof(float));
+        app.waterfallHead = (app.waterfallHead + 1) % kWaterfallRows;
+
+        // Distribuisci l'IQ anche ai moduli attivi.
+        for (auto& lm : app.modules)
+            lm.module()->processIq(chunk.data(), kFftSize);
+    }
+}
+
+void uploadWaterfallTexture(AppState& app)
+{
+    static std::vector<uint32_t> pixels(kFftSize * kWaterfallRows);
+    auto colorize = [](float db) -> uint32_t {
+        float t = std::clamp((db + 100.0f) / 70.0f, 0.0f, 1.0f);
+        uint8_t r = uint8_t(255.0f * std::clamp(t * 2.5f - 1.2f, 0.0f, 1.0f));
+        uint8_t g = uint8_t(255.0f * std::clamp(t * 2.0f - 0.5f, 0.0f, 1.0f));
+        uint8_t b = uint8_t(255.0f * std::clamp(t * 3.0f, 0.0f, 1.0f) *
+                            (1.0f - 0.5f * t));
+        return 0xFF000000u | (uint32_t(b) << 16) | (uint32_t(g) << 8) | r;
+    };
+    for (int row = 0; row < kWaterfallRows; row++) {
+        int src = (app.waterfallHead + row) % kWaterfallRows;
+        for (size_t x = 0; x < kFftSize; x++)
+            pixels[size_t(row) * kFftSize + x] =
+                colorize(app.waterfall[size_t(src) * kFftSize + x]);
+    }
+    if (!app.waterfallTex) {
+        glGenTextures(1, &app.waterfallTex);
+        glBindTexture(GL_TEXTURE_2D, app.waterfallTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    }
+    glBindTexture(GL_TEXTURE_2D, app.waterfallTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kFftSize, kWaterfallRows, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+}
+
+void drawDevicePanel(AppState& app)
+{
+    ImGui::Begin("Dispositivo");
+
+    if (!app.source) {
+#if defined(SDRJO_HAVE_RTLSDR)
+        auto devices = sdrjo::RtlSdrSource::enumerate();
+        ImGui::Text("RTL-SDR trovate: %zu", devices.size());
+        for (auto& d : devices) {
+            ImGui::BulletText("#%u %s (%s)", d.index, d.name.c_str(),
+                              d.serial.c_str());
+        }
+        if (!devices.empty() && ImGui::Button("Avvia")) {
+            try {
+                auto src = std::make_unique<sdrjo::RtlSdrSource>(devices[0].index);
+                src->setCenterFrequency(app.freqMHz * 1e6);
+                src->setSampleRate(app.sampleRate);
+                src->start([&app](const sdrjo::cfloat* s, size_t n) {
+                    app.iqRing.write(s, n);
+                });
+                app.source = std::move(src);
+            } catch (const std::exception& e) {
+                app.log("Dispositivo", e.what());
+            }
+        }
+#else
+        ImGui::TextWrapped("Compilato senza librtlsdr: disponibile solo la "
+                           "riproduzione da file IQ.");
+#endif
+    } else {
+        ImGui::Text("%s attivo", app.source->name().c_str());
+        double freq = app.freqMHz;
+        if (ImGui::InputDouble("Frequenza (MHz)", &freq, 0.1, 1.0, "%.4f")) {
+            app.freqMHz = freq;
+            app.source->setCenterFrequency(freq * 1e6);
+        }
+        if (ImGui::SliderFloat("Guadagno (dB)", &app.gainDb, -1.0f, 49.6f,
+                               app.gainDb < 0 ? "AGC" : "%.1f")) {
+            app.source->setGain(app.gainDb);
+        }
+        if (ImGui::Button("Ferma")) {
+            app.source->stop();
+            app.source.reset();
+        }
+    }
+    ImGui::End();
+}
+
+void drawSpectrumPanel(AppState& app)
+{
+    ImGui::Begin("Spettro");
+    ImGui::PlotLines("##spettro", app.spectrum.data(), int(kFftSize), 0,
+                     nullptr, -110.0f, 0.0f,
+                     ImVec2(ImGui::GetContentRegionAvail().x, 160));
+    if (app.waterfallTex) {
+        ImGui::Image((ImTextureID)(intptr_t)app.waterfallTex,
+                     ImVec2(ImGui::GetContentRegionAvail().x,
+                            ImGui::GetContentRegionAvail().y));
+    }
+    ImGui::End();
+}
+
+void drawModulesPanel(AppState& app)
+{
+    ImGui::Begin("Moduli");
+    if (app.modules.empty()) {
+        ImGui::TextWrapped("Nessun modulo caricato. Copia i moduli (*.dll) "
+                           "nella cartella 'modules' accanto all'eseguibile.");
+    }
+    for (auto& lm : app.modules) {
+        auto info = lm.module()->info();
+        if (ImGui::CollapsingHeader(info.name.c_str())) {
+            ImGui::TextWrapped("%s", info.description.c_str());
+            ImGui::Text("v%s", info.version.c_str());
+            lm.module()->drawUi();
+        }
+    }
+    ImGui::End();
+}
+
+void drawLogPanel(AppState& app)
+{
+    ImGui::Begin("Log");
+    std::lock_guard<std::mutex> lk(app.logMutex);
+    for (auto& line : app.logLines)
+        ImGui::TextUnformatted(line.c_str());
+    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+        ImGui::SetScrollHereY(1.0f);
+    ImGui::End();
+}
+
+} // namespace
+
+int main(int, char**)
+{
+    if (!glfwInit()) return 1;
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    GLFWwindow* window =
+        glfwCreateWindow(1280, 800, "SdrJo", nullptr, nullptr);
+    if (!window) return 1;
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init("#version 130");
+
+    AppState app;
+
+    // Carica i moduli dalla cartella "modules" accanto all'eseguibile.
+    std::vector<std::string> loadErrors;
+    app.modules = sdrjo::ModuleLoader::loadDirectory("modules", &loadErrors);
+    for (auto& e : loadErrors) app.log("Loader", e);
+    for (auto& lm : app.modules) lm.module()->start(app);
+
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+
+        updateSpectrum(app);
+        uploadWaterfallTexture(app);
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        drawDevicePanel(app);
+        drawSpectrumPanel(app);
+        drawModulesPanel(app);
+        drawLogPanel(app);
+
+        ImGui::Render();
+        int w, h;
+        glfwGetFramebufferSize(window, &w, &h);
+        glViewport(0, 0, w, h);
+        glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(window);
+    }
+
+    for (auto& lm : app.modules) lm.module()->stop();
+    if (app.source) app.source->stop();
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
+}

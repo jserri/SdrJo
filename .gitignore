@@ -1,0 +1,11 @@
+build/
+build-*/
+.vs/
+.vscode/
+*.user
+CMakeUserPresets.json
+
+# Registrazioni IQ (grosse)
+*.bin
+*.iq
+*.wav
