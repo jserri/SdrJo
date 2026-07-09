@@ -51,8 +51,12 @@ non serve toccare l'app principale.
 | Meteor LRPT: Viterbi CCSDS, derandomizer, sync CADU | ✅ implementato e testato |
 | Meteor LRPT: QPSK (Costas + Gardner) | 🔧 scheletro, da tarare su registrazioni reali |
 | Meteor LRPT: Reed-Solomon + immagine JPEG | 📋 da fare (vedi roadmap) |
-| GUI (spettro + waterfall + moduli) | 🔧 scritta, da provare su Windows |
-| Uscita audio | 📋 da fare |
+| GUI (spettro + waterfall + moduli + registratore + replay) | ✅ compila ed e' stata avviata su Linux; da provare su Windows |
+| VFO multipli / canalizzazione per modulo | ✅ implementati e testati |
+| WFM stereo + SSB + ricampionatore razionale + DC/PPM | ✅ implementati e testati |
+| Uscita audio (miniaudio) | ✅ implementata (backend nullo se offline) |
+| Registrazione IQ + replay | ✅ implementati e testati |
+| Installer (CPack NSIS/ZIP) | ✅ configurato |
 
 ## Compilazione su Windows (32 e 64 bit)
 
@@ -108,6 +112,18 @@ LNA esterno si attiva con `RtlSdrSource::setBiasTee(true)`.
   versione del repo e riconfigura da zero (cancella la cartella build).
 - **`_WinMain@16 non risolto`**: risolto, la GUI usa l'entry point
   standard `main()` anche in modalita' finestra.
+
+## Creare l'installer / pacchetto portabile
+
+```bat
+cmake --build build64 --config Release
+cd build64
+cpack -G ZIP            :: SdrJo-x.y.z.zip portabile
+cpack -G NSIS           :: installer .exe (serve NSIS: nsis.sourceforge.io)
+```
+
+Se prima di impacchettare crei una cartella `driver\` nella radice del
+progetto con dentro `rtlsdr.dll` e `libusb-1.0.dll`, finiscono nel pacchetto.
 
 ## Compilazione su Linux (sviluppo/test)
 

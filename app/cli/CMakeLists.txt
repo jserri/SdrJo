@@ -5,3 +5,5 @@ target_link_libraries(sdrjo-cli PRIVATE
     morse-decoder
     lrpt-decoder
 )
+
+install(TARGETS sdrjo-cli RUNTIME DESTINATION .)

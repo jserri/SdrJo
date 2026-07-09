@@ -59,3 +59,23 @@ if(SDRJO_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
 endif()
+
+# ---------------------------------------------------------------------------
+# Pacchetto di installazione: "cpack -G NSIS" (installer .exe, richiede NSIS)
+# oppure "cpack -G ZIP" (archivio portabile). Vedi README.
+# ---------------------------------------------------------------------------
+set(CPACK_PACKAGE_NAME "SdrJo")
+set(CPACK_PACKAGE_VENDOR "SdrJo")
+set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Ricevitore SDR modulare per RTL-SDR")
+set(CPACK_PACKAGE_INSTALL_DIRECTORY "SdrJo")
+set(CPACK_NSIS_MODIFY_PATH OFF)
+set(CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL ON)
+include(CPack)
+
+install(FILES README.md DESTINATION .)
+# Se accanto al progetto c'e' una cartella "driver" con rtlsdr.dll e
+# libusb-1.0.dll (scaricate da rtl-sdr-blog), l'installer le include.
+if(EXISTS ${CMAKE_SOURCE_DIR}/driver)
+    install(DIRECTORY ${CMAKE_SOURCE_DIR}/driver/ DESTINATION .)
+endif()

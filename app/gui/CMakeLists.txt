@@ -43,3 +43,5 @@ if(MSVC)
     # Sottosistema GUI (niente finestra console) mantenendo main() standard.
     set_target_properties(sdrjo PROPERTIES LINK_FLAGS "/ENTRY:mainCRTStartup")
 endif()
+
+install(TARGETS sdrjo RUNTIME DESTINATION .)

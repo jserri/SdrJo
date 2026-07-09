@@ -14,3 +14,5 @@ target_link_libraries(adsb-decoder PUBLIC sdrjo-core)
 add_library(sdrjo_module_adsb MODULE src/adsb_module.cpp)
 target_link_libraries(sdrjo_module_adsb PRIVATE adsb-decoder)
 set_target_properties(sdrjo_module_adsb PROPERTIES PREFIX "")
+
+install(TARGETS sdrjo_module_adsb LIBRARY DESTINATION modules)

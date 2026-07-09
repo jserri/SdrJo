@@ -49,9 +49,23 @@ e per alcune un LNA alimentato dal bias-T integrato.
 
 ## Miglioramenti al core
 
-- Uscita audio multipiattaforma (miniaudio) e demodulatori WFM stereo/SSB.
-- VFO multipli: più moduli in ascolto contemporaneamente nella stessa banda.
-- Ricampionatore razionale (per rate non divisori interi, es. 288k da 2.4M = /8.33).
-- Correzione automatica del DC spike e dell'offset PPM.
-- Pannello di registrazione IQ con replay integrato nella GUI.
-- Pacchetto di installazione Windows (NSIS/MSIX) con driver e moduli inclusi.
+Fatti:
+
+- ✅ Uscita audio multipiattaforma (miniaudio, scaricata automaticamente) e
+  demodulatori **WFM stereo** (pilota 19 kHz) e **SSB** (USB/LSB), testati.
+- ✅ **VFO multipli**: ogni modulo riceve il proprio canale (shift + filtro +
+  decimazione) dal flusso largo; ascolto FM contemporaneo ai decoder.
+- ✅ Ricampionatore **razionale polifase** (L/M automatico, es. 2.4M -> 288k).
+- ✅ **DC blocker** sul flusso IQ e stima dell'offset **PPM** da una portante
+  nota (`dsp::estimatePpm`).
+- ✅ **Registrazione IQ** con metadati e **replay** integrato nella GUI.
+- ✅ Pacchetto di installazione con CPack: `cpack -G NSIS` (installer) o
+  `cpack -G ZIP` (portabile); include i moduli e, se presente la cartella
+  `driver/`, anche le DLL della chiavetta.
+
+Prossimi:
+
+- Squelch e notch regolabili sul canale di ascolto.
+- Click-to-tune sullo spettro (GUI e Cockpit).
+- VFO con offset regolabile per modulo dalla GUI (oggi centrati).
+- MSIX per il Microsoft Store.

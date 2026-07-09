@@ -13,8 +13,13 @@
 
 #include "theme.hpp"
 
+#include <sdrjo/audio/audio_output.hpp>
+#include <sdrjo/dsp/correction.hpp>
 #include <sdrjo/dsp/fft.hpp>
+#include <sdrjo/dsp/vfo.hpp>
+#include <sdrjo/dsp/wfm_stereo.hpp>
 #include <sdrjo/module/module_loader.hpp>
+#include <sdrjo/util/iq_recorder.hpp>
 #include <sdrjo/web/cockpit_server.hpp>
 #include <sdrjo/source/sample_source.hpp>
 #include <sdrjo/source/file_source.hpp>
@@ -55,6 +60,24 @@ struct AppState : public sdrjo::IModuleHost {
     sdrjo::CockpitServer cockpit;
     std::mutex spectrumMutex; // lo spettro e' letto anche dal thread HTTP
 
+    // Canalizzazione: un VFO per ogni modulo che chiede un rate diverso
+    // da quello dell'hardware (piu' moduli in ascolto in parallelo).
+    struct ModuleChannel {
+        std::unique_ptr<sdrjo::dsp::Vfo> vfo; // nullo = passthrough
+        std::vector<sdrjo::cfloat> buf;
+    };
+    std::vector<ModuleChannel> channels;
+
+    sdrjo::dsp::DcBlocker dcBlocker;
+    sdrjo::AudioOutput audio;
+    sdrjo::IqRecorder recorder;
+
+    // Ascolto diretto WFM stereo (indipendente dai moduli).
+    bool listenWfm = false;
+    std::unique_ptr<sdrjo::dsp::Vfo> listenVfo;
+    std::unique_ptr<sdrjo::dsp::WfmStereoDemodulator> wfmDemod;
+    std::vector<float> audioL, audioR, audioInterleaved;
+
     // ---- IModuleHost ----
     void log(const std::string& mod, const std::string& text) override
     {
@@ -64,9 +87,10 @@ struct AppState : public sdrjo::IModuleHost {
             logLines.erase(logLines.begin(), logLines.begin() + 100);
     }
 
-    void playAudio(const float*, size_t, double) override
+    void playAudio(const float* samples, size_t n, double rateHz) override
     {
-        // TODO: uscita audio (WASAPI su Windows / miniaudio multipiattaforma).
+        if (!audio.isActive()) audio.start(rateHz, 2);
+        audio.writeMono(samples, n);
     }
 
     bool requestTune(double freqHz, double rateHz) override
@@ -75,16 +99,39 @@ struct AppState : public sdrjo::IModuleHost {
         source->setCenterFrequency(freqHz);
         source->setSampleRate(rateHz);
         freqMHz = freqHz / 1e6;
-        sampleRate = rateHz;
+        if (rateHz != sampleRate) {
+            sampleRate = rateHz;
+            channelsDirty = true; // i VFO vanno riprogettati
+        }
         return true;
     }
+
+    bool channelsDirty = false;
 };
+
+// (Ri)costruisce i VFO dei moduli per il sample rate corrente.
+void rebuildChannels(AppState& app)
+{
+    app.channels.clear();
+    for (auto& lm : app.modules) {
+        AppState::ModuleChannel ch;
+        double want = lm.module()->info().requiredSampleRateHz;
+        if (want > 0 && want < app.sampleRate * 0.999) {
+            ch.vfo = std::make_unique<sdrjo::dsp::Vfo>(app.sampleRate, want,
+                                                       0.0);
+        }
+        app.channels.push_back(std::move(ch));
+    }
+}
 
 void updateSpectrum(AppState& app)
 {
     static std::vector<sdrjo::cfloat> chunk(kFftSize);
     while (app.iqRing.available() >= kFftSize) {
         app.iqRing.read(chunk.data(), kFftSize);
+        app.dcBlocker.processInPlace(chunk.data(), kFftSize);
+        if (app.recorder.isRecording())
+            app.recorder.write(chunk.data(), kFftSize);
         {
             std::lock_guard<std::mutex> lk(app.spectrumMutex);
             sdrjo::dsp::powerSpectrumDb(chunk.data(), kFftSize,
@@ -96,9 +143,38 @@ void updateSpectrum(AppState& app)
                     app.spectrum.data(), kFftSize * sizeof(float));
         app.waterfallHead = (app.waterfallHead + 1) % kWaterfallRows;
 
-        // Distribuisci l'IQ anche ai moduli attivi.
-        for (auto& lm : app.modules)
-            lm.module()->processIq(chunk.data(), kFftSize);
+        // Distribuisci a ogni modulo il SUO canale (VFO dedicato).
+        for (size_t m = 0; m < app.modules.size(); m++) {
+            auto& ch = app.channels[m];
+            if (ch.vfo) {
+                ch.buf.clear();
+                ch.vfo->process(chunk.data(), kFftSize, ch.buf);
+                if (!ch.buf.empty())
+                    app.modules[m].module()->processIq(ch.buf.data(),
+                                                       ch.buf.size());
+            } else {
+                app.modules[m].module()->processIq(chunk.data(), kFftSize);
+            }
+        }
+
+        // Ascolto diretto WFM stereo.
+        if (app.listenWfm && app.listenVfo && app.wfmDemod) {
+            static std::vector<sdrjo::cfloat> lchan;
+            lchan.clear();
+            app.listenVfo->process(chunk.data(), kFftSize, lchan);
+            app.audioL.clear();
+            app.audioR.clear();
+            app.wfmDemod->process(lchan.data(), lchan.size(), app.audioL,
+                                  app.audioR);
+            if (!app.audio.isActive()) app.audio.start(48000.0, 2);
+            app.audioInterleaved.resize(app.audioL.size() * 2);
+            for (size_t i = 0; i < app.audioL.size(); i++) {
+                app.audioInterleaved[2 * i] = app.audioL[i];
+                app.audioInterleaved[2 * i + 1] = app.audioR[i];
+            }
+            app.audio.write(app.audioInterleaved.data(),
+                            app.audioInterleaved.size());
+        }
     }
 }
 
@@ -132,6 +208,8 @@ void uploadWaterfallTexture(AppState& app)
 
 void drawDevicePanel(AppState& app)
 {
+    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(330, 430), ImGuiCond_FirstUseEver);
     ImGui::Begin("Dispositivo");
 
     if (!app.source) {
@@ -178,12 +256,66 @@ void drawDevicePanel(AppState& app)
             app.source->stop();
             app.source.reset();
         }
+
+        ImGui::SeparatorText("Ascolto");
+        if (ImGui::Checkbox("Radio FM stereo (centro banda)", &app.listenWfm)) {
+            if (app.listenWfm) {
+                app.listenVfo = std::make_unique<sdrjo::dsp::Vfo>(
+                    app.sampleRate, 240000.0, 0.0);
+                app.wfmDemod =
+                    std::make_unique<sdrjo::dsp::WfmStereoDemodulator>();
+            } else {
+                app.listenVfo.reset();
+                app.wfmDemod.reset();
+            }
+        }
+        if (app.listenWfm && app.wfmDemod) {
+            ImGui::SameLine();
+            ImGui::TextDisabled(app.wfmDemod->stereoLocked() ? "STEREO"
+                                                             : "mono");
+        }
+
+        ImGui::SeparatorText("Registrazione IQ");
+        if (!app.recorder.isRecording()) {
+            if (ImGui::Button("Registra")) {
+                char name[64];
+                std::snprintf(name, sizeof(name), "sdrjo_%.4fMHz.bin",
+                              app.freqMHz);
+                app.recorder.start(name, app.freqMHz * 1e6, app.sampleRate);
+            }
+        } else {
+            if (ImGui::Button("Stop registrazione")) app.recorder.stop();
+            ImGui::SameLine();
+            ImGui::Text("%s  %.1f s (%.1f MB)", app.recorder.path().c_str(),
+                        app.recorder.secondsWritten(),
+                        double(app.recorder.bytesWritten()) / 1e6);
+        }
+    }
+
+    // Replay di una registrazione (disponibile anche senza hardware).
+    if (!app.source) {
+        ImGui::SeparatorText("Riproduci registrazione");
+        static char replayPath[260] = "";
+        ImGui::InputText("file IQ", replayPath, sizeof(replayPath));
+        if (ImGui::Button("Riproduci") && replayPath[0]) {
+            auto src = std::make_unique<sdrjo::FileSource>(replayPath,
+                                                           app.sampleRate);
+            src->setCenterFrequency(app.freqMHz * 1e6);
+            src->start([&app](const sdrjo::cfloat* s, size_t n) {
+                app.iqRing.write(s, n);
+            });
+            app.source = std::move(src);
+        }
     }
     ImGui::End();
 }
 
 void drawSpectrumPanel(AppState& app)
 {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(350, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - 360, 520),
+                             ImGuiCond_FirstUseEver);
     ImGui::Begin("Spettro");
     ImGui::PlotLines("##spettro", app.spectrum.data(), int(kFftSize), 0,
                      nullptr, -110.0f, 0.0f,
@@ -198,6 +330,10 @@ void drawSpectrumPanel(AppState& app)
 
 void drawModulesPanel(AppState& app)
 {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(10, 450), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(330, vp->WorkSize.y - 460),
+                             ImGuiCond_FirstUseEver);
     ImGui::Begin("Moduli");
     if (app.modules.empty()) {
         ImGui::TextWrapped("Nessun modulo caricato. Copia i moduli (*.dll) "
@@ -221,6 +357,11 @@ void drawModulesPanel(AppState& app)
 
 void drawLogPanel(AppState& app)
 {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(350, 540), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - 360,
+                                    vp->WorkSize.y - 550),
+                             ImGuiCond_FirstUseEver);
     ImGui::Begin("Log");
     std::lock_guard<std::mutex> lk(app.logMutex);
     for (auto& line : app.logLines)
@@ -257,6 +398,7 @@ int main(int, char**)
         sdrjo::ModuleLoader::defaultModulesDir(), &loadErrors);
     for (auto& e : loadErrors) app.log("Loader", e);
     for (auto& lm : app.modules) lm.module()->start(app);
+    rebuildChannels(app);
 
     // Cockpit web: la plancia di SdrJo, anche per tablet/telefono in LAN.
     app.cockpit.setStatusProvider([&app] {
@@ -283,6 +425,10 @@ int main(int, char**)
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
+        if (app.channelsDirty) {
+            rebuildChannels(app);
+            app.channelsDirty = false;
+        }
         updateSpectrum(app);
         uploadWaterfallTexture(app);
         app.cockpit.setDeviceInfo(

@@ -45,3 +45,11 @@ add_test(NAME cockpit COMMAND test_cockpit)
 add_executable(test_sources test_sources.cpp)
 target_link_libraries(test_sources PRIVATE sdrjo-core)
 add_test(NAME sources COMMAND test_sources)
+
+add_executable(test_dsp_advanced test_dsp_advanced.cpp)
+target_link_libraries(test_dsp_advanced PRIVATE sdrjo-core)
+add_test(NAME dsp_advanced COMMAND test_dsp_advanced)
+
+add_executable(test_recorder_audio test_recorder_audio.cpp)
+target_link_libraries(test_recorder_audio PRIVATE sdrjo-core)
+add_test(NAME recorder_audio COMMAND test_recorder_audio)
