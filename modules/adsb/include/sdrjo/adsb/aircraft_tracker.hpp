@@ -17,6 +17,8 @@ struct Aircraft {
     std::string callsign;
     bool hasPosition = false;
     double latDeg = 0.0, lonDeg = 0.0;
+    // Scia: ultime posizioni note, per disegnare la traiettoria sulla mappa.
+    std::vector<Position> trail;
     int altitudeFt = 0;
     bool hasAltitude = false;
     double groundSpeedKt = 0.0;

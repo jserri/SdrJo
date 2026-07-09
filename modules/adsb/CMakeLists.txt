@@ -3,6 +3,8 @@ add_library(adsb-decoder STATIC
     src/mode_s.cpp
     src/preamble_detector.cpp
     src/aircraft_tracker.cpp
+    src/adsb_json.cpp
+    src/adsb_web_page.cpp
 )
 target_include_directories(adsb-decoder PUBLIC include)
 target_link_libraries(adsb-decoder PUBLIC sdrjo-core)

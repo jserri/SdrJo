@@ -3,7 +3,12 @@ add_library(sdrjo-core STATIC
     src/dsp/fir_filter.cpp
     src/dsp/demod.cpp
     src/module/module_loader.cpp
+    src/util/http_server.cpp
 )
+
+if(WIN32)
+    target_link_libraries(sdrjo-core PUBLIC ws2_32)
+endif()
 
 target_include_directories(sdrjo-core PUBLIC include)
 

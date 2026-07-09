@@ -6,9 +6,12 @@ e per alcune un LNA alimentato dal bias-T integrato.
 
 ## In lavorazione
 
-- **ADS-B (1090 MHz)** — funzionante a livello decoder. Prossimi passi:
-  mappa degli aerei nella GUI, correzione errori a 1 bit sul CRC, uscita in
-  formato SBS/BaseStation per alimentare altri programmi.
+- **ADS-B (1090 MHz)** — decoder e **mappa web dei voli** funzionanti
+  (icone orientate, scie, cerchi di portata, distanza/rilevamento
+  dall'antenna). Prossimi passi: correzione errori a 1 bit sul CRC,
+  uscita in formato SBS/BaseStation (porta 30003) per alimentare altri
+  programmi, foto/dati aereo da database ICAO offline, grafico polare
+  della portata dell'antenna.
 - **Morse (CW)** — funzionante. Prossimi passi: filtro audio stretto attorno
   al tono con Goertzel, waterfall audio nella GUI.
 - **Meteor-M LRPT (137.1 / 137.9 MHz)** — Viterbi, derandomizer e sync CADU

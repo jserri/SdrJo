@@ -3,6 +3,7 @@
 // rileva i frame Mode S e mantiene la tabella degli aerei.
 //
 #include <sdrjo/module/module.hpp>
+#include "sdrjo/adsb/adsb_server.hpp"
 #include "sdrjo/adsb/aircraft_tracker.hpp"
 #include "sdrjo/adsb/preamble_detector.hpp"
 
@@ -36,9 +37,24 @@ public:
         host_ = &host;
         host.requestTune(1090e6, PreambleDetector::kSampleRateHz);
         host.log("ADS-B", "in ascolto su 1090 MHz");
+
+        // Avvia la mappa web dei voli (stile SDRAngel / tar1090).
+        web_ = std::make_unique<AdsbWebServer>(tracker_, mutex_);
+        if (web_->start()) {
+            host.log("ADS-B", "mappa voli su http://localhost:" +
+                                  std::to_string(web_->port()));
+        } else {
+            host.log("ADS-B", "porta web occupata: mappa non disponibile");
+            web_.reset();
+        }
     }
 
-    void stop() override { host_ = nullptr; }
+    void stop() override
+    {
+        if (web_) web_->stop();
+        web_.reset();
+        host_ = nullptr;
+    }
 
     void processIq(const cfloat* samples, size_t n) override
     {
@@ -74,6 +90,7 @@ private:
     PreambleDetector detector_;
     AircraftTracker tracker_;
     std::mutex mutex_;
+    std::unique_ptr<AdsbWebServer> web_;
 };
 
 } // namespace sdrjo::adsb

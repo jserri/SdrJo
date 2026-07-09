@@ -1,5 +1,7 @@
 #include "sdrjo/adsb/aircraft_tracker.hpp"
 
+#include <sdrjo/util/geo.hpp>
+
 namespace sdrjo::adsb {
 
 void AircraftTracker::update(const ModeSMessage& msg)
@@ -54,6 +56,16 @@ void AircraftTracker::update(const ModeSMessage& msg)
                     ac.latDeg = pos->latDeg;
                     ac.lonDeg = pos->lonDeg;
                     ac.hasPosition = true;
+
+                    // Aggiorna la scia se ci si e' spostati di almeno ~100 m.
+                    if (ac.trail.empty() ||
+                        geo::haversineKm(ac.trail.back().latDeg,
+                                         ac.trail.back().lonDeg,
+                                         pos->latDeg, pos->lonDeg) > 0.1) {
+                        ac.trail.push_back(*pos);
+                        if (ac.trail.size() > 200)
+                            ac.trail.erase(ac.trail.begin());
+                    }
                 }
             }
         }

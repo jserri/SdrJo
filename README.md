@@ -31,6 +31,7 @@ non serve toccare l'app principale.
 | API moduli plugin + loader dinamico | ✅ implementato |
 | Sorgente RTL-SDR (V3/V4) e da file IQ | ✅ implementato (V4: vedi nota driver) |
 | ADS-B: preambolo, CRC, callsign, posizione CPR, velocità | ✅ implementato e testato |
+| ADS-B: mappa web dei voli (stile SDRAngel/tar1090) | ✅ implementata e testata |
 | Morse: decoder adattivo (velocità e pitch qualsiasi) | ✅ implementato e testato |
 | Meteor LRPT: Viterbi CCSDS, derandomizer, sync CADU | ✅ implementato e testato |
 | Meteor LRPT: QPSK (Costas + Gardner) | 🔧 scheletro, da tarare su registrazioni reali |
@@ -77,6 +78,25 @@ ADS-B) si attiva da `RtlSdrSource::setBiasTee(true)`.
 cmake -B build && cmake --build build -j4
 ctest --test-dir build            # esegue i test
 ```
+
+## Mappa dei voli (stile SDRAngel)
+
+Il modulo ADS-B include un'interfaccia web con **mappa scura Leaflet, icone
+degli aerei orientate con la rotta, scie, cerchi di portata attorno
+all'antenna** e tabella dei voli con quota, velocità, distanza e rilevamento.
+Si apre su `http://localhost:8757` e viene avviata automaticamente dal modulo
+nella GUI, oppure dalla CLI:
+
+```sh
+# In diretta con la RTL-SDR (lat/lon = posizione della tua antenna):
+rtl_sdr -f 1090000000 -s 2000000 - | sdrjo-cli adsb-serve - 45.4642 9.1900
+
+# Oppure replay di una registrazione:
+sdrjo-cli adsb-serve cattura.bin 45.4642 9.1900
+```
+
+La pagina usa Leaflet e i tile da CDN: serve internet nel browser; senza
+rete la tabella dei voli continua comunque a funzionare.
 
 ## Prova rapida senza hardware
 

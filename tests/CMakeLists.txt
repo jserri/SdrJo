@@ -17,3 +17,11 @@ add_test(NAME dsp COMMAND test_dsp)
 add_executable(test_adsb_rf test_adsb_rf.cpp)
 target_link_libraries(test_adsb_rf PRIVATE adsb-decoder)
 add_test(NAME adsb_rf COMMAND test_adsb_rf)
+
+add_executable(test_geo test_geo.cpp)
+target_link_libraries(test_geo PRIVATE sdrjo-core)
+add_test(NAME geo COMMAND test_geo)
+
+add_executable(test_adsb_server test_adsb_server.cpp)
+target_link_libraries(test_adsb_server PRIVATE adsb-decoder)
+add_test(NAME adsb_server COMMAND test_adsb_server)
