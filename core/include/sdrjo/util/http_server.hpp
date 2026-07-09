@@ -25,6 +25,11 @@ public:
     void route(const std::string& path, const std::string& contentType,
                Handler handler);
 
+    // Protegge TUTTE le rotte con HTTP Basic Auth (password vuota = off).
+    // Nota: Basic Auth su HTTP in chiaro va bene in LAN; per l'accesso da
+    // internet usare una VPN (vedi README, sezione accesso remoto).
+    void setAuth(const std::string& username, const std::string& password);
+
     // Avvia il server. port = 0 sceglie una porta libera (vedi port()).
     // bindAll = true ascolta su tutte le interfacce (visibile in LAN).
     bool start(uint16_t port, bool bindAll = false);
@@ -43,6 +48,7 @@ private:
     void handleClient(intptr_t clientFd);
 
     std::map<std::string, Route> routes_;
+    std::string authToken_; // base64(user:pass); vuoto = nessuna auth
     intptr_t listenFd_ = -1;
     uint16_t port_ = 0;
     std::thread worker_;

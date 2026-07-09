@@ -42,6 +42,12 @@ public:
     void setTuneHandler(TuneHandler h) { tune_ = std::move(h); }
     void setDeviceInfo(const std::string& name, double freqHz, double rateHz);
 
+    // Password per l'accesso (utente "sdrjo"); vuota = nessuna protezione.
+    void setPassword(const std::string& password)
+    {
+        server_.setAuth("sdrjo", password);
+    }
+
     bool start(uint16_t port = kDefaultPort, bool bindAll = false);
     void stop();
     uint16_t port() const { return server_.port(); }

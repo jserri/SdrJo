@@ -49,6 +49,11 @@ constexpr int kWaterfallRows = 256;
 const char* kListenModeNames[] = {"Spento", "WFM stereo", "NFM",
                                   "AM", "USB", "LSB"};
 
+// Font caricati all'avvio (nullptr = fallback al font di default).
+ImFont* gFontUi = nullptr;
+ImFont* gFontMonoBig = nullptr;   // frequenzimetro
+ImFont* gFontMonoSmall = nullptr; // etichette S-meter
+
 struct AppState : public sdrjo::IModuleHost {
     std::unique_ptr<sdrjo::ISampleSource> source;
     sdrjo::RingBuffer<sdrjo::cfloat> iqRing{1 << 20};
@@ -436,7 +441,7 @@ void uploadWaterfallTexture(AppState& app)
 void drawDevicePanel(AppState& app)
 {
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(330, 360), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(330, 300), ImGuiCond_FirstUseEver);
     ImGui::Begin("Dispositivo");
 
     if (!app.source) {
@@ -578,6 +583,158 @@ void drawDevicePanel(AppState& app)
     ImGui::End();
 }
 
+// Applica la frequenza del visore: VFO se dentro lo span, altrimenti
+// risintonizza l'hardware.
+void applyTunedFrequency(AppState& app, double f)
+{
+    f = std::clamp(f, 0.0, 1.999e9);
+    double center = app.freqMHz * 1e6;
+    if (app.source && std::fabs(f - center) < app.sampleRate * 0.45) {
+        app.listenOffsetHz = f - center;
+    } else {
+        app.freqMHz = f / 1e6;
+        if (app.source) app.source->setCenterFrequency(f);
+        app.listenOffsetHz = 0.0;
+    }
+    if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
+}
+
+// Frequenzimetro a cifre stile SDR Console: rotellina su una cifra per
+// incrementarla/decrementarla, click sulla meta' alta = +, bassa = -.
+void drawFrequencyDial(AppState& app)
+{
+    ImFont* font = gFontMonoBig ? gFontMonoBig : ImGui::GetFont();
+    const float fh = gFontMonoBig ? gFontMonoBig->FontSize
+                                  : ImGui::GetFontSize() * 1.8f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+
+    int64_t f = int64_t(std::llround(app.freqMHz * 1e6 + app.listenOffsetHz));
+    f = std::clamp<int64_t>(f, 0, 1999999999);
+
+    const float charW = font->CalcTextSizeA(fh, FLT_MAX, 0, "0").x;
+    const float sepW = charW * 0.5f;
+    const ImU32 colLit = ImGui::GetColorU32(ImVec4(0.22f, 0.71f, 1.0f, 1.0f));
+    const ImU32 colDim = ImGui::GetColorU32(ImVec4(0.25f, 0.32f, 0.40f, 1.0f));
+    const ImU32 colHov = ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 1.0f));
+
+    // Centra il visore nella finestra.
+    float totalW = 10 * charW + 3 * sepW + charW * 2.2f;
+    float x = origin.x +
+              std::max(0.0f, (ImGui::GetContentRegionAvail().x - totalW) / 2);
+    float y = origin.y;
+
+    bool seenNonZero = false;
+    int64_t place = 1000000000;
+    ImVec2 mouse = ImGui::GetIO().MousePos;
+    for (int i = 0; i < 10; i++) {
+        int digit = int((f / place) % 10);
+        if (digit != 0) seenNonZero = true;
+
+        bool hov = mouse.x >= x && mouse.x < x + charW && mouse.y >= y &&
+                   mouse.y < y + fh && ImGui::IsWindowHovered();
+        char c = char('0' + digit);
+        dl->AddText(font, fh, ImVec2(x, y),
+                    hov ? colHov : (seenNonZero ? colLit : colDim), &c,
+                    &c + 1);
+        if (hov) {
+            dl->AddLine(ImVec2(x, y + fh + 1), ImVec2(x + charW, y + fh + 1),
+                        colHov, 2.0f);
+            float wheel = ImGui::GetIO().MouseWheel;
+            int64_t delta = 0;
+            if (wheel != 0.0f) delta = int64_t(wheel) * place;
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+                delta = (mouse.y < y + fh / 2) ? place : -place;
+            if (delta != 0)
+                applyTunedFrequency(app, double(f + delta));
+        }
+        x += charW;
+        if (i == 0 || i == 3 || i == 6) {
+            dl->AddText(font, fh, ImVec2(x, y), colDim, ".");
+            x += sepW;
+        }
+        place /= 10;
+    }
+    dl->AddText(nullptr, 0, ImVec2(x + 6, y + fh * 0.45f),
+                ImGui::GetColorU32(ImVec4(0.46f, 0.52f, 0.60f, 1.0f)), "Hz");
+
+    ImGui::Dummy(ImVec2(totalW, fh + 6.0f));
+}
+
+// S-meter analogico "d'epoca": quadrante crema, zona rossa oltre S9,
+// lancetta smorzata pilotata dal livello del canale di ascolto.
+void drawSMeter(AppState& app)
+{
+    static float needle = 0.0f;
+    float target = std::clamp((app.chanLevelDb + 120.0f) / 120.0f, 0.0f, 1.0f);
+    needle += 0.12f * (target - needle);
+
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float h = 120.0f;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // Cornice scura e quadrante crema.
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h),
+                      IM_COL32(28, 24, 20, 255), 8.0f);
+    dl->AddRectFilled(ImVec2(p.x + 5, p.y + 5),
+                      ImVec2(p.x + w - 5, p.y + h - 5),
+                      IM_COL32(238, 229, 203, 255), 6.0f);
+
+    const ImVec2 pivot(p.x + w * 0.5f, p.y + h - 16.0f);
+    const float radius = std::min(w * 0.44f, h - 42.0f);
+    auto tip = [&](float t, float r) {
+        float ang = (-50.0f + 100.0f * t) * 3.14159265f / 180.0f;
+        return ImVec2(pivot.x + r * std::sin(ang), pivot.y - r * std::cos(ang));
+    };
+
+    // Arco della scala: nero fino a S9 (t=0.55), rosso oltre.
+    for (int seg = 0; seg < 40; seg++) {
+        float t0 = seg / 40.0f, t1 = (seg + 1) / 40.0f;
+        ImU32 col = (t0 >= 0.55f) ? IM_COL32(178, 34, 34, 255)
+                                  : IM_COL32(30, 26, 22, 255);
+        dl->AddLine(tip(t0, radius), tip(t1, radius), col,
+                    t0 >= 0.55f ? 3.5f : 2.0f);
+    }
+
+    // Tacche e numeri: S1..S9, poi +20/+40/+60 dB.
+    ImFont* small = gFontMonoSmall ? gFontMonoSmall : ImGui::GetFont();
+    float smallSize = gFontMonoSmall ? gFontMonoSmall->FontSize : 12.0f;
+    for (int k = 1; k <= 9; k += 2) {
+        float t = 0.55f * float(k) / 9.0f;
+        dl->AddLine(tip(t, radius - 5), tip(t, radius + 3),
+                    IM_COL32(30, 26, 22, 255), 2.0f);
+        char lbl[4];
+        std::snprintf(lbl, sizeof(lbl), "%d", k);
+        ImVec2 lp = tip(t, radius - 15); // etichette dentro l'arco
+        dl->AddText(small, smallSize, ImVec2(lp.x - 4, lp.y - 6),
+                    IM_COL32(30, 26, 22, 255), lbl);
+    }
+    const float tOver[3] = {0.7f, 0.85f, 1.0f};
+    const char* lblOver[3] = {"+20", "+40", "+60"};
+    for (int k = 0; k < 3; k++) {
+        dl->AddLine(tip(tOver[k], radius - 5), tip(tOver[k], radius + 3),
+                    IM_COL32(178, 34, 34, 255), 2.0f);
+        ImVec2 lp = tip(tOver[k], radius - 17);
+        dl->AddText(small, smallSize, ImVec2(lp.x - 9, lp.y - 6),
+                    IM_COL32(178, 34, 34, 255), lblOver[k]);
+    }
+
+    // Scritte del quadrante e lancetta.
+    dl->AddText(small, smallSize, ImVec2(p.x + 14, p.y + h - 24),
+                IM_COL32(30, 26, 22, 200), "S-METER");
+    char dbLbl[24];
+    std::snprintf(dbLbl, sizeof(dbLbl), "%.0f dB", double(app.chanLevelDb));
+    dl->AddText(small, smallSize, ImVec2(p.x + w - 60, p.y + h - 24),
+                IM_COL32(30, 26, 22, 200), dbLbl);
+
+    dl->AddLine(pivot, tip(needle, radius - 4), IM_COL32(150, 20, 20, 255),
+                2.4f);
+    dl->AddCircleFilled(pivot, 5.5f, IM_COL32(30, 26, 22, 255));
+
+    ImGui::Dummy(ImVec2(w, h + 4.0f));
+}
+
 // Passo "bello" per le tacche di frequenza (1/2/5 * 10^k).
 double niceStep(double raw)
 {
@@ -613,6 +770,9 @@ void drawSpectrumPanel(AppState& app)
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - 360, 520),
                              ImGuiCond_FirstUseEver);
     ImGui::Begin("Spettro");
+
+    // Frequenza sintonizzata: cifre cliccabili e scrollabili.
+    drawFrequencyDial(app);
 
     // Leve di regolazione (contrasto, velocita', memoria, palette).
     if (ImGui::CollapsingHeader("Regolazioni waterfall",
@@ -860,9 +1020,11 @@ void drawSpectrumPanel(AppState& app)
 
 void drawReceiverPanel(AppState& app)
 {
-    ImGui::SetNextWindowPos(ImVec2(10, 380), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(330, 330), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(10, 320), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(330, 420), ImGuiCond_FirstUseEver);
     ImGui::Begin("Ricevitore");
+
+    drawSMeter(app);
 
     int mode = int(app.listenMode);
     if (ImGui::Combo("Demodulatore", &mode, kListenModeNames, 6)) {
@@ -1022,8 +1184,8 @@ void drawFrequenciesPanel(AppState& app)
 
 void drawAudioPanel(AppState& app)
 {
-    ImGui::SetNextWindowPos(ImVec2(10, 720), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(330, 170), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(10, 750), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(330, 190), ImGuiCond_FirstUseEver);
     ImGui::Begin("Audio");
 
     ImGui::TextDisabled("backend: %s", app.audio.backendName().c_str());
@@ -1060,6 +1222,34 @@ void drawAudioPanel(AppState& app)
         app.audioRateHz = kAudioRates[aIdx];
         app.audio.stop();
     }
+
+    // ---- Accesso remoto al Cockpit (LAN, con password) ----
+    ImGui::SeparatorText("Accesso remoto");
+    static bool lanEnabled = false;
+    static char lanPass[64] = "";
+    ImGui::Checkbox("Esponi il Cockpit in LAN", &lanEnabled);
+    ImGui::InputText("Password", lanPass, sizeof(lanPass),
+                     ImGuiInputTextFlags_Password);
+    if (lanEnabled && lanPass[0] == '\0') {
+        ImGui::TextColored(ImVec4(1.0f, 0.71f, 0.33f, 1.0f),
+                           "Serve una password per esporre in LAN.");
+    }
+    if (ImGui::Button("Applica##remoto")) {
+        if (lanEnabled && lanPass[0] == '\0') {
+            app.log("Cockpit", "password obbligatoria per la LAN: non applicato");
+        } else {
+            app.cockpit.stop();
+            app.cockpit.setPassword(lanPass);
+            bool ok = app.cockpit.start(sdrjo::CockpitServer::kDefaultPort,
+                                        lanEnabled);
+            app.log("Cockpit",
+                    !ok ? std::string("errore nel riavvio del server")
+                        : (lanEnabled
+                               ? "esposto in LAN sulla porta 8750 (utente sdrjo)"
+                               : "raggiungibile solo da questo PC"));
+        }
+    }
+    ImGui::TextDisabled("utente: sdrjo - da internet usa una VPN (README)");
     ImGui::End();
 }
 
@@ -1122,6 +1312,28 @@ int main(int argc, char** argv)
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     sdrjo::gui::applyTheme();
+
+    // Font moderni dalla cartella fonts/ accanto all'eseguibile.
+    {
+        ImGuiIO& io = ImGui::GetIO();
+        namespace fs = std::filesystem;
+        fs::path fontDir =
+            fs::path(sdrjo::ModuleLoader::defaultModulesDir()).parent_path() /
+            "fonts";
+        fs::path roboto = fontDir / "Roboto-Medium.ttf";
+        fs::path cousine = fontDir / "Cousine-Regular.ttf";
+        if (fs::exists(roboto))
+            gFontUi = io.Fonts->AddFontFromFileTTF(roboto.string().c_str(),
+                                                   17.0f);
+        if (fs::exists(cousine)) {
+            gFontMonoBig = io.Fonts->AddFontFromFileTTF(
+                cousine.string().c_str(), 34.0f);
+            gFontMonoSmall = io.Fonts->AddFontFromFileTTF(
+                cousine.string().c_str(), 13.0f);
+        }
+        if (gFontUi) io.FontDefault = gFontUi;
+    }
+
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
 

@@ -125,6 +125,31 @@ cpack -G NSIS           :: installer .exe (serve NSIS: nsis.sourceforge.io)
 Se prima di impacchettare crei una cartella `driver\` nella radice del
 progetto con dentro `rtlsdr.dll` e `libusb-1.0.dll`, finiscono nel pacchetto.
 
+## Accesso remoto (usare la radio fuori casa)
+
+Il Cockpit puo' essere esposto oltre il PC locale dal pannello
+**Audio > Accesso remoto**: spunta "Esponi il Cockpit in LAN", imposta una
+**password** (obbligatoria) e premi Applica. Da quel momento
+`http://IP-del-PC:8750` e' raggiungibile dagli altri dispositivi della rete
+di casa (utente `sdrjo` + la tua password, HTTP Basic Auth).
+
+**Per l'accesso da fuori casa la strada sicura e' una VPN**, non l'apertura
+della porta sul router:
+
+1. **Tailscale** (consigliato, gratuito per uso personale): installalo sul
+   PC con SdrJo e sul telefono/portatile; i due dispositivi si vedono su una
+   rete privata cifrata (WireGuard) senza toccare il router. Da fuori apri
+   `http://100.x.y.z:8750` con l'IP Tailscale del PC.
+2. **WireGuard/OpenVPN sul router**, se il tuo router lo supporta: stesso
+   principio, gestito da te.
+3. **Da evitare**: il port-forwarding diretto della 8750 su internet. La
+   password Basic Auth viaggia su HTTP in chiaro: fuori dalla LAN va sempre
+   incapsulata in una VPN o dietro un reverse proxy HTTPS (es. Caddy).
+
+Nota bene: la chiavetta e' solo in ricezione, quindi il rischio e' limitato
+all'accesso a cio' che ricevi e ai controlli dell'app — ma la password e la
+VPN restano il minimo indispensabile.
+
 ## Compilazione su Linux (sviluppo/test)
 
 ```sh

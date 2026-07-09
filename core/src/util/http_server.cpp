@@ -42,6 +42,43 @@ void HttpServer::route(const std::string& path, const std::string& contentType,
     routes_[path] = Route{contentType, std::move(handler)};
 }
 
+static std::string base64Encode(const std::string& in)
+{
+    static const char* kTab =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    size_t i = 0;
+    while (i + 2 < in.size()) {
+        uint32_t v = (uint8_t(in[i]) << 16) | (uint8_t(in[i + 1]) << 8) |
+                     uint8_t(in[i + 2]);
+        out += kTab[(v >> 18) & 63];
+        out += kTab[(v >> 12) & 63];
+        out += kTab[(v >> 6) & 63];
+        out += kTab[v & 63];
+        i += 3;
+    }
+    if (i + 1 == in.size()) {
+        uint32_t v = uint8_t(in[i]) << 16;
+        out += kTab[(v >> 18) & 63];
+        out += kTab[(v >> 12) & 63];
+        out += "==";
+    } else if (i + 2 == in.size()) {
+        uint32_t v = (uint8_t(in[i]) << 16) | (uint8_t(in[i + 1]) << 8);
+        out += kTab[(v >> 18) & 63];
+        out += kTab[(v >> 12) & 63];
+        out += kTab[(v >> 6) & 63];
+        out += '=';
+    }
+    return out;
+}
+
+void HttpServer::setAuth(const std::string& username,
+                         const std::string& password)
+{
+    authToken_ = password.empty() ? std::string()
+                                  : base64Encode(username + ":" + password);
+}
+
 bool HttpServer::start(uint16_t port, bool bindAll)
 {
     if (running_.load()) return false;
@@ -127,6 +164,26 @@ void HttpServer::handleClient(intptr_t clientFd)
         // Ignora la query string.
         auto q = path.find('?');
         if (q != std::string::npos) path.resize(q);
+    }
+
+    // Autenticazione (se configurata): confronto diretto del token Basic.
+    if (!authToken_.empty()) {
+        bool ok = false;
+        if (const char* h = std::strstr(buf, "Authorization: Basic ")) {
+            h += 21;
+            std::string tok;
+            while (*h && *h != '\r' && *h != '\n' && *h != ' ') tok += *h++;
+            ok = (tok == authToken_);
+        }
+        if (!ok) {
+            const char* resp =
+                "HTTP/1.1 401 Unauthorized\r\n"
+                "WWW-Authenticate: Basic realm=\"SdrJo\"\r\n"
+                "Content-Length: 0\r\nConnection: close\r\n\r\n";
+            ::send(client, resp, int(std::strlen(resp)), 0);
+            closeSocket(client);
+            return;
+        }
     }
 
     std::string status = "404 Not Found";

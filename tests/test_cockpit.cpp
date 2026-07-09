@@ -18,7 +18,16 @@
   using socket_t = int;
 #endif
 
+static std::string httpGetAuth(uint16_t port, const std::string& path,
+                               const std::string& basicToken);
+
 static std::string httpGet(uint16_t port, const std::string& path)
+{
+    return httpGetAuth(port, path, "");
+}
+
+static std::string httpGetAuth(uint16_t port, const std::string& path,
+                               const std::string& basicToken)
 {
 #if defined(_WIN32)
     WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
@@ -29,7 +38,10 @@ static std::string httpGet(uint16_t port, const std::string& path)
     addr.sin_port = htons(port);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (::connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) return "";
-    std::string req = "GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n";
+    std::string req = "GET " + path + " HTTP/1.1\r\nHost: x\r\n";
+    if (!basicToken.empty())
+        req += "Authorization: Basic " + basicToken + "\r\n";
+    req += "\r\n";
     ::send(fd, req.data(), int(req.size()), 0);
     std::string resp;
     char buf[8192];
@@ -76,5 +88,30 @@ int main()
     CHECK(spec.find("\"db\":[-90.5,-45.0,-88.2]") != std::string::npos);
 
     cockpit.stop();
+
+    // --- Autenticazione HTTP Basic -----------------------------------------
+    {
+        sdrjo::CockpitServer secured;
+        secured.setPassword("segreta123");
+        CHECK(secured.start(0));
+
+        // Senza credenziali: 401.
+        auto denied = httpGet(secured.port(), "/");
+        CHECK(denied.find("401 Unauthorized") != std::string::npos);
+        CHECK(denied.find("WWW-Authenticate") != std::string::npos);
+        CHECK(denied.find("SdrJo Cockpit") == std::string::npos);
+
+        // Con credenziali giuste: 200. base64("sdrjo:segreta123").
+        auto ok = httpGetAuth(secured.port(), "/", "c2Ryam86c2VncmV0YTEyMw==");
+        CHECK(ok.find("200 OK") != std::string::npos);
+        CHECK(ok.find("SdrJo Cockpit") != std::string::npos);
+
+        // Con credenziali sbagliate: 401.
+        auto wrong = httpGetAuth(secured.port(), "/", "c2Ryam86c2JhZ2xpYXRh");
+        CHECK(wrong.find("401 Unauthorized") != std::string::npos);
+
+        secured.stop();
+    }
+
     return testResult("test_cockpit");
 }

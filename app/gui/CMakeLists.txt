@@ -44,4 +44,15 @@ if(MSVC)
     set_target_properties(sdrjo PROPERTIES LINK_FLAGS "/ENTRY:mainCRTStartup")
 endif()
 
+# Font moderni (arrivano con i sorgenti di Dear ImGui): Roboto per la UI,
+# Cousine (mono) per frequenzimetro e valori numerici.
+file(COPY
+    ${imgui_SOURCE_DIR}/misc/fonts/Roboto-Medium.ttf
+    ${imgui_SOURCE_DIR}/misc/fonts/Cousine-Regular.ttf
+    DESTINATION ${CMAKE_BINARY_DIR}/bin/fonts)
+install(FILES
+    ${imgui_SOURCE_DIR}/misc/fonts/Roboto-Medium.ttf
+    ${imgui_SOURCE_DIR}/misc/fonts/Cousine-Regular.ttf
+    DESTINATION fonts)
+
 install(TARGETS sdrjo RUNTIME DESTINATION .)
