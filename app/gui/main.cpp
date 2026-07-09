@@ -63,6 +63,15 @@ struct AppState : public sdrjo::IModuleHost {
     int waterfallHead = 0;
     GLuint waterfallTex = 0;
 
+    // Regolazioni di spettro e waterfall.
+    float rangeMinDb = -110.0f;      // fondo scala (luminosita')
+    float rangeMaxDb = -10.0f;       // tetto scala (contrasto)
+    int wfRows = kWaterfallRows;     // memoria del waterfall (righe)
+    int wfSpeedDiv = 4;              // 1 riga ogni N FFT (velocita')
+    int wfSpeedCounter = 0;
+    int wfPalette = 0;               // 0 classica, 1 grigi, 2 fuoco
+    float wfSplit = 0.42f;           // quota di altezza dello spettro
+
     std::vector<sdrjo::LoadedModule> modules;
     std::vector<std::string> logLines;
     std::mutex logMutex;
@@ -271,10 +280,13 @@ void updateSpectrum(AppState& app)
                                         app.spectrum.data());
         }
 
-        // Riga nel waterfall circolare.
-        std::memcpy(&app.waterfall[size_t(app.waterfallHead) * kFftSize],
-                    app.spectrum.data(), kFftSize * sizeof(float));
-        app.waterfallHead = (app.waterfallHead + 1) % kWaterfallRows;
+        // Riga nel waterfall circolare (1 ogni wfSpeedDiv FFT).
+        if (++app.wfSpeedCounter >= app.wfSpeedDiv) {
+            app.wfSpeedCounter = 0;
+            std::memcpy(&app.waterfall[size_t(app.waterfallHead) * kFftSize],
+                        app.spectrum.data(), kFftSize * sizeof(float));
+            app.waterfallHead = (app.waterfallHead + 1) % app.wfRows;
+        }
 
         // Distribuisci a ogni modulo il SUO canale (VFO dedicato).
         for (size_t m = 0; m < app.modules.size(); m++) {
@@ -366,19 +378,46 @@ void updateSpectrum(AppState& app)
     }
 }
 
+// Cambia il numero di righe di storia del waterfall.
+void resizeWaterfall(AppState& app, int rows)
+{
+    app.wfRows = rows;
+    app.waterfall.assign(size_t(kFftSize) * size_t(rows), -120.0f);
+    app.waterfallHead = 0;
+}
+
 void uploadWaterfallTexture(AppState& app)
 {
-    static std::vector<uint32_t> pixels(kFftSize * kWaterfallRows);
-    auto colorize = [](float db) -> uint32_t {
-        float t = std::clamp((db + 100.0f) / 70.0f, 0.0f, 1.0f);
-        uint8_t r = uint8_t(255.0f * std::clamp(t * 2.5f - 1.2f, 0.0f, 1.0f));
-        uint8_t g = uint8_t(255.0f * std::clamp(t * 2.0f - 0.5f, 0.0f, 1.0f));
-        uint8_t b = uint8_t(255.0f * std::clamp(t * 3.0f, 0.0f, 1.0f) *
-                            (1.0f - 0.5f * t));
+    static std::vector<uint32_t> pixels;
+    pixels.resize(size_t(kFftSize) * size_t(app.wfRows));
+
+    const float lo = app.rangeMinDb;
+    const float span = std::max(1.0f, app.rangeMaxDb - app.rangeMinDb);
+    const int palette = app.wfPalette;
+    auto colorize = [&](float db) -> uint32_t {
+        float t = std::clamp((db - lo) / span, 0.0f, 1.0f);
+        uint8_t r, g, b;
+        switch (palette) {
+        case 1: // grigi
+            r = g = b = uint8_t(255.0f * t);
+            break;
+        case 2: // fuoco: nero -> rosso -> giallo -> bianco
+            r = uint8_t(255.0f * std::clamp(t * 3.0f, 0.0f, 1.0f));
+            g = uint8_t(255.0f * std::clamp(t * 3.0f - 1.0f, 0.0f, 1.0f));
+            b = uint8_t(255.0f * std::clamp(t * 3.0f - 2.0f, 0.0f, 1.0f));
+            break;
+        default: // classica: blu -> ciano -> giallo
+            r = uint8_t(255.0f * std::clamp(t * 2.5f - 1.2f, 0.0f, 1.0f));
+            g = uint8_t(255.0f * std::clamp(t * 2.0f - 0.5f, 0.0f, 1.0f));
+            b = uint8_t(255.0f * std::clamp(t * 3.0f, 0.0f, 1.0f) *
+                        (1.0f - 0.5f * t));
+            break;
+        }
         return 0xFF000000u | (uint32_t(b) << 16) | (uint32_t(g) << 8) | r;
     };
-    for (int row = 0; row < kWaterfallRows; row++) {
-        int src = (app.waterfallHead + row) % kWaterfallRows;
+
+    for (int row = 0; row < app.wfRows; row++) {
+        int src = (app.waterfallHead + row) % app.wfRows;
         for (size_t x = 0; x < kFftSize; x++)
             pixels[size_t(row) * kFftSize + x] =
                 colorize(app.waterfall[size_t(src) * kFftSize + x]);
@@ -390,7 +429,7 @@ void uploadWaterfallTexture(AppState& app)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     }
     glBindTexture(GL_TEXTURE_2D, app.waterfallTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kFftSize, kWaterfallRows, 0,
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kFftSize, app.wfRows, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
 }
 
@@ -575,10 +614,41 @@ void drawSpectrumPanel(AppState& app)
                              ImGuiCond_FirstUseEver);
     ImGui::Begin("Spettro");
 
+    // Leve di regolazione (contrasto, velocita', memoria, palette).
+    if (ImGui::CollapsingHeader("Regolazioni waterfall",
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SetNextItemWidth(220);
+        ImGui::DragFloatRange2("Range dB", &app.rangeMinDb, &app.rangeMaxDb,
+                               1.0f, -140.0f, 0.0f, "min %.0f", "max %.0f");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(140);
+        double rowsPerSec =
+            app.sampleRate / double(kFftSize) / double(app.wfSpeedDiv);
+        char speedLbl[32];
+        std::snprintf(speedLbl, sizeof(speedLbl), "%.0f righe/s", rowsPerSec);
+        ImGui::SliderInt("Velocita'", &app.wfSpeedDiv, 1, 100, speedLbl,
+                         ImGuiSliderFlags_Logarithmic);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90);
+        static const char* kRowNames[] = {"256", "512", "1024", "2048"};
+        static const int kRowVals[] = {256, 512, 1024, 2048};
+        int rowIdx = 0;
+        for (int i = 0; i < 4; i++)
+            if (kRowVals[i] == app.wfRows) rowIdx = i;
+        if (ImGui::Combo("Memoria", &rowIdx, kRowNames, 4))
+            resizeWaterfall(app, kRowVals[rowIdx]);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90);
+        static const char* kPalNames[] = {"Classica", "Grigi", "Fuoco"};
+        ImGui::Combo("Palette", &app.wfPalette, kPalNames, 3);
+        ImGui::Spacing();
+    }
+
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 avail = ImGui::GetContentRegionAvail();
     const float bandH = 20.0f;
-    float specH = std::max(120.0f, avail.y * 0.42f);
+    // Altezza dello spettro regolabile con il divisore trascinabile.
+    float specH = std::clamp(avail.y * app.wfSplit, 90.0f, avail.y - 90.0f);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     const float w = avail.x;
 
@@ -623,9 +693,10 @@ void drawSpectrumPanel(AppState& app)
     ImGui::InvisibleButton("##specarea", ImVec2(w, bandH + specH));
     bool hovered = ImGui::IsItemHovered();
 
-    const float dbMin = -110.0f, dbMax = -10.0f;
+    const float dbMin = app.rangeMinDb, dbMax = app.rangeMaxDb;
     auto yOf = [&](float db) {
-        float t = (std::clamp(db, dbMin, dbMax) - dbMin) / (dbMax - dbMin);
+        float t = (std::clamp(db, dbMin, dbMax) - dbMin) /
+                  std::max(1.0f, dbMax - dbMin);
         return s1.y - t * specH;
     };
 
@@ -755,6 +826,24 @@ void drawSpectrumPanel(AppState& app)
             app.listenOffsetHz = snapped - centerHz;
             if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
         }
+    }
+
+    // Divisore trascinabile: regola l'altezza spettro/waterfall.
+    ImGui::InvisibleButton("##split", ImVec2(w, 7.0f));
+    if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+    if (ImGui::IsItemActive() && avail.y > 1.0f)
+        app.wfSplit = std::clamp(
+            app.wfSplit + ImGui::GetIO().MouseDelta.y / avail.y, 0.12f, 0.85f);
+    {
+        ImVec2 sp0 = ImGui::GetItemRectMin();
+        ImVec2 sp1 = ImGui::GetItemRectMax();
+        float cy = (sp0.y + sp1.y) * 0.5f;
+        dl->AddLine(ImVec2(sp0.x, cy), ImVec2(sp1.x, cy),
+                    ImGui::GetColorU32(ImVec4(0.3f, 0.42f, 0.53f,
+                                              ImGui::IsItemHovered() ? 0.8f
+                                                                     : 0.3f)),
+                    2.0f);
     }
 
     // Waterfall nel resto dello spazio (ritagliato sulla vista/zoom).
