@@ -22,6 +22,8 @@
 #include <sdrjo/dsp/vfo.hpp>
 #include <sdrjo/dsp/wfm_stereo.hpp>
 #include <sdrjo/module/module_loader.hpp>
+#include <sdrjo/dsp/audio_filters.hpp>
+#include <sdrjo/util/frequency_store.hpp>
 #include <sdrjo/util/iq_recorder.hpp>
 #include <sdrjo/web/cockpit_server.hpp>
 #include <sdrjo/source/sample_source.hpp>
@@ -32,6 +34,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -42,6 +45,9 @@ namespace {
 
 constexpr size_t kFftSize = 4096;
 constexpr int kWaterfallRows = 256;
+
+const char* kListenModeNames[] = {"Spento", "WFM stereo", "NFM",
+                                  "AM", "USB", "LSB"};
 
 struct AppState : public sdrjo::IModuleHost {
     std::unique_ptr<sdrjo::ISampleSource> source;
@@ -100,6 +106,32 @@ struct AppState : public sdrjo::IModuleHost {
     bool tunerAgc = true;
     bool biasTee = false;
     int ppmCorrection = 0;
+
+    // Zoom dello spettro: frazioni dello span pieno dell'hardware.
+    double viewSpanFrac = 1.0;
+    double viewCenterFrac = 0.5;
+
+    // Passo di sintonia (rotellina/click) e larghezza canale regolabile.
+    double snapHz = 12500.0;
+    double listenBwHz = 0.0;
+
+    // Squelch sul canale di ascolto.
+    bool squelchOn = false;
+    float squelchDb = -50.0f;
+    float chanLevelDb = -120.0f;
+    bool squelchOpen = true;
+
+    // Filtri audio (passa-alto/passa-basso).
+    float audioHighPassHz = 0.0f;
+    float audioLowPassHz = 0.0f;
+    sdrjo::dsp::AudioFilterChain filterL, filterR;
+
+    // Filtro di canale con la larghezza scelta dal grafico (NFM/AM).
+    std::unique_ptr<sdrjo::dsp::FirFilter> chanFilter;
+
+    // Frequency manager (persistente su file).
+    sdrjo::FrequencyStore freqStore;
+    std::string freqStorePath;
 
     void ensureAudio()
     {
@@ -166,6 +198,23 @@ double listenBandwidthHz(AppState::ListenMode m)
     }
 }
 
+// Ricostruisce il filtro di canale/SSB per la larghezza corrente.
+void rebuildChanFilter(AppState& app)
+{
+    app.chanFilter.reset();
+    if (app.listenMode == AppState::ListenMode::Off ||
+        app.listenMode == AppState::ListenMode::WfmStereo)
+        return;
+    double bw = std::clamp(app.listenBwHz, 500.0, 46000.0);
+    if (app.ssbDemod) {
+        app.ssbDemod = std::make_unique<sdrjo::dsp::SsbDemodulator>(
+            48000.0, app.listenMode == AppState::ListenMode::Usb, bw);
+    } else {
+        app.chanFilter = std::make_unique<sdrjo::dsp::FirFilter>(
+            sdrjo::dsp::designLowPass(48000.0, bw / 2.0, 129));
+    }
+}
+
 // (Ri)costruisce la catena di ascolto per modalita'/rate correnti.
 void rebuildListener(AppState& app)
 {
@@ -202,6 +251,10 @@ void rebuildListener(AppState& app)
     default:
         break;
     }
+    app.listenBwHz = listenBandwidthHz(app.listenMode);
+    rebuildChanFilter(app);
+    app.filterL.reset();
+    app.filterR.reset();
 }
 
 void updateSpectrum(AppState& app)
@@ -244,17 +297,43 @@ void updateSpectrum(AppState& app)
             app.listenVfo->process(chunk.data(), kFftSize, lchan);
             if (lchan.empty()) continue;
 
+            // Filtro di canale (larghezza scelta trascinando i bordi).
+            if (app.chanFilter) {
+                static std::vector<sdrjo::cfloat> filt;
+                filt.resize(lchan.size());
+                app.chanFilter->process(lchan.data(), lchan.size(),
+                                        filt.data());
+                lchan.swap(filt);
+            }
+
+            // Livello del canale (per squelch e indicatore).
+            double pw = 0;
+            for (const auto& c : lchan) pw += std::norm(c);
+            float level = 10.0f * std::log10(float(pw / double(lchan.size())) +
+                                             1e-12f);
+            app.chanLevelDb += 0.3f * (level - app.chanLevelDb);
+            if (app.squelchOn) {
+                // Isteresi di 2 dB attorno alla soglia.
+                app.squelchOpen = app.squelchOpen
+                                      ? (app.chanLevelDb > app.squelchDb - 2)
+                                      : (app.chanLevelDb > app.squelchDb + 2);
+            } else {
+                app.squelchOpen = true;
+            }
+
             app.ensureAudio();
             if (app.wfmDemod) {
                 app.audioL.clear();
                 app.audioR.clear();
                 app.wfmDemod->process(lchan.data(), lchan.size(), app.audioL,
                                       app.audioR);
+                app.filterL.process(app.audioL.data(), app.audioL.size());
+                app.filterR.process(app.audioR.data(), app.audioR.size());
+                float g = app.squelchOpen ? app.volume : 0.0f;
                 app.audioInterleaved.resize(app.audioL.size() * 2);
                 for (size_t i = 0; i < app.audioL.size(); i++) {
-                    app.audioInterleaved[2 * i] = app.volume * app.audioL[i];
-                    app.audioInterleaved[2 * i + 1] =
-                        app.volume * app.audioR[i];
+                    app.audioInterleaved[2 * i] = g * app.audioL[i];
+                    app.audioInterleaved[2 * i + 1] = g * app.audioR[i];
                 }
                 app.audio.write(app.audioInterleaved.data(),
                                 app.audioInterleaved.size());
@@ -276,7 +355,10 @@ void updateSpectrum(AppState& app)
                     app.listenAgc.process(app.audioMono.data(),
                                           app.audioMono.size());
                 }
-                for (auto& v : app.audioMono) v *= app.volume;
+                app.filterL.process(app.audioMono.data(),
+                                    app.audioMono.size());
+                float g = app.squelchOpen ? app.volume : 0.0f;
+                for (auto& v : app.audioMono) v *= g;
                 app.audio.writeMono(app.audioMono.data(),
                                     app.audioMono.size());
             }
@@ -315,7 +397,7 @@ void uploadWaterfallTexture(AppState& app)
 void drawDevicePanel(AppState& app)
 {
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(330, 590), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(330, 360), ImGuiCond_FirstUseEver);
     ImGui::Begin("Dispositivo");
 
     if (!app.source) {
@@ -421,24 +503,6 @@ void drawDevicePanel(AppState& app)
                 app.rtl->setPpmCorrection(app.ppmCorrection);
         }
 
-        ImGui::SeparatorText("Ascolto");
-        static const char* kModes[] = {"Spento", "WFM stereo", "NFM",
-                                       "AM", "USB", "LSB"};
-        int mode = int(app.listenMode);
-        if (ImGui::Combo("Demodulatore", &mode, kModes, 6)) {
-            app.listenMode = AppState::ListenMode(mode);
-            rebuildListener(app);
-        }
-        if (app.listenMode != AppState::ListenMode::Off) {
-            ImGui::Text("VFO: %+.1f kHz dal centro (click sullo spettro)",
-                        app.listenOffsetHz / 1e3);
-            if (app.wfmDemod) {
-                ImGui::SameLine();
-                ImGui::TextDisabled(app.wfmDemod->stereoLocked() ? "STEREO"
-                                                                 : "mono");
-            }
-        }
-        ImGui::SliderFloat("Volume", &app.volume, 0.0f, 1.0f, "%.2f");
 
         ImGui::SeparatorText("Registrazione IQ");
         if (!app.recorder.isRecording()) {
@@ -521,17 +585,25 @@ void drawSpectrumPanel(AppState& app)
     const double centerHz = app.freqMHz * 1e6;
     const double f0 = centerHz - app.sampleRate / 2.0;
     const double f1 = centerHz + app.sampleRate / 2.0;
+
+    // Finestra di vista (zoom): sottoinsieme dello span pieno.
+    app.viewSpanFrac = std::clamp(app.viewSpanFrac, 0.005, 1.0);
+    app.viewCenterFrac = std::clamp(app.viewCenterFrac, app.viewSpanFrac / 2,
+                                    1.0 - app.viewSpanFrac / 2);
+    const double span = (f1 - f0) * app.viewSpanFrac;
+    const double v0 = f0 + app.viewCenterFrac * (f1 - f0) - span / 2.0;
+    const double v1 = v0 + span;
     auto xOf = [&](double f) {
-        return p0.x + float((f - f0) / (f1 - f0)) * w;
+        return p0.x + float((f - v0) / (v1 - v0)) * w;
     };
     auto freqAt = [&](float x) {
-        return f0 + double((x - p0.x) / w) * (f1 - f0);
+        return v0 + double((x - p0.x) / w) * (v1 - v0);
     };
 
     // --- Fascia delle bande (cosa si sta ascoltando) ---
     dl->AddRectFilled(p0, ImVec2(p0.x + w, p0.y + bandH),
                       ImGui::GetColorU32(ImVec4(0, 0, 0, 0.35f)), 4.0f);
-    for (const auto& b : sdrjo::bandsInRange(f0, f1)) {
+    for (const auto& b : sdrjo::bandsInRange(v0, v1)) {
         float x0 = std::max(p0.x, xOf(b.lowHz));
         float x1 = std::min(p0.x + w, xOf(b.highHz));
         dl->AddRectFilled(ImVec2(x0, p0.y + 2), ImVec2(x1, p0.y + bandH - 2),
@@ -558,10 +630,10 @@ void drawSpectrumPanel(AppState& app)
     };
 
     // Griglia di frequenza con etichette in MHz.
-    double step = niceStep((f1 - f0) / 8.0);
+    double step = niceStep((v1 - v0) / 8.0);
     ImU32 gridCol = ImGui::GetColorU32(ImVec4(0.3f, 0.42f, 0.53f, 0.18f));
     ImU32 textCol = ImGui::GetColorU32(ImVec4(0.55f, 0.65f, 0.75f, 0.9f));
-    for (double f = std::ceil(f0 / step) * step; f < f1; f += step) {
+    for (double f = std::ceil(v0 / step) * step; f < v1; f += step) {
         float x = xOf(f);
         dl->AddLine(ImVec2(x, s0.y), ImVec2(x, s1.y), gridCol);
         char lbl[32];
@@ -575,12 +647,17 @@ void drawSpectrumPanel(AppState& app)
     {
         std::lock_guard<std::mutex> lk(app.spectrumMutex);
         const size_t n = app.spectrum.size();
+        // Mappa i pixel sui bin della finestra di vista (zoom incluso).
+        const double startBin = (v0 - f0) / (f1 - f0) * double(n);
+        const double binsPerPx = (v1 - v0) / (f1 - f0) * double(n) / w;
         ImU32 line = ImGui::GetColorU32(ImVec4(0.22f, 0.71f, 1.0f, 1.0f));
         ImU32 fill = ImGui::GetColorU32(ImVec4(0.22f, 0.71f, 1.0f, 0.18f));
         float prevY = 0;
         for (int px = 0; px < int(w); px++) {
-            size_t b0 = size_t(double(px) / w * n);
-            size_t b1 = std::max(b0 + 1, size_t(double(px + 1) / w * n));
+            size_t b0 = size_t(std::max(0.0, startBin + px * binsPerPx));
+            size_t b1 = std::max(b0 + 1,
+                                 size_t(std::max(0.0, startBin +
+                                                          (px + 1) * binsPerPx)));
             float v = -160.0f;
             for (size_t b = b0; b < b1 && b < n; b++)
                 v = std::max(v, app.spectrum[b]);
@@ -593,50 +670,271 @@ void drawSpectrumPanel(AppState& app)
         }
     }
 
-    // Marker del VFO di ascolto con la sua larghezza di banda.
+    // Marker del VFO di ascolto: banda evidenziata, bordi trascinabili.
+    static bool draggingBw = false;
+    bool nearEdge = false;
+    float mx = ImGui::GetIO().MousePos.x;
     if (app.listenMode != AppState::ListenMode::Off) {
-        double bw = listenBandwidthHz(app.listenMode);
-        float xc = xOf(centerHz + app.listenOffsetHz);
-        float xb0 = xOf(centerHz + app.listenOffsetHz - bw / 2);
-        float xb1 = xOf(centerHz + app.listenOffsetHz + bw / 2);
+        double bw = app.listenBwHz;
+        double vfoHz = centerHz + app.listenOffsetHz;
+        float xc = xOf(vfoHz);
+        float xb0 = xOf(vfoHz - bw / 2);
+        float xb1 = xOf(vfoHz + bw / 2);
         dl->AddRectFilled(ImVec2(xb0, s0.y), ImVec2(xb1, s1.y),
                           ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.15f)));
         dl->AddLine(ImVec2(xc, s0.y), ImVec2(xc, s1.y),
                     ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.9f)), 1.5f);
+        dl->AddLine(ImVec2(xb0, s0.y), ImVec2(xb0, s1.y),
+                    ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.5f)));
+        dl->AddLine(ImVec2(xb1, s0.y), ImVec2(xb1, s1.y),
+                    ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.5f)));
+
+        // Trascinamento dei bordi = cambia la larghezza del canale.
+        nearEdge = hovered && (std::fabs(mx - xb0) < 6.0f ||
+                               std::fabs(mx - xb1) < 6.0f);
+        if (nearEdge || draggingBw)
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if (nearEdge && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            draggingBw = true;
+        if (draggingBw) {
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                double maxBw =
+                    (app.listenMode == AppState::ListenMode::WfmStereo)
+                        ? 220000.0 : 46000.0;
+                app.listenBwHz = std::clamp(
+                    2.0 * std::fabs(freqAt(mx) - vfoHz), 500.0, maxBw);
+            } else {
+                draggingBw = false;
+                rebuildChanFilter(app); // applica la nuova larghezza
+            }
+        }
     }
 
-    // Interazione: tooltip con la frequenza, click = VFO, doppio = centro.
-    if (hovered) {
-        float mx = ImGui::GetIO().MousePos.x;
+    // Interazione: tooltip, click = VFO (con snap), doppio = centra,
+    // rotellina = sintonia a passi di snap, Ctrl+rotellina = zoom.
+    if (hovered && !draggingBw) {
         double f = freqAt(mx);
         dl->AddLine(ImVec2(mx, s0.y), ImVec2(mx, s1.y),
                     ImGui::GetColorU32(ImVec4(1, 1, 1, 0.25f)));
-        ImGui::SetTooltip("%.4f MHz\nclick: sposta l'ascolto\n"
-                          "doppio click: centra qui", f / 1e6);
+        ImGui::SetTooltip("%.4f MHz\nclick: sintonizza (snap %.4g kHz)\n"
+                          "rotellina: sintonia  Ctrl+rotellina: zoom\n"
+                          "doppio click: centra qui  bordi banda: trascina",
+                          f / 1e6, app.snapHz / 1e3);
+
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.0f) {
+            if (ImGui::GetIO().KeyCtrl) {
+                // Zoom mantenendo ferma la frequenza sotto il cursore.
+                double frac = double((mx - p0.x) / w);
+                app.viewSpanFrac =
+                    std::clamp(app.viewSpanFrac * std::pow(0.8, double(wheel)),
+                               0.005, 1.0);
+                double newSpan = (f1 - f0) * app.viewSpanFrac;
+                double newV0 = f - frac * newSpan;
+                app.viewCenterFrac =
+                    (newV0 + newSpan / 2.0 - f0) / (f1 - f0);
+            } else {
+                double cur = centerHz + app.listenOffsetHz;
+                double next = std::round((cur + double(wheel) * app.snapHz) /
+                                         app.snapHz) * app.snapHz;
+                app.listenOffsetHz = std::clamp(
+                    next - centerHz, -app.sampleRate * 0.49,
+                    app.sampleRate * 0.49);
+                if (app.listenVfo)
+                    app.listenVfo->setOffset(app.listenOffsetHz);
+            }
+        }
+
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
             app.freqMHz = f / 1e6;
             if (app.source) app.source->setCenterFrequency(f);
             app.listenOffsetHz = 0.0;
             if (app.listenVfo) app.listenVfo->setOffset(0.0);
-        } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            app.listenOffsetHz = f - centerHz;
+        } else if (!nearEdge && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            double snapped = std::round(f / app.snapHz) * app.snapHz;
+            app.listenOffsetHz = snapped - centerHz;
             if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
         }
     }
 
-    // Waterfall nel resto dello spazio.
+    // Waterfall nel resto dello spazio (ritagliato sulla vista/zoom).
     if (app.waterfallTex) {
+        float u0 = float((v0 - f0) / (f1 - f0));
+        float u1 = float((v1 - f0) / (f1 - f0));
         ImGui::Image((ImTextureID)(intptr_t)app.waterfallTex,
                      ImVec2(ImGui::GetContentRegionAvail().x,
-                            ImGui::GetContentRegionAvail().y));
+                            ImGui::GetContentRegionAvail().y),
+                     ImVec2(u0, 0.0f), ImVec2(u1, 1.0f));
+    }
+    ImGui::End();
+}
+
+void drawReceiverPanel(AppState& app)
+{
+    ImGui::SetNextWindowPos(ImVec2(10, 380), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(330, 330), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Ricevitore");
+
+    int mode = int(app.listenMode);
+    if (ImGui::Combo("Demodulatore", &mode, kListenModeNames, 6)) {
+        app.listenMode = AppState::ListenMode(mode);
+        rebuildListener(app);
+    }
+    if (app.listenMode != AppState::ListenMode::Off) {
+        ImGui::Text("VFO %.4f MHz  banda %.1f kHz",
+                    (app.freqMHz * 1e6 + app.listenOffsetHz) / 1e6,
+                    app.listenBwHz / 1e3);
+        if (app.wfmDemod) {
+            ImGui::SameLine();
+            ImGui::TextDisabled(app.wfmDemod->stereoLocked() ? "STEREO"
+                                                             : "mono");
+        }
+    }
+    ImGui::SliderFloat("Volume", &app.volume, 0.0f, 1.0f, "%.2f");
+
+    // Passo di sintonia per click e rotellina.
+    static const double kSnaps[] = {1000, 5000, 9000, 10000,
+                                    12500, 25000, 50000, 100000};
+    static const char* kSnapNames[] = {"1 kHz",    "5 kHz",  "9 kHz (OM)",
+                                       "10 kHz",   "12.5 kHz", "25 kHz",
+                                       "50 kHz",   "100 kHz"};
+    int snapIdx = 4;
+    for (int i = 0; i < 8; i++)
+        if (std::fabs(kSnaps[i] - app.snapHz) < 1) snapIdx = i;
+    if (ImGui::Combo("Snap", &snapIdx, kSnapNames, 8))
+        app.snapHz = kSnaps[snapIdx];
+
+    // Zoom (equivalente a Ctrl+rotellina sullo spettro).
+    float zoom = float(1.0 / app.viewSpanFrac);
+    if (ImGui::SliderFloat("Zoom", &zoom, 1.0f, 100.0f, "%.0fx",
+                           ImGuiSliderFlags_Logarithmic))
+        app.viewSpanFrac = 1.0 / double(zoom);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("1x")) {
+        app.viewSpanFrac = 1.0;
+        app.viewCenterFrac = 0.5;
+    }
+
+    ImGui::SeparatorText("Squelch");
+    ImGui::Checkbox("Attivo##sq", &app.squelchOn);
+    ImGui::SameLine();
+    ImGui::TextDisabled(app.squelchOn ? (app.squelchOpen ? "APERTO" : "chiuso")
+                                      : "");
+    ImGui::SliderFloat("Soglia (dB)", &app.squelchDb, -100.0f, 0.0f, "%.0f");
+    float lvl = std::clamp((app.chanLevelDb + 120.0f) / 120.0f, 0.0f, 1.0f);
+    char lvlTxt[32];
+    std::snprintf(lvlTxt, sizeof(lvlTxt), "%.0f dB", double(app.chanLevelDb));
+    ImGui::ProgressBar(lvl, ImVec2(-1, 0), lvlTxt);
+
+    ImGui::SeparatorText("Filtri audio");
+    bool changed = false;
+    changed |= ImGui::SliderFloat("Passa-alto (Hz)", &app.audioHighPassHz,
+                                  0.0f, 500.0f, app.audioHighPassHz < 1
+                                                    ? "spento" : "%.0f");
+    changed |= ImGui::SliderFloat("Passa-basso (Hz)", &app.audioLowPassHz,
+                                  0.0f, 12000.0f, app.audioLowPassHz < 1
+                                                      ? "spento" : "%.0f");
+    if (changed) {
+        app.filterL.configure(48000.0, double(app.audioHighPassHz),
+                              double(app.audioLowPassHz));
+        app.filterR.configure(48000.0, double(app.audioHighPassHz),
+                              double(app.audioLowPassHz));
+    }
+    ImGui::End();
+}
+
+// Frequency manager: memorie salvate su file, riordinate per frequenza.
+void drawFrequenciesPanel(AppState& app)
+{
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(350, 540), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(430, vp->WorkSize.y - 550),
+                             ImGuiCond_FirstUseEver);
+    ImGui::Begin("Frequenze");
+
+    static char nameBuf[64] = "";
+    ImGui::SetNextItemWidth(180);
+    ImGui::InputTextWithHint("##nome", "nome memoria", nameBuf,
+                             sizeof(nameBuf));
+    ImGui::SameLine();
+    if (ImGui::Button("Salva corrente")) {
+        sdrjo::FavoriteFrequency ff;
+        ff.freqHz = app.freqMHz * 1e6 + app.listenOffsetHz;
+        ff.mode = kListenModeNames[int(app.listenMode)];
+        ff.bandwidthHz = app.listenBwHz;
+        if (nameBuf[0]) {
+            ff.name = nameBuf;
+        } else {
+            char def[48];
+            std::snprintf(def, sizeof(def), "%.4f MHz", ff.freqHz / 1e6);
+            ff.name = def;
+        }
+        app.freqStore.add(std::move(ff));
+        app.freqStore.save(app.freqStorePath);
+        nameBuf[0] = '\0';
+    }
+
+    if (ImGui::BeginTable("freqs", 4,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+        ImGui::TableSetupColumn("Nome", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("MHz", ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn("Modo", ImGuiTableColumnFlags_WidthFixed, 60);
+        ImGui::TableSetupColumn("##az", ImGuiTableColumnFlags_WidthFixed, 70);
+        ImGui::TableHeadersRow();
+
+        int removeIdx = -1;
+        auto& items = app.freqStore.items();
+        for (int i = 0; i < int(items.size()); i++) {
+            const auto& ff = items[size_t(i)];
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(ff.name.c_str());
+            ImGui::TableNextColumn();
+            ImGui::Text("%.4f", ff.freqHz / 1e6);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(ff.mode.c_str());
+            ImGui::TableNextColumn();
+            ImGui::PushID(i);
+            if (ImGui::SmallButton("Vai")) {
+                // Dentro lo span attuale: sposta solo il VFO; fuori: centra.
+                double center = app.freqMHz * 1e6;
+                if (app.source &&
+                    std::fabs(ff.freqHz - center) < app.sampleRate * 0.45) {
+                    app.listenOffsetHz = ff.freqHz - center;
+                } else {
+                    app.freqMHz = ff.freqHz / 1e6;
+                    if (app.source)
+                        app.source->setCenterFrequency(ff.freqHz);
+                    app.listenOffsetHz = 0.0;
+                }
+                for (int m = 0; m < 6; m++)
+                    if (ff.mode == kListenModeNames[m])
+                        app.listenMode = AppState::ListenMode(m);
+                rebuildListener(app);
+                if (ff.bandwidthHz > 0) {
+                    app.listenBwHz = ff.bandwidthHz;
+                    rebuildChanFilter(app);
+                }
+                if (app.listenVfo)
+                    app.listenVfo->setOffset(app.listenOffsetHz);
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("X")) removeIdx = i;
+            ImGui::PopID();
+        }
+        if (removeIdx >= 0) {
+            app.freqStore.remove(size_t(removeIdx));
+            app.freqStore.save(app.freqStorePath);
+        }
+        ImGui::EndTable();
     }
     ImGui::End();
 }
 
 void drawAudioPanel(AppState& app)
 {
-    ImGui::SetNextWindowPos(ImVec2(10, 450), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(330, 150), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(10, 720), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(330, 170), ImGuiCond_FirstUseEver);
     ImGui::Begin("Audio");
 
     ImGui::TextDisabled("backend: %s", app.audio.backendName().c_str());
@@ -679,8 +977,8 @@ void drawAudioPanel(AppState& app)
 void drawModulesPanel(AppState& app)
 {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(10, 610), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(330, vp->WorkSize.y - 620),
+    ImGui::SetNextWindowPos(ImVec2(790, 540), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(330, vp->WorkSize.y - 550),
                              ImGuiCond_FirstUseEver);
     ImGui::Begin("Moduli");
     if (app.modules.empty()) {
@@ -706,8 +1004,8 @@ void drawModulesPanel(AppState& app)
 void drawLogPanel(AppState& app)
 {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(350, 540), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - 360,
+    ImGui::SetNextWindowPos(ImVec2(1130, 540), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - 1140,
                                     vp->WorkSize.y - 550),
                              ImGuiCond_FirstUseEver);
     ImGui::Begin("Log");
@@ -747,6 +1045,14 @@ int main(int argc, char** argv)
     for (auto& e : loadErrors) app.log("Loader", e);
     for (auto& lm : app.modules) lm.module()->start(app);
     rebuildChannels(app);
+
+    // Frequency manager: memorie accanto all'eseguibile.
+    app.freqStorePath =
+        (std::filesystem::path(sdrjo::ModuleLoader::defaultModulesDir())
+             .parent_path() /
+         "frequenze.csv")
+            .string();
+    app.freqStore.load(app.freqStorePath);
 
     // Cockpit web: la plancia di SdrJo, anche per tablet/telefono in LAN.
     app.cockpit.setStatusProvider([&app] {
@@ -804,6 +1110,8 @@ int main(int argc, char** argv)
 
         drawDevicePanel(app);
         drawSpectrumPanel(app);
+        drawReceiverPanel(app);
+        drawFrequenciesPanel(app);
         drawAudioPanel(app);
         drawModulesPanel(app);
         drawLogPanel(app);

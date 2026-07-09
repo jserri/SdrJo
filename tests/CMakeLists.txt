@@ -57,3 +57,7 @@ add_test(NAME recorder_audio COMMAND test_recorder_audio)
 add_executable(test_bands test_bands.cpp)
 target_link_libraries(test_bands PRIVATE sdrjo-core)
 add_test(NAME bands COMMAND test_bands)
+
+add_executable(test_freq_store test_freq_store.cpp)
+target_link_libraries(test_freq_store PRIVATE sdrjo-core)
+add_test(NAME freq_store COMMAND test_freq_store)

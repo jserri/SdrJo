@@ -10,6 +10,7 @@ add_library(sdrjo-core STATIC
     src/audio/audio_output.cpp
     src/util/iq_recorder.cpp
     src/util/band_plan.cpp
+    src/util/frequency_store.cpp
     src/module/module_loader.cpp
     src/util/http_server.cpp
     src/util/tcp_line_server.cpp

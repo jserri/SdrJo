@@ -63,9 +63,19 @@ Fatti:
   `cpack -G ZIP` (portabile); include i moduli e, se presente la cartella
   `driver/`, anche le DLL della chiavetta.
 
+Fatti (2a tornata):
+
+- ✅ Click-to-tune, rotellina con **snap interval** selezionabile, **zoom**
+  (Ctrl+rotellina o slider) con waterfall ritagliato sulla vista.
+- ✅ **Larghezza canale trascinabile** dai bordi della banda sul grafico.
+- ✅ **Squelch** con soglia, isteresi e indicatore di livello.
+- ✅ **Filtri audio** passa-alto/passa-basso sul canale di ascolto.
+- ✅ **Frequency manager** persistente (frequenze.csv accanto all'exe).
+- ✅ Pannello Audio: scelta scheda di uscita e frequenza audio.
+
 Prossimi:
 
-- Squelch e notch regolabili sul canale di ascolto.
-- Click-to-tune sullo spettro (GUI e Cockpit).
+- Notch regolabile e noise blanker sul canale di ascolto.
+- Click-to-tune anche sul Cockpit web.
 - VFO con offset regolabile per modulo dalla GUI (oggi centrati).
 - MSIX per il Microsoft Store.
