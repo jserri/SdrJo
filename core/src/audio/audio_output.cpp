@@ -36,18 +36,57 @@ AudioOutput::AudioOutput() : impl_(std::make_unique<Impl>()) {}
 
 AudioOutput::~AudioOutput() { stop(); }
 
-bool AudioOutput::start(double sampleRate, int channels)
+#if defined(SDRJO_HAVE_MINIAUDIO)
+// Contesto condiviso tra enumerazione e apertura (gli ID dei dispositivi
+// sono validi solo dentro lo stesso contesto).
+static ma_context* sharedContext()
+{
+    static ma_context ctx;
+    static bool ok = (ma_context_init(nullptr, 0, nullptr, &ctx) == MA_SUCCESS);
+    return ok ? &ctx : nullptr;
+}
+#endif
+
+std::vector<std::string> AudioOutput::listDevices()
+{
+    std::vector<std::string> out;
+#if defined(SDRJO_HAVE_MINIAUDIO)
+    ma_context* ctx = sharedContext();
+    if (!ctx) return out;
+    ma_device_info* infos = nullptr;
+    ma_uint32 count = 0;
+    if (ma_context_get_devices(ctx, &infos, &count, nullptr, nullptr) ==
+        MA_SUCCESS) {
+        for (ma_uint32 i = 0; i < count; i++) out.emplace_back(infos[i].name);
+    }
+#endif
+    return out;
+}
+
+bool AudioOutput::start(double sampleRate, int channels, int deviceIndex)
 {
     stop();
     impl_->channels = channels;
 #if defined(SDRJO_HAVE_MINIAUDIO)
+    ma_context* ctx = sharedContext();
     ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
     cfg.playback.format = ma_format_f32;
     cfg.playback.channels = ma_uint32(channels);
     cfg.sampleRate = ma_uint32(sampleRate);
     cfg.dataCallback = maCallback;
     cfg.pUserData = impl_.get();
-    if (ma_device_init(nullptr, &cfg, &impl_->device) != MA_SUCCESS)
+
+    // Scheda specifica richiesta: recupera l'ID dal contesto condiviso.
+    if (deviceIndex >= 0 && ctx) {
+        ma_device_info* infos = nullptr;
+        ma_uint32 count = 0;
+        if (ma_context_get_devices(ctx, &infos, &count, nullptr, nullptr) ==
+                MA_SUCCESS &&
+            ma_uint32(deviceIndex) < count) {
+            cfg.playback.pDeviceID = &infos[deviceIndex].id;
+        }
+    }
+    if (ma_device_init(ctx, &cfg, &impl_->device) != MA_SUCCESS)
         return false;
     if (ma_device_start(&impl_->device) != MA_SUCCESS) {
         ma_device_uninit(&impl_->device);
@@ -58,6 +97,7 @@ bool AudioOutput::start(double sampleRate, int channels)
     return true;
 #else
     (void)sampleRate;
+    (void)deviceIndex;
     return false; // backend nullo: build senza miniaudio
 #endif
 }

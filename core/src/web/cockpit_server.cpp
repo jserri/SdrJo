@@ -1,4 +1,5 @@
 #include "sdrjo/web/cockpit_server.hpp"
+#include "sdrjo/util/band_plan.hpp"
 
 #include <cstdio>
 
@@ -41,8 +42,11 @@ static void appendEscaped(std::string& out, const std::string& s)
 std::string CockpitServer::statusJson()
 {
     std::string j = "{";
+    double freq = 0, rate = 0;
     {
         std::lock_guard<std::mutex> lk(devMutex_);
+        freq = freqHz_;
+        rate = rateHz_;
         char buf[160];
         std::snprintf(buf, sizeof(buf),
                       "\"device\":{\"name\":\"%s\",\"freqHz\":%.0f,"
@@ -50,6 +54,23 @@ std::string CockpitServer::statusJson()
                       deviceName_.c_str(), freqHz_, rateHz_);
         j += buf;
     }
+
+    // Bande radio visibili nello span corrente (per le guide sul grafico).
+    j += "\"bands\":[";
+    if (rate > 0) {
+        bool first = true;
+        char buf[192];
+        for (const auto& b : bandsInRange(freq - rate / 2, freq + rate / 2)) {
+            if (!first) j += ",";
+            first = false;
+            std::snprintf(buf, sizeof(buf),
+                          "{\"low\":%.0f,\"high\":%.0f,\"name\":\"%s\","
+                          "\"cat\":\"%s\"}",
+                          b.lowHz, b.highHz, b.name, b.category);
+            j += buf;
+        }
+    }
+    j += "],";
     j += "\"modules\":[";
     if (status_) {
         bool first = true;

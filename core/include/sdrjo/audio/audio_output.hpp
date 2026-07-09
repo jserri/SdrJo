@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace sdrjo {
 
@@ -21,8 +22,12 @@ public:
     AudioOutput();
     ~AudioOutput();
 
-    // Apre il dispositivo di uscita predefinito. channels: 1 o 2.
-    bool start(double sampleRate, int channels);
+    // Elenco delle schede/uscite audio disponibili (vuoto senza backend).
+    static std::vector<std::string> listDevices();
+
+    // Apre l'uscita audio. deviceIndex: indice in listDevices(),
+    // -1 = dispositivo predefinito di sistema. channels: 1 o 2.
+    bool start(double sampleRate, int channels, int deviceIndex = -1);
     void stop();
 
     bool isActive() const;

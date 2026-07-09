@@ -57,7 +57,8 @@ const char* cockpitPageHtml()
     letter-spacing: 1.5px; color: var(--dim); padding: 10px 14px 0;
   }
   canvas { display: block; width: 100%; }
-  #spectrum { height: 170px; }
+  #bands { height: 22px; }
+  #spectrum { height: 170px; cursor: crosshair; }
   #waterfall { height: 190px; border-top: 1px solid var(--line); }
   .nosig { padding: 26px; text-align: center; color: var(--dim); }
 
@@ -100,6 +101,7 @@ const char* cockpitPageHtml()
 
 <div class="panel">
   <h2>Spettro &middot; Waterfall</h2>
+  <canvas id="bands"></canvas>
   <canvas id="spectrum"></canvas>
   <canvas id="waterfall"></canvas>
   <div class="nosig" id="nosig" style="display:none">
@@ -118,9 +120,16 @@ const char* cockpitPageHtml()
 
 const specCv = document.getElementById("spectrum");
 const wfCv = document.getElementById("waterfall");
+const bandCv = document.getElementById("bands");
+
+let device = null;   // {freqHz, rateHz}
+let bands = [];
+const bandColors = { ham: "#3ddc97", bc: "#38b6ff", aero: "#ffb454",
+  sat: "#c792ea", marine: "#4dd0e1", ism: "#f47067", cb: "#ffd166",
+  pmr: "#f47067", nav: "#9e9e9e" };
 
 function sizeCanvases() {
-  for (const cv of [specCv, wfCv]) {
+  for (const cv of [specCv, wfCv, bandCv]) {
     const w = cv.clientWidth, h = cv.clientHeight;
     if (cv.width !== w || cv.height !== h) {
       // Conserva il waterfall gia' disegnato durante il resize.
@@ -145,6 +154,29 @@ for (let i = 0; i < 256; i++) {
   const g = Math.min(255, Math.max(0, 460 * (t - 0.25)));
   const b = Math.min(255, t < 0.5 ? 220 * t * 2 : 480 * (1 - t) + 120);
   wfLut[i] = [r | 0, g | 0, b | 0];
+}
+
+function drawBands() {
+  const ctx = bandCv.getContext("2d");
+  const w = bandCv.width, h = bandCv.height;
+  ctx.clearRect(0, 0, w, h);
+  if (!device || !device.rateHz || !bands.length) return;
+  const f0 = device.freqHz - device.rateHz / 2;
+  const f1 = device.freqHz + device.rateHz / 2;
+  ctx.font = "10px sans-serif";
+  ctx.textBaseline = "middle";
+  for (const b of bands) {
+    const x0 = Math.max(0, (b.low - f0) / (f1 - f0) * w);
+    const x1 = Math.min(w, (b.high - f0) / (f1 - f0) * w);
+    const col = bandColors[b.cat] || "#888";
+    ctx.fillStyle = col + "44";
+    ctx.fillRect(x0, 2, x1 - x0, h - 4);
+    ctx.fillStyle = col;
+    ctx.fillRect(x0, 2, 2, h - 4);
+    if (x1 - x0 > 60) {
+      ctx.fillText(b.name, x0 + 6, h / 2);
+    }
+  }
 }
 
 function drawSpectrum(db) {
@@ -189,7 +221,26 @@ function drawSpectrum(db) {
   ctx.lineWidth = 1.4;
   ctx.stroke();
 
-  // Riga nuova del waterfall.
+  // Etichette di frequenza sulla griglia verticale.
+  if (device && device.rateHz) {
+    const f0 = device.freqHz - device.rateHz / 2;
+    ctx.fillStyle = "rgba(160,190,220,.55)";
+    ctx.font = "10px monospace";
+    const ticks = 8;
+    ctx.strokeStyle = "rgba(120,160,200,.08)";
+    ctx.beginPath();
+    for (let k = 1; k < ticks; k++) {
+      const x = k * w / ticks;
+      ctx.moveTo(x, 0); ctx.lineTo(x, h);
+      const f = (f0 + device.rateHz * k / ticks) / 1e6;
+      ctx.fillText(f.toFixed(3) + " MHz", x + 4, h - 6);
+    }
+    ctx.stroke();
+  }
+
+  // Riga nuova del waterfall (solo su dati nuovi).
+  if (!drawSpectrum.newRow) return;
+  drawSpectrum.newRow = false;
   const wctx = wfCv.getContext("2d");
   wctx.drawImage(wfCv, 0, 0, wfCv.width, wfCv.height - 1,
                        0, 1, wfCv.width, wfCv.height - 1);
@@ -205,14 +256,45 @@ function drawSpectrum(db) {
   wctx.putImageData(line, 0, 0);
 }
 
+// Spettro fluido: i dati arrivano a ~5 Hz ma il disegno gira a 60 fps
+// interpolando verso l'ultimo frame ricevuto.
+let specTarget = null, specShown = null;
+
 async function pollSpectrum() {
   try {
     const d = await (await fetch("api/spectrum")).json();
     const has = d.db && d.db.length > 0;
     document.getElementById("nosig").style.display = has ? "none" : "block";
-    if (has) drawSpectrum(d.db);
+    if (has) {
+      specTarget = d.db;
+      drawSpectrum.newRow = true; // una riga di waterfall per fetch
+    }
   } catch (e) {}
 }
+
+function animate() {
+  if (specTarget) {
+    if (!specShown || specShown.length !== specTarget.length) {
+      specShown = specTarget.slice();
+    } else {
+      for (let i = 0; i < specShown.length; i++)
+        specShown[i] += (specTarget[i] - specShown[i]) * 0.35;
+    }
+    drawSpectrum(specShown);
+  }
+  requestAnimationFrame(animate);
+}
+requestAnimationFrame(animate);
+
+// Frequenza sotto il cursore.
+specCv.title = "";
+specCv.addEventListener("mousemove", e => {
+  if (!device || !device.rateHz) return;
+  const r = specCv.getBoundingClientRect();
+  const f = device.freqHz - device.rateHz / 2 +
+            (e.clientX - r.left) / r.width * device.rateHz;
+  specCv.title = (f / 1e6).toFixed(4) + " MHz";
+});
 
 function fmtFreq(hz) { return (hz / 1e6).toFixed(4); }
 function fmtRate(hz) {
@@ -227,6 +309,9 @@ async function pollStatus() {
   document.getElementById("devName").textContent = d.device.name;
   document.getElementById("devFreq").textContent = fmtFreq(d.device.freqHz);
   document.getElementById("devRate").textContent = fmtRate(d.device.rateHz);
+  device = d.device;
+  bands = d.bands || [];
+  drawBands();
 
   const cards = document.getElementById("cards");
   cards.innerHTML = d.modules.map(m => {
@@ -246,7 +331,7 @@ async function pollStatus() {
 
 pollStatus(); pollSpectrum();
 setInterval(pollStatus, 1500);
-setInterval(pollSpectrum, 250);
+setInterval(pollSpectrum, 200);
 </script>
 </body>
 </html>

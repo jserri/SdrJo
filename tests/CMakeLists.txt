@@ -53,3 +53,7 @@ add_test(NAME dsp_advanced COMMAND test_dsp_advanced)
 add_executable(test_recorder_audio test_recorder_audio.cpp)
 target_link_libraries(test_recorder_audio PRIVATE sdrjo-core)
 add_test(NAME recorder_audio COMMAND test_recorder_audio)
+
+add_executable(test_bands test_bands.cpp)
+target_link_libraries(test_bands PRIVATE sdrjo-core)
+add_test(NAME bands COMMAND test_bands)
