@@ -37,6 +37,10 @@ public:
     // Carica tutti i moduli trovati in una cartella (*.dll / *.so).
     static std::vector<LoadedModule> loadDirectory(const std::string& dir,
                                                    std::vector<std::string>* errors = nullptr);
+
+    // Cartella "modules" accanto all'eseguibile (indipendente dalla
+    // directory corrente di lavoro).
+    static std::string defaultModulesDir();
 };
 
 } // namespace sdrjo

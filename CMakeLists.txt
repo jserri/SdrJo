@@ -11,6 +11,20 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+if(MSVC)
+    # M_PI e soci da <cmath>, niente macro min/max da windows.h.
+    add_compile_definitions(_USE_MATH_DEFINES NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
+# Tutti gli eseguibili in build/bin e i moduli plugin in build/bin/modules,
+# cosi' l'app trova i moduli senza copiare file a mano.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/modules)
+foreach(cfg IN ITEMS RELEASE DEBUG RELWITHDEBINFO MINSIZEREL)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${cfg} ${CMAKE_BINARY_DIR}/bin)
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${cfg} ${CMAKE_BINARY_DIR}/bin/modules)
+endforeach()
+
 # ---------------------------------------------------------------------------
 # Opzioni di build
 # ---------------------------------------------------------------------------
@@ -22,17 +36,9 @@ else()
     option(SDRJO_BUILD_GUI "Compila la GUI (Dear ImGui + GLFW)" OFF)
 endif()
 
-# librtlsdr: facoltativa: senza, l'app funziona solo da file IQ registrati.
-# Per la RTL-SDR Blog V4 serve il driver del fork rtl-sdr-blog (>= 2023).
-find_library(RTLSDR_LIBRARY rtlsdr)
-find_path(RTLSDR_INCLUDE_DIR rtl-sdr.h)
-if(RTLSDR_LIBRARY AND RTLSDR_INCLUDE_DIR)
-    set(SDRJO_HAVE_RTLSDR ON)
-    message(STATUS "librtlsdr trovata: ${RTLSDR_LIBRARY}")
-else()
-    set(SDRJO_HAVE_RTLSDR OFF)
-    message(STATUS "librtlsdr NON trovata: la sorgente hardware RTL-SDR sara' disabilitata")
-endif()
+# librtlsdr viene caricata A RUNTIME (rtlsdr.dll su Windows, librtlsdr.so
+# su Linux): non serve nulla in fase di compilazione. Basta mettere la DLL
+# del driver rtl-sdr-blog accanto all'eseguibile (vedi README).
 
 add_subdirectory(core)
 add_subdirectory(modules/adsb)

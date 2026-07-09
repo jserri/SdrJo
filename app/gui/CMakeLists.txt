@@ -38,3 +38,8 @@ target_link_libraries(sdrjo PRIVATE
     imgui-backend
     OpenGL::GL
 )
+
+if(MSVC)
+    # Sottosistema GUI (niente finestra console) mantenendo main() standard.
+    set_target_properties(sdrjo PROPERTIES LINK_FLAGS "/ENTRY:mainCRTStartup")
+endif()

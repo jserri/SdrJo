@@ -25,6 +25,7 @@
 #include <sdrjo/dsp/types.hpp>
 #include <sdrjo/web/cockpit_server.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>

@@ -6,6 +6,7 @@
 #include <sdrjo/dsp/demod.hpp>
 #include "test_util.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 

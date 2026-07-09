@@ -1,13 +1,16 @@
 #pragma once
 //
-// Sorgente RTL-SDR basata su librtlsdr.
+// Sorgente RTL-SDR con caricamento di librtlsdr A RUNTIME (come SDR#):
+// nessuna dipendenza in fase di build. All'avvio si cerca:
+//   - Windows: rtlsdr.dll / librtlsdr.dll accanto all'eseguibile o nel PATH
+//   - Linux:   librtlsdr.so.2 / .so.0 / .so
 //
-// NOTA per RTL-SDR Blog V4: la V4 monta il tuner R828D e un upconverter
-// interno per le HF; e' PIENAMENTE supportata solo dal driver del fork
-// "rtl-sdr-blog" (https://github.com/rtlsdrblog/rtl-sdr-blog).
-// Su Windows: installare il driver WinUSB con Zadig e mettere le DLL del
-// fork accanto all'eseguibile. Con la librtlsdr "vanilla" vecchia la V4
-// sintonizza male sotto i 28 MHz e con offset di frequenza.
+// NOTA per RTL-SDR Blog V4: la V4 monta il tuner R828D ed e' PIENAMENTE
+// supportata solo dalle DLL del fork "rtl-sdr-blog"
+// (https://github.com/rtlsdrblog/rtl-sdr-blog/releases). Scaricare la
+// versione x86 o x64 corrispondente alla build dell'app. Su Windows va
+// prima installato il driver WinUSB con Zadig. Con la librtlsdr "vanilla"
+// vecchia la V4 sintonizza con offset ed e' sorda sotto i 28 MHz.
 //
 #include "sample_source.hpp"
 
@@ -16,19 +19,24 @@
 #include <thread>
 #include <vector>
 
-#if defined(SDRJO_HAVE_RTLSDR)
-
-struct rtlsdr_dev; // forward (da rtl-sdr.h)
+struct rtlsdr_dev; // opaco, definito dentro librtlsdr
 
 namespace sdrjo {
 
 class RtlSdrSource : public ISampleSource {
 public:
+    // true se librtlsdr e' stata trovata e caricata correttamente.
+    static bool available();
+
+    // Messaggio d'aiuto quando available() == false (quale file manca).
+    static std::string libraryHint();
+
     struct DeviceDesc {
         uint32_t index;
         std::string name;
         std::string serial;
     };
+    // Elenco chiavette collegate (vuoto se libreria assente).
     static std::vector<DeviceDesc> enumerate();
 
     explicit RtlSdrSource(uint32_t deviceIndex = 0);
@@ -48,7 +56,7 @@ public:
     bool setPpmCorrection(int ppm);
 
     // Bias-T per alimentare LNA esterni (utile per LRPT/ADS-B).
-    // Richiede librtlsdr recente (fork rtl-sdr-blog o >= 0.8).
+    // Ritorna false se la DLL caricata non espone la funzione.
     bool setBiasTee(bool on);
 
     bool start(IqCallback cb) override;
@@ -67,5 +75,3 @@ private:
 };
 
 } // namespace sdrjo
-
-#endif // SDRJO_HAVE_RTLSDR

@@ -71,6 +71,24 @@ LoadedModule ModuleLoader::load(const std::string& libraryPath)
     return lm;
 }
 
+std::string ModuleLoader::defaultModulesDir()
+{
+    namespace fs = std::filesystem;
+    fs::path exeDir;
+#if defined(_WIN32)
+    char buf[MAX_PATH] = {0};
+    GetModuleFileNameA(nullptr, buf, MAX_PATH);
+    exeDir = fs::path(buf).parent_path();
+#elif defined(__linux__)
+    std::error_code ec;
+    exeDir = fs::read_symlink("/proc/self/exe", ec).parent_path();
+    if (ec) exeDir = fs::current_path();
+#else
+    exeDir = fs::current_path();
+#endif
+    return (exeDir / "modules").string();
+}
+
 std::vector<LoadedModule> ModuleLoader::loadDirectory(const std::string& dir,
                                                       std::vector<std::string>* errors)
 {

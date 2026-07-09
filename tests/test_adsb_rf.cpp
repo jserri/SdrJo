@@ -6,6 +6,7 @@
 #include <sdrjo/adsb/mode_s.hpp>
 #include "test_util.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <vector>

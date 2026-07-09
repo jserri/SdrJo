@@ -22,7 +22,9 @@ bool FileSource::start(IqCallback cb)
 
 void FileSource::stop()
 {
-    if (!running_.exchange(false)) return;
+    running_.store(false);
+    // Join incondizionato: il worker puo' essere gia' terminato da solo
+    // (fine del file) ma il thread resta joinable finche' non lo si unisce.
     if (worker_.joinable()) worker_.join();
 }
 

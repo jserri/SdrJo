@@ -18,9 +18,7 @@
 #include <sdrjo/web/cockpit_server.hpp>
 #include <sdrjo/source/sample_source.hpp>
 #include <sdrjo/source/file_source.hpp>
-#if defined(SDRJO_HAVE_RTLSDR)
 #include <sdrjo/source/rtl_sdr_source.hpp>
-#endif
 #include <sdrjo/util/ring_buffer.hpp>
 
 #include <algorithm>
@@ -137,30 +135,34 @@ void drawDevicePanel(AppState& app)
     ImGui::Begin("Dispositivo");
 
     if (!app.source) {
-#if defined(SDRJO_HAVE_RTLSDR)
-        auto devices = sdrjo::RtlSdrSource::enumerate();
-        ImGui::Text("RTL-SDR trovate: %zu", devices.size());
-        for (auto& d : devices) {
-            ImGui::BulletText("#%u %s (%s)", d.index, d.name.c_str(),
-                              d.serial.c_str());
-        }
-        if (!devices.empty() && ImGui::Button("Avvia")) {
-            try {
-                auto src = std::make_unique<sdrjo::RtlSdrSource>(devices[0].index);
-                src->setCenterFrequency(app.freqMHz * 1e6);
-                src->setSampleRate(app.sampleRate);
-                src->start([&app](const sdrjo::cfloat* s, size_t n) {
-                    app.iqRing.write(s, n);
-                });
-                app.source = std::move(src);
-            } catch (const std::exception& e) {
-                app.log("Dispositivo", e.what());
+        if (!sdrjo::RtlSdrSource::available()) {
+            // librtlsdr caricata a runtime: se manca, spiega cosa fare.
+            ImGui::TextWrapped("%s", sdrjo::RtlSdrSource::libraryHint().c_str());
+        } else {
+            auto devices = sdrjo::RtlSdrSource::enumerate();
+            ImGui::Text("RTL-SDR trovate: %zu", devices.size());
+            if (devices.empty()) {
+                ImGui::TextWrapped("Nessuna chiavetta rilevata: controlla il "
+                                   "cavo USB e il driver WinUSB (Zadig).");
+            }
+            for (auto& d : devices) {
+                ImGui::BulletText("#%u %s (%s)", d.index, d.name.c_str(),
+                                  d.serial.c_str());
+            }
+            if (!devices.empty() && ImGui::Button("Avvia")) {
+                try {
+                    auto src = std::make_unique<sdrjo::RtlSdrSource>(devices[0].index);
+                    src->setCenterFrequency(app.freqMHz * 1e6);
+                    src->setSampleRate(app.sampleRate);
+                    src->start([&app](const sdrjo::cfloat* s, size_t n) {
+                        app.iqRing.write(s, n);
+                    });
+                    app.source = std::move(src);
+                } catch (const std::exception& e) {
+                    app.log("Dispositivo", e.what());
+                }
             }
         }
-#else
-        ImGui::TextWrapped("Compilato senza librtlsdr: disponibile solo la "
-                           "riproduzione da file IQ.");
-#endif
     } else {
         ImGui::Text("%s attivo", app.source->name().c_str());
         double freq = app.freqMHz;
@@ -251,7 +253,8 @@ int main(int, char**)
 
     // Carica i moduli dalla cartella "modules" accanto all'eseguibile.
     std::vector<std::string> loadErrors;
-    app.modules = sdrjo::ModuleLoader::loadDirectory("modules", &loadErrors);
+    app.modules = sdrjo::ModuleLoader::loadDirectory(
+        sdrjo::ModuleLoader::defaultModulesDir(), &loadErrors);
     for (auto& e : loadErrors) app.log("Loader", e);
     for (auto& lm : app.modules) lm.module()->start(app);
 

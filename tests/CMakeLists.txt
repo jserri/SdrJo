@@ -41,3 +41,7 @@ add_test(NAME apt COMMAND test_apt)
 add_executable(test_cockpit test_cockpit.cpp)
 target_link_libraries(test_cockpit PRIVATE sdrjo-core)
 add_test(NAME cockpit COMMAND test_cockpit)
+
+add_executable(test_sources test_sources.cpp)
+target_link_libraries(test_sources PRIVATE sdrjo-core)
+add_test(NAME sources COMMAND test_sources)

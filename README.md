@@ -54,38 +54,60 @@ non serve toccare l'app principale.
 | GUI (spettro + waterfall + moduli) | 🔧 scritta, da provare su Windows |
 | Uscita audio | 📋 da fare |
 
-## Compilazione su Windows
+## Compilazione su Windows (32 e 64 bit)
 
-Prerequisiti: [CMake](https://cmake.org), Visual Studio 2022 (o MSYS2/MinGW) e Git.
+Prerequisiti: [CMake](https://cmake.org), Visual Studio (Community va bene) e
+Git. La GUI scarica da sola Dear ImGui e GLFW alla prima configurazione.
 
 ```bat
 git clone https://github.com/jserri/SdrJo.git
 cd SdrJo
-cmake -B build -DSDRJO_BUILD_GUI=ON
-cmake --build build --config Release
+
+:: build a 64 bit
+cmake -B build64 -A x64
+cmake --build build64 --config Release
+
+:: build a 32 bit
+cmake -B build32 -A Win32
+cmake --build build32 --config Release
 ```
 
-La GUI scarica da sola Dear ImGui e GLFW (serve la connessione a internet la
-prima volta). Per la sorgente hardware serve **librtlsdr**: il modo più
-semplice è `vcpkg install rtlsdr` oppure copiare le DLL del driver
-[rtl-sdr-blog](https://github.com/rtlsdrblog/rtl-sdr-blog/releases) accanto
-all'eseguibile.
+> Se usi il **Developer Command Prompt** (generatore NMake), l'architettura
+> segue il prompt: "x64 Native Tools" produce 64 bit, quello base x86
+> produce 32 bit. In quel caso ometti `-A`.
 
-### Nota importante per la RTL-SDR Blog V4
+Al termine trovi tutto gia' al suo posto in `buildXX\bin\`:
+`sdrjo.exe`, `sdrjo-cli.exe` e la cartella `modules\` con i plugin.
 
-La V4 (tuner R828D) è pienamente supportata **solo dal driver del fork
-rtl-sdr-blog**: con la librtlsdr "vanilla" vecchia sintonizza con offset ed è
-sorda sotto i 28 MHz. Quindi:
+### Collegare la chiavetta (RTL-SDR V4 inclusa)
 
-1. installare il driver USB **WinUSB** con [Zadig](https://zadig.akeo.ie)
-   (seleziona "Bulk-In Interface 0" della chiavetta);
-2. usare le DLL compilate del fork
-   [rtl-sdr-blog](https://github.com/rtlsdrblog/rtl-sdr-blog) (≥ 2023);
-3. per HF (onde corte) basta sintonizzare sotto i 28 MHz: l'upconverter
-   interno della V4 viene gestito automaticamente dal driver.
+**librtlsdr non serve per compilare**: viene caricata a runtime. Per far
+riconoscere la chiavetta:
 
-Il bias-T della V4 (per alimentare un LNA esterno, molto utile per LRPT e
-ADS-B) si attiva da `RtlSdrSource::setBiasTee(true)`.
+1. installa il driver USB **WinUSB** con [Zadig](https://zadig.akeo.ie):
+   collega la chiavetta, `Options > List All Devices`, seleziona
+   "Bulk-In, Interface (Interface 0)" e premi *Install Driver*;
+2. scarica le DLL del driver dal fork
+   [rtl-sdr-blog releases](https://github.com/rtlsdrblog/rtl-sdr-blog/releases)
+   (obbligatorio per la **V4**; la versione vanilla la sintonizza male);
+3. copia `rtlsdr.dll` **della stessa architettura dell'app** (x64 con la
+   build a 64 bit, x86 con quella a 32) in `build\bin\` accanto a
+   `sdrjo.exe`, insieme alla `libusb-1.0.dll` fornita nello stesso zip.
+
+Se la DLL manca o e' dell'architettura sbagliata, il pannello Dispositivo
+di SdrJo lo dice chiaramente (niente crash, niente build da rifare).
+
+Per le HF (onde corte) con la V4 basta sintonizzare sotto i 28 MHz:
+l'upconverter interno e' gestito dal driver. Il bias-T per alimentare un
+LNA esterno si attiva con `RtlSdrSource::setBiasTee(true)`.
+
+### Problemi comuni di compilazione
+
+- **`M_PI: identificatore non dichiarato`** / **`std::min non trovato`**:
+  risolti nel progetto (definizioni MSVC globali) — aggiorna all'ultima
+  versione del repo e riconfigura da zero (cancella la cartella build).
+- **`_WinMain@16 non risolto`**: risolto, la GUI usa l'entry point
+  standard `main()` anche in modalita' finestra.
 
 ## Compilazione su Linux (sviluppo/test)
 
