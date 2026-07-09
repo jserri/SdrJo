@@ -59,6 +59,15 @@ public:
 
     size_t caduCount() const { return caduCount_; }
 
+    std::string statusJson() const override
+    {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      "{\"CADU\":\"%zu\",\"Aggancio\":\"%s\"}",
+                      caduCount_, demod_.locked() ? "si" : "no");
+        return buf;
+    }
+
 private:
     static constexpr size_t kViterbiChunk = kCaduBytes * 8 * 2 * 4;
 

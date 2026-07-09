@@ -20,8 +20,10 @@
 #include <sdrjo/adsb/preamble_detector.hpp>
 #include <sdrjo/adsb/aircraft_tracker.hpp>
 #include <sdrjo/adsb/adsb_server.hpp>
+#include <sdrjo/adsb/sbs_output.hpp>
 #include <sdrjo/morse/cw_decoder.hpp>
 #include <sdrjo/dsp/types.hpp>
+#include <sdrjo/web/cockpit_server.hpp>
 
 #include <chrono>
 #include <cmath>
@@ -167,12 +169,23 @@ static int cmdAdsbServe(int argc, char** argv)
     std::printf("mappa voli: http://localhost:%u  (Ctrl+C per uscire)\n",
                 web.port());
 
+    adsb::SbsOutput sbs;
+    if (sbs.start(adsb::SbsOutput::kDefaultPort, true))
+        std::printf("uscita SBS/BaseStation: porta %u\n", sbs.port());
+
     size_t frames = 0;
     adsb::PreambleDetector det([&](const uint8_t* frame, size_t len) {
         adsb::ModeSMessage msg;
         if (adsb::decode(frame, len, msg)) {
             std::lock_guard<std::mutex> lk(mutex);
             tracker.update(msg);
+            const adsb::Aircraft* ac = tracker.find(msg.icao);
+            if (ac && ac->hasPosition && msg.hasCprPosition) {
+                adsb::Position pos{ac->latDeg, ac->lonDeg};
+                sbs.publish(msg, &pos, ac->altitudeFt);
+            } else {
+                sbs.publish(msg);
+            }
             frames++;
         }
     });
@@ -210,6 +223,66 @@ static int cmdAdsbServe(int argc, char** argv)
     return 0;
 }
 
+// Cockpit con dati simulati: per sviluppare/valutare l'interfaccia web
+// senza hardware ne' registrazioni.
+static int cmdCockpitDemo()
+{
+    sdrjo::CockpitServer cockpit;
+    cockpit.setDeviceInfo("RTL-SDR V4 (demo)", 1090.0e6, 2.0e6);
+
+    cockpit.setStatusProvider([] {
+        std::vector<sdrjo::CockpitServer::ModuleStatus> out;
+        out.push_back({"ADS-B", "Monitoraggio aerei su 1090 MHz",
+                       "{\"Aerei\":\"7\",\"Con posizione\":\"5\","
+                       "\"Messaggi\":\"12840\",\"SBS clients\":\"1\"}",
+                       8757});
+        out.push_back({"RDS", "Nome stazione e RadioText dalle radio FM",
+                       "{\"Stazione\":\"SDRJO FM\",\"PI\":\"5264\","
+                       "\"RadioText\":\"CIAO DA SDRJO!\",\"Gruppi\":\"312\"}",
+                       0});
+        out.push_back({"NOAA APT", "Immagini meteo NOAA 15/18/19",
+                       "{\"Righe\":\"482\",\"Con sync\":\"475\","
+                       "\"Immagine\":\"apt_ricezione.bmp\"}",
+                       0});
+        out.push_back({"Meteor LRPT", "Immagini digitali Meteor-M N2-3/N2-4",
+                       "{\"CADU\":\"1204\",\"Aggancio\":\"si\"}", 0});
+        out.push_back({"Morse (CW)", "Decodifica telegrafia CW",
+                       "{\"Testo\":\"CQ CQ DE SDRJO\",\"WPM\":\"18\"}", 0});
+        return out;
+    });
+
+    cockpit.setSpectrumProvider([] {
+        // Spettro finto ma realistico: rumore + portanti.
+        static double t = 0.0;
+        t += 0.15;
+        std::vector<float> db(1024);
+        for (size_t i = 0; i < db.size(); i++) {
+            double x = double(i) / db.size();
+            double noise = -95.0 + 3.0 * std::sin(t * 1.7 + i * 0.37) +
+                           2.0 * std::sin(t * 3.1 + i * 1.13);
+            auto carrier = [&](double c, double w, double a) {
+                double d = (x - c) / w;
+                return a * std::exp(-d * d);
+            };
+            double sig = carrier(0.50, 0.004, 55.0) +
+                         carrier(0.27, 0.010, 40.0 + 6.0 * std::sin(t)) +
+                         carrier(0.73, 0.006, 30.0 + 8.0 * std::sin(t * 0.7)) +
+                         carrier(0.88, 0.003, 25.0);
+            db[i] = float(noise + sig);
+        }
+        return db;
+    });
+
+    if (!cockpit.start()) {
+        std::fprintf(stderr, "porta %u occupata\n",
+                     sdrjo::CockpitServer::kDefaultPort);
+        return 1;
+    }
+    std::printf("SdrJo Cockpit (demo): http://localhost:%u\n", cockpit.port());
+    while (true) std::this_thread::sleep_for(std::chrono::seconds(3600));
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
@@ -218,8 +291,9 @@ int main(int argc, char** argv)
             "  %s adsb-hex <frame> [...]\n"
             "  %s adsb-iq <file.bin>\n"
             "  %s adsb-serve <file.bin|-> [lat lon] [porta]\n"
-            "  %s morse-iq <file.bin> <sample_rate>\n",
-            argv[0], argv[0], argv[0], argv[0]);
+            "  %s morse-iq <file.bin> <sample_rate>\n"
+            "  %s cockpit-demo\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 1;
     }
 
@@ -228,6 +302,7 @@ int main(int argc, char** argv)
     if (cmd == "adsb-iq" && argc >= 3) return cmdAdsbIq(argv[2]);
     if (cmd == "adsb-serve" && argc >= 3) return cmdAdsbServe(argc - 2, argv + 2);
     if (cmd == "morse-iq" && argc >= 4) return cmdMorseIq(argv[2], std::atof(argv[3]));
+    if (cmd == "cockpit-demo") return cmdCockpitDemo();
 
     std::fprintf(stderr, "comando sconosciuto: %s\n", cmd.c_str());
     return 1;

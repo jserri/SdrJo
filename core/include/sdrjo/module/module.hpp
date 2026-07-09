@@ -25,7 +25,7 @@ namespace sdrjo {
 
 // Versione dell'ABI: da incrementare a ogni modifica incompatibile
 // di questa interfaccia. L'host rifiuta i moduli con ABI diversa.
-constexpr uint32_t kModuleAbiVersion = 1;
+constexpr uint32_t kModuleAbiVersion = 2;
 
 struct ModuleInfo {
     std::string name;        // es. "ADS-B"
@@ -68,6 +68,15 @@ public:
 
     // Hook per la GUI (chiamato nel thread di rendering ImGui).
     virtual void drawUi() {}
+
+    // Stato corrente in JSON per il Cockpit web: coppie chiave/valore da
+    // mostrare nella card del modulo, es. {"Aerei":"12","Messaggi":"4813"}.
+    // Chiamato da un thread diverso da processIq: proteggere lo stato.
+    virtual std::string statusJson() const { return "{}"; }
+
+    // Porta dell'eventuale interfaccia web dedicata (0 = nessuna),
+    // es. la mappa voli del modulo ADS-B.
+    virtual uint16_t webPort() const { return 0; }
 };
 
 } // namespace sdrjo

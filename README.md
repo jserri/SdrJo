@@ -9,15 +9,26 @@ qualsiasi chiavetta RTL2832U.
 
 ```
 core/                 Libreria base: DSP (FFT, FIR, demod FM/AM), API moduli,
-                      sorgenti campioni (RTL-SDR, file IQ)
-modules/adsb/         Monitoraggio aerei su 1090 MHz (Mode S / ADS-B)
-modules/morse/        Decodifica telegrafia CW con stima automatica dei WPM
+                      sorgenti campioni (RTL-SDR, file IQ), server web/TCP,
+                      Cockpit web
+modules/adsb/         Aerei su 1090 MHz: mappa web + uscita SBS (porta 30003)
+modules/rds/          Nome stazione e RadioText dalle radio FM (RDS)
+modules/noaa_apt/     Immagini meteo NOAA 15/18/19 (APT su 137 MHz)
 modules/meteor_lrpt/  Immagini meteo Meteor-M N2-3 / N2-4 (LRPT su 137 MHz)
-app/gui/              GUI Dear ImGui: spettro, waterfall, gestione moduli
+modules/morse/        Decodifica telegrafia CW con stima automatica dei WPM
+app/gui/              GUI nativa Dear ImGui + Cockpit web integrato
 app/cli/              Strumento a riga di comando per provare i decoder
 tests/                Test automatici (ctest)
 docs/                 Architettura e roadmap
 ```
+
+## Il Cockpit
+
+La plancia di SdrJo e' **web-based**: l'app serve su `http://localhost:8750`
+una dashboard moderna con spettro + waterfall live, il frequenzimetro e le
+card di stato di tutti i moduli — consultabile anche da tablet o telefono
+sulla rete locale. La GUI nativa (ImGui) resta per il controllo del
+dispositivo e usa lo stesso tema scuro.
 
 Ogni modulo è una libreria dinamica (`.dll` su Windows) caricata a runtime
 dalla cartella `modules/` accanto all'eseguibile: per aggiungere un decoder
@@ -32,6 +43,10 @@ non serve toccare l'app principale.
 | Sorgente RTL-SDR (V3/V4) e da file IQ | ✅ implementato (V4: vedi nota driver) |
 | ADS-B: preambolo, CRC, callsign, posizione CPR, velocità | ✅ implementato e testato |
 | ADS-B: mappa web dei voli (stile SDRAngel/tar1090) | ✅ implementata e testata |
+| ADS-B: uscita SBS/BaseStation porta 30003 (VRS, PlanePlotter...) | ✅ implementata e testata |
+| RDS: PI, PTY, nome stazione (PS) e RadioText | ✅ implementato e testato (anche end-to-end dal multiplex) |
+| NOAA APT: sync, righe immagine, salvataggio BMP | ✅ implementato e testato |
+| Cockpit web (dashboard moderna, senza dipendenze) | ✅ implementato e testato |
 | Morse: decoder adattivo (velocità e pitch qualsiasi) | ✅ implementato e testato |
 | Meteor LRPT: Viterbi CCSDS, derandomizer, sync CADU | ✅ implementato e testato |
 | Meteor LRPT: QPSK (Costas + Gardner) | 🔧 scheletro, da tarare su registrazioni reali |

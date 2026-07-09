@@ -11,8 +11,11 @@
 #include <imgui_impl_opengl3.h>
 #include <GLFW/glfw3.h>
 
+#include "theme.hpp"
+
 #include <sdrjo/dsp/fft.hpp>
 #include <sdrjo/module/module_loader.hpp>
+#include <sdrjo/web/cockpit_server.hpp>
 #include <sdrjo/source/sample_source.hpp>
 #include <sdrjo/source/file_source.hpp>
 #if defined(SDRJO_HAVE_RTLSDR)
@@ -51,6 +54,9 @@ struct AppState : public sdrjo::IModuleHost {
     std::vector<std::string> logLines;
     std::mutex logMutex;
 
+    sdrjo::CockpitServer cockpit;
+    std::mutex spectrumMutex; // lo spettro e' letto anche dal thread HTTP
+
     // ---- IModuleHost ----
     void log(const std::string& mod, const std::string& text) override
     {
@@ -81,7 +87,11 @@ void updateSpectrum(AppState& app)
     static std::vector<sdrjo::cfloat> chunk(kFftSize);
     while (app.iqRing.available() >= kFftSize) {
         app.iqRing.read(chunk.data(), kFftSize);
-        sdrjo::dsp::powerSpectrumDb(chunk.data(), kFftSize, app.spectrum.data());
+        {
+            std::lock_guard<std::mutex> lk(app.spectrumMutex);
+            sdrjo::dsp::powerSpectrumDb(chunk.data(), kFftSize,
+                                        app.spectrum.data());
+        }
 
         // Riga nel waterfall circolare.
         std::memcpy(&app.waterfall[size_t(app.waterfallHead) * kFftSize],
@@ -193,12 +203,17 @@ void drawModulesPanel(AppState& app)
     }
     for (auto& lm : app.modules) {
         auto info = lm.module()->info();
-        if (ImGui::CollapsingHeader(info.name.c_str())) {
-            ImGui::TextWrapped("%s", info.description.c_str());
-            ImGui::Text("v%s", info.version.c_str());
+        if (ImGui::CollapsingHeader(info.name.c_str(),
+                                    ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::TextDisabled("%s", info.description.c_str());
+            uint16_t port = lm.module()->webPort();
+            if (port) ImGui::Text("Interfaccia web: http://localhost:%u", port);
             lm.module()->drawUi();
         }
     }
+    ImGui::Separator();
+    ImGui::TextDisabled("Cockpit completo: http://localhost:%u",
+                        app.cockpit.port());
     ImGui::End();
 }
 
@@ -228,7 +243,7 @@ int main(int, char**)
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGui::StyleColorsDark();
+    sdrjo::gui::applyTheme();
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
 
@@ -240,11 +255,36 @@ int main(int, char**)
     for (auto& e : loadErrors) app.log("Loader", e);
     for (auto& lm : app.modules) lm.module()->start(app);
 
+    // Cockpit web: la plancia di SdrJo, anche per tablet/telefono in LAN.
+    app.cockpit.setStatusProvider([&app] {
+        std::vector<sdrjo::CockpitServer::ModuleStatus> out;
+        for (auto& lm : app.modules) {
+            auto info = lm.module()->info();
+            out.push_back({info.name, info.description,
+                           lm.module()->statusJson(),
+                           lm.module()->webPort()});
+        }
+        return out;
+    });
+    app.cockpit.setSpectrumProvider([&app] {
+        std::lock_guard<std::mutex> lk(app.spectrumMutex);
+        return app.source ? app.spectrum : std::vector<float>{};
+    });
+    app.cockpit.setTuneHandler([&app](double freqHz) {
+        return app.requestTune(freqHz, app.sampleRate);
+    });
+    if (app.cockpit.start())
+        app.log("Cockpit", "http://localhost:" +
+                               std::to_string(app.cockpit.port()));
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
         updateSpectrum(app);
         uploadWaterfallTexture(app);
+        app.cockpit.setDeviceInfo(
+            app.source ? app.source->name() : "nessuna sorgente",
+            app.freqMHz * 1e6, app.sampleRate);
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
@@ -265,6 +305,7 @@ int main(int, char**)
         glfwSwapBuffers(window);
     }
 
+    app.cockpit.stop();
     for (auto& lm : app.modules) lm.module()->stop();
     if (app.source) app.source->stop();
 

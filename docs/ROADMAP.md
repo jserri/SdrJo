@@ -4,14 +4,24 @@ Tutte le idee qui sotto sono realizzabili con la sola **RTL-SDR Blog V4**
 (24 MHz – 1.7 GHz + HF via upconverter interno), al più con un'antenna adatta
 e per alcune un LNA alimentato dal bias-T integrato.
 
+## Fatti di recente
+
+- **RDS su FM broadcast** — decoder completo (checkword, sync blocchi,
+  gruppi 0A/2A: PS e RadioText) testato end-to-end dal multiplex a 57 kHz.
+  Prossimi passi: lista AF, CT (orologio), TMC.
+- **NOAA APT** — inviluppo della sottoportante 2400 Hz, aggancio del sync A,
+  righe immagine e salvataggio BMP. Prossimi passi: correzione Doppler,
+  falso colore, telemetria per la calibrazione.
+- **Cockpit web** — la dashboard di SdrJo (spettro/waterfall live e card dei
+  moduli). Prossimi passi: click-to-tune sullo spettro, websocket al posto
+  del polling, immagini APT/LRPT inline.
+
 ## In lavorazione
 
-- **ADS-B (1090 MHz)** — decoder e **mappa web dei voli** funzionanti
-  (icone orientate, scie, cerchi di portata, distanza/rilevamento
-  dall'antenna). Prossimi passi: correzione errori a 1 bit sul CRC,
-  uscita in formato SBS/BaseStation (porta 30003) per alimentare altri
-  programmi, foto/dati aereo da database ICAO offline, grafico polare
-  della portata dell'antenna.
+- **ADS-B (1090 MHz)** — decoder, **mappa web dei voli** e **uscita
+  SBS/BaseStation (porta 30003)** funzionanti. Prossimi passi: correzione
+  errori a 1 bit sul CRC, database ICAO offline, grafico polare della
+  portata dell'antenna.
 - **Morse (CW)** — funzionante. Prossimi passi: filtro audio stretto attorno
   al tono con Goertzel, waterfall audio nella GUI.
 - **Meteor-M LRPT (137.1 / 137.9 MHz)** — Viterbi, derandomizer e sync CADU
@@ -24,8 +34,6 @@ e per alcune un LNA alimentato dal bias-T integrato.
 
 | Modulo | Frequenza | Note |
 |---|---|---|
-| **RDS su FM broadcast** | 87.5–108 MHz | nome stazione e radiotesto; ottimo secondo modulo "digitale", segnale fortissimo |
-| **NOAA APT** | 137.62 / 137.9125 / 137.1 MHz | immagini meteo analogiche dei NOAA 15/18/19: molto più semplice di LRPT (FM + AM 2400 Hz), riusa il ricevitore a 137 MHz |
 | **Sensori ISM 433/868 MHz** | 433.92 / 868 MHz | stazioni meteo, sensori porta, TPMS delle gomme — stile `rtl_433`; decoder OOK/FSK generico a profili |
 | **POCSAG / cercapersone** | ~466 MHz (varia per paese) | FSK 512–2400 bps, decoder semplice e didattico |
 | **AIS navale** | 161.975 / 162.025 MHz | posizione delle navi, GMSK 9600; ottimo se vivi vicino alla costa |

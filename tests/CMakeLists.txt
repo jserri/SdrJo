@@ -25,3 +25,19 @@ add_test(NAME geo COMMAND test_geo)
 add_executable(test_adsb_server test_adsb_server.cpp)
 target_link_libraries(test_adsb_server PRIVATE adsb-decoder)
 add_test(NAME adsb_server COMMAND test_adsb_server)
+
+add_executable(test_sbs test_sbs.cpp)
+target_link_libraries(test_sbs PRIVATE adsb-decoder)
+add_test(NAME sbs COMMAND test_sbs)
+
+add_executable(test_rds test_rds.cpp)
+target_link_libraries(test_rds PRIVATE rds-decoder)
+add_test(NAME rds COMMAND test_rds)
+
+add_executable(test_apt test_apt.cpp)
+target_link_libraries(test_apt PRIVATE apt-decoder)
+add_test(NAME apt COMMAND test_apt)
+
+add_executable(test_cockpit test_cockpit.cpp)
+target_link_libraries(test_cockpit PRIVATE sdrjo-core)
+add_test(NAME cockpit COMMAND test_cockpit)

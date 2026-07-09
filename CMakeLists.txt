@@ -38,6 +38,8 @@ add_subdirectory(core)
 add_subdirectory(modules/adsb)
 add_subdirectory(modules/morse)
 add_subdirectory(modules/meteor_lrpt)
+add_subdirectory(modules/rds)
+add_subdirectory(modules/noaa_apt)
 
 if(SDRJO_BUILD_CLI)
     add_subdirectory(app/cli)

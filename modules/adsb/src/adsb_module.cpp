@@ -6,6 +6,7 @@
 #include "sdrjo/adsb/adsb_server.hpp"
 #include "sdrjo/adsb/aircraft_tracker.hpp"
 #include "sdrjo/adsb/preamble_detector.hpp"
+#include "sdrjo/adsb/sbs_output.hpp"
 
 #include <cstdio>
 #include <memory>
@@ -47,10 +48,17 @@ public:
             host.log("ADS-B", "porta web occupata: mappa non disponibile");
             web_.reset();
         }
+
+        // Uscita SBS/BaseStation per Virtual Radar Server & co.
+        if (sbs_.start()) {
+            host.log("ADS-B", "uscita SBS sulla porta " +
+                                  std::to_string(sbs_.port()));
+        }
     }
 
     void stop() override
     {
+        sbs_.stop();
         if (web_) web_->stop();
         web_.reset();
         host_ = nullptr;
@@ -67,6 +75,26 @@ public:
         // activeAircraft(); qui non serve altro per la versione CLI.
     }
 
+    std::string statusJson() const override
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto active = tracker_.activeAircraft(60.0);
+        size_t withPos = 0;
+        for (const auto& ac : active) if (ac.hasPosition) withPos++;
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+                      "{\"Aerei\":\"%zu\",\"Con posizione\":\"%zu\","
+                      "\"Messaggi\":\"%zu\",\"SBS clients\":\"%zu\"}",
+                      active.size(), withPos, tracker_.totalMessages(),
+                      sbs_.clientCount());
+        return buf;
+    }
+
+    uint16_t webPort() const override
+    {
+        return web_ ? web_->port() : 0;
+    }
+
     AircraftTracker& tracker() { return tracker_; }
 
 private:
@@ -77,6 +105,15 @@ private:
 
         std::lock_guard<std::mutex> lk(mutex_);
         tracker_.update(msg);
+
+        // Pubblica sull'uscita SBS (con posizione risolta, se disponibile).
+        const Aircraft* ac = tracker_.find(msg.icao);
+        if (ac && ac->hasPosition && msg.hasCprPosition) {
+            Position pos{ac->latDeg, ac->lonDeg};
+            sbs_.publish(msg, &pos, ac->altitudeFt);
+        } else {
+            sbs_.publish(msg);
+        }
 
         if (host_ && msg.hasCallsign) {
             char line[64];
@@ -89,8 +126,9 @@ private:
     IModuleHost* host_ = nullptr;
     PreambleDetector detector_;
     AircraftTracker tracker_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::unique_ptr<AdsbWebServer> web_;
+    SbsOutput sbs_;
 };
 
 } // namespace sdrjo::adsb

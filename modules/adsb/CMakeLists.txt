@@ -4,6 +4,7 @@ add_library(adsb-decoder STATIC
     src/preamble_detector.cpp
     src/aircraft_tracker.cpp
     src/adsb_json.cpp
+    src/sbs_output.cpp
     src/adsb_web_page.cpp
 )
 target_include_directories(adsb-decoder PUBLIC include)

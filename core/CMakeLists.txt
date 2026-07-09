@@ -4,6 +4,10 @@ add_library(sdrjo-core STATIC
     src/dsp/demod.cpp
     src/module/module_loader.cpp
     src/util/http_server.cpp
+    src/util/tcp_line_server.cpp
+    src/util/bmp_writer.cpp
+    src/web/cockpit_server.cpp
+    src/web/cockpit_page.cpp
 )
 
 if(WIN32)

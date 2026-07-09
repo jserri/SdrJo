@@ -42,6 +42,13 @@ public:
     // Elenco dei contatti attivi (visti negli ultimi maxAgeS secondi).
     std::vector<Aircraft> activeAircraft(double maxAgeS = 60.0) const;
 
+    // Contatto per ICAO, o nullptr se mai visto.
+    const Aircraft* find(uint32_t icao) const
+    {
+        auto it = aircraft_.find(icao);
+        return (it != aircraft_.end()) ? &it->second : nullptr;
+    }
+
     size_t totalMessages() const { return totalMessages_; }
 
 private:
