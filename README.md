@@ -127,7 +127,17 @@ progetto con dentro `rtlsdr.dll` e `libusb-1.0.dll`, finiscono nel pacchetto.
 
 ## Accesso remoto (usare la radio fuori casa)
 
-Il Cockpit puo' essere esposto oltre il PC locale dal pannello
+Il Cockpit e' un **ricevitore web completo** stile OpenWebRX:
+
+- **click sullo spettro** dal browser = sintonia del VFO (marker arancione);
+- **chips del demodulatore** (WFM stereo / NFM / AM / USB / LSB) per
+  accendere e cambiare l'ascolto da remoto;
+- pulsante **"Ascolta"**: l'audio demodulato arriva nel browser come
+  stream WAV senza fine (48 kHz mono, ~96 kB/s) — funziona su telefono e
+  tablet, piu' client contemporaneamente (ognuno ha la sua coda);
+  dopo 30 s di silenzio continuo lo stream si chiude da solo.
+
+L'esposizione oltre il PC locale si attiva dal pannello
 **Audio > Accesso remoto**: spunta "Esponi il Cockpit in LAN", imposta una
 **password** (obbligatoria) e premi Applica. Da quel momento
 `http://IP-del-PC:8750` e' raggiungibile dagli altri dispositivi della rete

@@ -147,6 +147,12 @@ struct AppState : public sdrjo::IModuleHost {
     sdrjo::FrequencyStore freqStore;
     std::string freqStorePath;
 
+    // Comandi arrivati dal Cockpit web (thread HTTP): applicati nel loop
+    // principale per non toccare lo stato da thread diversi.
+    std::mutex remoteMutex;
+    double pendingTuneHz = -1.0;
+    std::string pendingMode;
+
     void ensureAudio()
     {
         if (!audio.isActive())
@@ -354,6 +360,13 @@ void updateSpectrum(AppState& app)
                 }
                 app.audio.write(app.audioInterleaved.data(),
                                 app.audioInterleaved.size());
+                // Streaming web: mix mono (L+R)/2 gia' regolato.
+                static std::vector<float> mix;
+                mix.resize(app.audioL.size());
+                for (size_t i = 0; i < mix.size(); i++)
+                    mix[i] = 0.5f * (app.audioInterleaved[2 * i] +
+                                     app.audioInterleaved[2 * i + 1]);
+                app.cockpit.pushAudio(mix.data(), mix.size());
             } else {
                 app.audioMono.clear();
                 if (app.nfmDemod) {
@@ -378,6 +391,8 @@ void updateSpectrum(AppState& app)
                 for (auto& v : app.audioMono) v *= g;
                 app.audio.writeMono(app.audioMono.data(),
                                     app.audioMono.size());
+                app.cockpit.pushAudio(app.audioMono.data(),
+                                      app.audioMono.size());
             }
         }
     }
@@ -1371,7 +1386,14 @@ int main(int argc, char** argv)
         return app.source ? app.spectrum : std::vector<float>{};
     });
     app.cockpit.setTuneHandler([&app](double freqHz) {
-        return app.requestTune(freqHz, app.sampleRate);
+        std::lock_guard<std::mutex> lk(app.remoteMutex);
+        app.pendingTuneHz = freqHz;
+        return true;
+    });
+    app.cockpit.setModeHandler([&app](const std::string& mode) {
+        std::lock_guard<std::mutex> lk(app.remoteMutex);
+        app.pendingMode = mode;
+        return true;
     });
     if (app.cockpit.start())
         app.log("Cockpit", "http://localhost:" +
@@ -1399,11 +1421,33 @@ int main(int argc, char** argv)
             rebuildChannels(app);
             app.channelsDirty = false;
         }
+
+        // Applica i comandi arrivati dal Cockpit web.
+        {
+            double tuneHz = -1.0;
+            std::string mode;
+            {
+                std::lock_guard<std::mutex> lk(app.remoteMutex);
+                tuneHz = app.pendingTuneHz;
+                app.pendingTuneHz = -1.0;
+                mode.swap(app.pendingMode);
+            }
+            if (!mode.empty()) {
+                for (int m = 0; m < 6; m++)
+                    if (mode == kListenModeNames[m])
+                        app.listenMode = AppState::ListenMode(m);
+                rebuildListener(app);
+            }
+            if (tuneHz > 0) applyTunedFrequency(app, tuneHz);
+        }
+
         updateSpectrum(app);
         uploadWaterfallTexture(app);
         app.cockpit.setDeviceInfo(
             app.source ? app.source->name() : "nessuna sorgente",
             app.freqMHz * 1e6, app.sampleRate);
+        app.cockpit.setVfoInfo(app.freqMHz * 1e6 + app.listenOffsetHz,
+                               kListenModeNames[int(app.listenMode)]);
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();

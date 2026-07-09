@@ -76,6 +76,6 @@ Fatti (2a tornata):
 Prossimi:
 
 - Notch regolabile e noise blanker sul canale di ascolto.
-- Click-to-tune anche sul Cockpit web.
+- Cockpit: audio Opus/WebSocket per latenza e banda migliori (oggi WAV).
 - VFO con offset regolabile per modulo dalla GUI (oggi centrati).
 - MSIX per il Microsoft Store.

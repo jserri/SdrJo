@@ -62,6 +62,27 @@ const char* cockpitPageHtml()
   #waterfall { height: 190px; border-top: 1px solid var(--line); }
   .nosig { padding: 26px; text-align: center; color: var(--dim); }
 
+  .rxbar {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 14px; border-top: 1px solid var(--line);
+  }
+  .rxbar .vfo { font-family: var(--mono); font-size: 17px; color: var(--warn); }
+  .chip {
+    padding: 4px 12px; border-radius: 999px; border: 1px solid var(--line);
+    background: rgba(255,255,255,.03); color: var(--dim); cursor: pointer;
+    font-size: 12px; user-select: none;
+  }
+  .chip:hover { border-color: rgba(56,182,255,.5); color: var(--text); }
+  .chip.on { background: rgba(56,182,255,.18); color: var(--acc);
+    border-color: rgba(56,182,255,.6); }
+  .playbtn {
+    margin-left: auto; padding: 6px 18px; border-radius: 8px; cursor: pointer;
+    border: 1px solid rgba(61,220,151,.5); color: var(--ok);
+    background: rgba(61,220,151,.08); font-size: 13px; user-select: none;
+  }
+  .playbtn.playing { border-color: rgba(244,112,103,.6); color: #f47067;
+    background: rgba(244,112,103,.08); }
+
   .grid {
     margin-top: 16px; display: grid; gap: 14px;
     grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
@@ -104,6 +125,11 @@ const char* cockpitPageHtml()
   <canvas id="bands"></canvas>
   <canvas id="spectrum"></canvas>
   <canvas id="waterfall"></canvas>
+  <div class="rxbar">
+    <span class="vfo" id="vfoFreq">&ndash;</span>
+    <span id="modeChips"></span>
+    <span class="playbtn" id="playBtn">&#9654; Ascolta</span>
+  </div>
   <div class="nosig" id="nosig" style="display:none">
     Nessuna sorgente attiva: collega la RTL-SDR o avvia un replay.
   </div>
@@ -123,7 +149,41 @@ const wfCv = document.getElementById("waterfall");
 const bandCv = document.getElementById("bands");
 
 let device = null;   // {freqHz, rateHz}
+let vfo = null;      // {freqHz, mode}
 let bands = [];
+const modes = ["Spento", "WFM stereo", "NFM", "AM", "USB", "LSB"];
+
+async function control(params) {
+  try { await fetch("api/control?" + params); } catch (e) {}
+  pollStatus();
+}
+
+function renderChips() {
+  const el = document.getElementById("modeChips");
+  el.innerHTML = modes.map(m =>
+    `<span class="chip ${vfo && vfo.mode === m ? "on" : ""}"
+       data-mode="${m}">${m}</span>`).join(" ");
+  for (const c of el.querySelectorAll(".chip"))
+    c.onclick = () => control("mode=" + encodeURIComponent(c.dataset.mode));
+}
+
+// Ascolto nel browser: stream WAV senza fine da /api/audio.wav.
+let player = null;
+const playBtn = document.getElementById("playBtn");
+playBtn.onclick = () => {
+  if (player) {
+    player.pause();
+    player.src = "";
+    player = null;
+    playBtn.classList.remove("playing");
+    playBtn.innerHTML = "&#9654; Ascolta";
+  } else {
+    player = new Audio("api/audio.wav?t=" + Date.now());
+    player.play().catch(() => {});
+    playBtn.classList.add("playing");
+    playBtn.innerHTML = "&#9632; Stop";
+  }
+};
 const bandColors = { ham: "#3ddc97", bc: "#38b6ff", aero: "#ffb454",
   sat: "#c792ea", marine: "#4dd0e1", ism: "#f47067", cb: "#ffd166",
   pmr: "#f47067", nav: "#9e9e9e" };
@@ -238,6 +298,18 @@ function drawSpectrum(db) {
     ctx.stroke();
   }
 
+  // Marker del VFO di ascolto.
+  if (vfo && vfo.freqHz > 0 && device && device.rateHz) {
+    const f0v = device.freqHz - device.rateHz / 2;
+    const xv = (vfo.freqHz - f0v) / device.rateHz * w;
+    if (xv >= 0 && xv <= w) {
+      ctx.strokeStyle = "rgba(255,180,84,.9)";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(xv, 0); ctx.lineTo(xv, h); ctx.stroke();
+      ctx.lineWidth = 1;
+    }
+  }
+
   // Riga nuova del waterfall (solo su dati nuovi).
   if (!drawSpectrum.newRow) return;
   drawSpectrum.newRow = false;
@@ -286,14 +358,21 @@ function animate() {
 }
 requestAnimationFrame(animate);
 
-// Frequenza sotto il cursore.
+// Frequenza sotto il cursore + click per sintonizzare.
 specCv.title = "";
 specCv.addEventListener("mousemove", e => {
   if (!device || !device.rateHz) return;
   const r = specCv.getBoundingClientRect();
   const f = device.freqHz - device.rateHz / 2 +
             (e.clientX - r.left) / r.width * device.rateHz;
-  specCv.title = (f / 1e6).toFixed(4) + " MHz";
+  specCv.title = (f / 1e6).toFixed(4) + " MHz - click per sintonizzare";
+});
+specCv.addEventListener("click", e => {
+  if (!device || !device.rateHz) return;
+  const r = specCv.getBoundingClientRect();
+  const f = device.freqHz - device.rateHz / 2 +
+            (e.clientX - r.left) / r.width * device.rateHz;
+  control("freq=" + Math.round(f));
 });
 
 function fmtFreq(hz) { return (hz / 1e6).toFixed(4); }
@@ -311,6 +390,10 @@ async function pollStatus() {
   document.getElementById("devRate").textContent = fmtRate(d.device.rateHz);
   device = d.device;
   bands = d.bands || [];
+  vfo = d.vfo || null;
+  document.getElementById("vfoFreq").textContent =
+    vfo && vfo.freqHz > 0 ? (vfo.freqHz / 1e6).toFixed(4) + " MHz" : "-";
+  renderChips();
   drawBands();
 
   const cards = document.getElementById("cards");

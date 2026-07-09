@@ -9,8 +9,10 @@
 //  - controllo di sintonia e collegamenti alle UI dedicate dei moduli
 //
 #include "../util/http_server.hpp"
+#include "../util/ring_buffer.hpp"
 
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -34,13 +36,23 @@ public:
     using SpectrumProvider = std::function<std::vector<float>()>;
     // Richiesta di sintonia dall'interfaccia web (Hz); ritorna successo.
     using TuneHandler = std::function<bool(double freqHz)>;
+    // Cambio di demodulatore dal web ("WFM stereo", "NFM", "AM", ...).
+    using ModeHandler = std::function<bool(const std::string& mode)>;
 
     CockpitServer();
 
     void setStatusProvider(StatusProvider p) { status_ = std::move(p); }
     void setSpectrumProvider(SpectrumProvider p) { spectrum_ = std::move(p); }
     void setTuneHandler(TuneHandler h) { tune_ = std::move(h); }
+    void setModeHandler(ModeHandler h) { mode_ = std::move(h); }
     void setDeviceInfo(const std::string& name, double freqHz, double rateHz);
+
+    // Stato del ricevitore d'ascolto, mostrato e comandato dal browser.
+    void setVfoInfo(double freqHz, const std::string& mode);
+
+    // Audio demodulato dal host (mono, 48 kHz): distribuito a tutti i
+    // client collegati a /api/audio.wav, ognuno con la propria coda.
+    void pushAudio(const float* mono, size_t n);
 
     // Password per l'accesso (utente "sdrjo"); vuota = nessuna protezione.
     void setPassword(const std::string& password)
@@ -56,15 +68,25 @@ private:
     std::string statusJson();
     std::string spectrumJson();
 
+    std::string controlJson(const std::string& query);
+    void audioStream(HttpServer::StreamWriter& w);
+
     HttpServer server_;
     StatusProvider status_;
     SpectrumProvider spectrum_;
     TuneHandler tune_;
+    ModeHandler mode_;
 
     std::mutex devMutex_;
     std::string deviceName_ = "nessuna sorgente";
     double freqHz_ = 0.0;
     double rateHz_ = 0.0;
+    double vfoHz_ = 0.0;
+    std::string vfoMode_ = "Spento";
+
+    // Code audio per-client (16 bit, 48 kHz mono).
+    std::mutex audioMutex_;
+    std::vector<std::shared_ptr<RingBuffer<int16_t>>> audioClients_;
 };
 
 // Pagina HTML del cockpit (autonoma, nessuna dipendenza esterna).

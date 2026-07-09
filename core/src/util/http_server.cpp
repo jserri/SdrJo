@@ -1,5 +1,6 @@
 #include "sdrjo/util/http_server.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -30,6 +31,12 @@
   static bool initSockets() { return true; }
 #endif
 
+#if defined(MSG_NOSIGNAL)
+  #define SEND_FLAGS_HTTP MSG_NOSIGNAL
+#else
+  #define SEND_FLAGS_HTTP 0
+#endif
+
 namespace sdrjo {
 
 HttpServer::HttpServer() = default;
@@ -40,6 +47,35 @@ void HttpServer::route(const std::string& path, const std::string& contentType,
                        Handler handler)
 {
     routes_[path] = Route{contentType, std::move(handler)};
+}
+
+void HttpServer::streamRoute(const std::string& path,
+                             const std::string& contentType,
+                             StreamHandler handler)
+{
+    streamRoutes_[path] = StreamRoute{contentType, std::move(handler)};
+}
+
+bool HttpServer::StreamWriter::write(const void* data, size_t len)
+{
+    if (dead_ || !running_.load()) return false;
+    const char* p = static_cast<const char*>(data);
+    size_t sent = 0;
+    while (sent < len) {
+        int n = int(::send(socket_t(fd_), p + sent, int(len - sent),
+                           SEND_FLAGS_HTTP));
+        if (n <= 0) {
+            dead_ = true;
+            return false;
+        }
+        sent += size_t(n);
+    }
+    return true;
+}
+
+bool HttpServer::StreamWriter::alive() const
+{
+    return !dead_ && running_.load();
 }
 
 static std::string base64Encode(const std::string& in)
@@ -134,6 +170,16 @@ void HttpServer::stop()
     if (worker_.joinable()) worker_.join();
     closeSocket(socket_t(listenFd_));
     listenFd_ = -1;
+
+    // Chiudi gli streaming attivi e aspetta i loro thread.
+    {
+        std::lock_guard<std::mutex> lk(streamMutex_);
+        for (auto fd : streamSockets_) closeSocket(socket_t(fd));
+        streamSockets_.clear();
+    }
+    for (auto& t : streamThreads_)
+        if (t.joinable()) t.join();
+    streamThreads_.clear();
 }
 
 void HttpServer::acceptLoop()
@@ -155,15 +201,17 @@ void HttpServer::handleClient(intptr_t clientFd)
     if (rd <= 0) { closeSocket(client); return; }
     buf[rd] = '\0';
 
-    // Estrai il percorso dalla request line ("GET /path HTTP/1.1").
-    std::string path;
+    // Estrai percorso e query dalla request line ("GET /path?q HTTP/1.1").
+    std::string path, query;
     if (std::strncmp(buf, "GET ", 4) == 0) {
         const char* start = buf + 4;
         const char* end = std::strchr(start, ' ');
         if (end) path.assign(start, end);
-        // Ignora la query string.
         auto q = path.find('?');
-        if (q != std::string::npos) path.resize(q);
+        if (q != std::string::npos) {
+            query = path.substr(q + 1);
+            path.resize(q);
+        }
     }
 
     // Autenticazione (se configurata): confronto diretto del token Basic.
@@ -186,6 +234,30 @@ void HttpServer::handleClient(intptr_t clientFd)
         }
     }
 
+    // Rotte in streaming: header subito, poi il gestore in un suo thread.
+    auto sit = streamRoutes_.find(path);
+    if (sit != streamRoutes_.end()) {
+        std::string hdr = "HTTP/1.1 200 OK\r\nContent-Type: " +
+                          sit->second.contentType +
+                          "\r\nCache-Control: no-store\r\n"
+                          "Connection: close\r\n\r\n";
+        ::send(client, hdr.data(), int(hdr.size()), SEND_FLAGS_HTTP);
+        StreamHandler handler = sit->second.handler;
+        std::lock_guard<std::mutex> lk(streamMutex_);
+        streamSockets_.push_back(intptr_t(client));
+        streamThreads_.emplace_back(
+            [this, handler, fd = intptr_t(client)]() {
+                StreamWriter w(fd, running_);
+                handler(w);
+                closeSocket(socket_t(fd));
+                std::lock_guard<std::mutex> lk2(streamMutex_);
+                streamSockets_.erase(std::remove(streamSockets_.begin(),
+                                                 streamSockets_.end(), fd),
+                                     streamSockets_.end());
+            });
+        return;
+    }
+
     std::string status = "404 Not Found";
     std::string contentType = "text/plain";
     std::string body = "not found";
@@ -194,7 +266,7 @@ void HttpServer::handleClient(intptr_t clientFd)
     if (it != routes_.end()) {
         status = "200 OK";
         contentType = it->second.contentType;
-        body = it->second.handler();
+        body = it->second.handler(query);
     }
 
     std::string resp = "HTTP/1.1 " + status + "\r\n"

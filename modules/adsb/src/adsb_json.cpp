@@ -80,8 +80,9 @@ AdsbWebServer::AdsbWebServer(AircraftTracker& tracker, std::mutex& trackerMutex)
     : tracker_(tracker), mutex_(trackerMutex)
 {
     server_.route("/", "text/html; charset=utf-8",
-                  [] { return std::string(mapPageHtml()); });
-    server_.route("/data/aircraft.json", "application/json", [this] {
+                  [](const std::string&) { return std::string(mapPageHtml()); });
+    server_.route("/data/aircraft.json", "application/json",
+                  [this](const std::string&) {
         std::lock_guard<std::mutex> lk(mutex_);
         return aircraftToJson(tracker_, antenna_);
     });

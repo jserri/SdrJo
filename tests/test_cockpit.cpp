@@ -26,6 +26,36 @@ static std::string httpGet(uint16_t port, const std::string& path)
     return httpGetAuth(port, path, "");
 }
 
+// GET che legge al massimo maxBytes e poi chiude (per gli stream infiniti).
+static std::string httpGetLimited(uint16_t port, const std::string& path,
+                                  size_t maxBytes)
+{
+#if defined(_WIN32)
+    WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+    socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::connect(fd, (sockaddr*)&addr, sizeof(addr)) != 0) return "";
+    std::string req = "GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n";
+    ::send(fd, req.data(), int(req.size()), 0);
+    std::string resp;
+    char buf[4096];
+    while (resp.size() < maxBytes) {
+        int n = int(::recv(fd, buf, sizeof(buf), 0));
+        if (n <= 0) break;
+        resp.append(buf, size_t(n));
+    }
+#if defined(_WIN32)
+    closesocket(fd);
+#else
+    close(fd);
+#endif
+    return resp;
+}
+
 static std::string httpGetAuth(uint16_t port, const std::string& path,
                                const std::string& basicToken)
 {
@@ -86,6 +116,59 @@ int main()
 
     auto spec = httpGet(cockpit.port(), "/api/spectrum");
     CHECK(spec.find("\"db\":[-90.5,-45.0,-88.2]") != std::string::npos);
+
+    // --- Controllo remoto: /api/control ------------------------------------
+    {
+        double tunedTo = 0;
+        std::string modeSet;
+        cockpit.setTuneHandler([&](double f) { tunedTo = f; return true; });
+        cockpit.setModeHandler([&](const std::string& m) {
+            modeSet = m;
+            return true;
+        });
+        auto r = httpGet(cockpit.port(),
+                         "/api/control?freq=100300000&mode=WFM%20stereo");
+        CHECK(r.find("{\"ok\":true}") != std::string::npos);
+        CHECK(tunedTo == 100300000.0);
+        CHECK(modeSet == "WFM stereo");
+
+        // Lo stato espone il VFO.
+        cockpit.setVfoInfo(100.3e6, "WFM stereo");
+        auto st = httpGet(cockpit.port(), "/api/status");
+        CHECK(st.find("\"vfo\":{\"freqHz\":100300000") != std::string::npos);
+    }
+
+    // --- Streaming audio: /api/audio.wav ------------------------------------
+    {
+        // Alimenta l'audio in un thread mentre il client legge.
+        std::atomic<bool> feeding{true};
+        std::thread feeder([&] {
+            std::vector<float> tone(480);
+            for (size_t i = 0; i < tone.size(); i++)
+                tone[i] = 0.5f * std::sin(2.0 * 3.14159265 * 1000.0 *
+                                          double(i) / 48000.0);
+            while (feeding.load()) {
+                cockpit.pushAudio(tone.data(), tone.size());
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        });
+
+        auto wav = httpGetLimited(cockpit.port(), "/api/audio.wav", 6000);
+        feeding.store(false);
+        feeder.join();
+
+        CHECK(wav.find("200 OK") != std::string::npos);
+        CHECK(wav.find("audio/wav") != std::string::npos);
+        CHECK(wav.find("RIFF") != std::string::npos);
+        CHECK(wav.find("WAVE") != std::string::npos);
+        // Devono esserci campioni non nulli dopo l'header.
+        size_t dataPos = wav.find("data");
+        CHECK(dataPos != std::string::npos);
+        bool nonZero = false;
+        for (size_t i = dataPos + 8; i + 1 < wav.size(); i++)
+            if (wav[i] != 0) nonZero = true;
+        CHECK(nonZero);
+    }
 
     cockpit.stop();
 
