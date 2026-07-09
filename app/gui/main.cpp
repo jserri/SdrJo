@@ -218,10 +218,26 @@ void drawDevicePanel(AppState& app)
             ImGui::TextWrapped("%s", sdrjo::RtlSdrSource::libraryHint().c_str());
         } else {
             auto devices = sdrjo::RtlSdrSource::enumerate();
+            ImGui::TextDisabled("%s", sdrjo::RtlSdrSource::libraryHint().c_str());
             ImGui::Text("RTL-SDR trovate: %zu", devices.size());
             if (devices.empty()) {
+#if defined(_WIN32)
+                ImGui::TextWrapped(
+                    "La libreria e' caricata ma nessuna chiavetta risponde. "
+                    "Su Windows libusb vede la chiavetta SOLO con il driver "
+                    "WinUSB:\n"
+                    "1. collega la chiavetta;\n"
+                    "2. apri Zadig (zadig.akeo.ie) come amministratore;\n"
+                    "3. Options > List All Devices;\n"
+                    "4. seleziona 'Bulk-In, Interface (Interface 0)' "
+                    "(o RTL2838UHIDIR);\n"
+                    "5. driver di destinazione WinUSB > Replace Driver;\n"
+                    "6. scollega e ricollega la chiavetta.\n"
+                    "L'elenco qui si aggiorna da solo.");
+#else
                 ImGui::TextWrapped("Nessuna chiavetta rilevata: controlla il "
-                                   "cavo USB e il driver WinUSB (Zadig).");
+                                   "cavo USB e i permessi udev.");
+#endif
             }
             for (auto& d : devices) {
                 ImGui::BulletText("#%u %s (%s)", d.index, d.name.c_str(),
