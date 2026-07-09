@@ -43,7 +43,8 @@
 
 namespace {
 
-constexpr size_t kFftSize = 4096;
+constexpr size_t kChunkSize = 4096;   // blocco DSP per moduli/ascolto
+constexpr int kWfWidth = 4096;        // colonne della texture waterfall
 constexpr int kWaterfallRows = 256;
 
 const char* kListenModeNames[] = {"Spento", "WFM stereo", "NFM",
@@ -62,9 +63,17 @@ struct AppState : public sdrjo::IModuleHost {
     double sampleRate = 2.4e6;
     float gainDb = -1.0f; // <0 = AGC
 
-    std::vector<float> spectrum = std::vector<float>(kFftSize, -120.0f);
+    // Spettro ad alta risoluzione: FFT selezionabile, calcolata ~30 volte
+    // al secondo sugli ultimi campioni catturati (non per ogni chunk DSP).
+    int fftSize = 16384;
+    std::vector<sdrjo::cfloat> captureBuf;
+    size_t capturePos = 0;
+    size_t captureFilled = 0;
+    size_t samplesSinceFft = 0;
+    std::vector<float> spectrum = std::vector<float>(16384, -120.0f);
+
     std::vector<float> waterfall =
-        std::vector<float>(kFftSize * kWaterfallRows, -120.0f);
+        std::vector<float>(size_t(kWfWidth) * kWaterfallRows, -120.0f);
     int waterfallHead = 0;
     GLuint waterfallTex = 0;
 
@@ -279,37 +288,39 @@ void rebuildListener(AppState& app)
 
 void updateSpectrum(AppState& app)
 {
-    static std::vector<sdrjo::cfloat> chunk(kFftSize);
-    while (app.iqRing.available() >= kFftSize) {
-        app.iqRing.read(chunk.data(), kFftSize);
-        app.dcBlocker.processInPlace(chunk.data(), kFftSize);
+    static std::vector<sdrjo::cfloat> chunk(kChunkSize);
+    while (app.iqRing.available() >= kChunkSize) {
+        app.iqRing.read(chunk.data(), kChunkSize);
+        app.dcBlocker.processInPlace(chunk.data(), kChunkSize);
         if (app.recorder.isRecording())
-            app.recorder.write(chunk.data(), kFftSize);
-        {
-            std::lock_guard<std::mutex> lk(app.spectrumMutex);
-            sdrjo::dsp::powerSpectrumDb(chunk.data(), kFftSize,
-                                        app.spectrum.data());
-        }
+            app.recorder.write(chunk.data(), kChunkSize);
 
-        // Riga nel waterfall circolare (1 ogni wfSpeedDiv FFT).
-        if (++app.wfSpeedCounter >= app.wfSpeedDiv) {
-            app.wfSpeedCounter = 0;
-            std::memcpy(&app.waterfall[size_t(app.waterfallHead) * kFftSize],
-                        app.spectrum.data(), kFftSize * sizeof(float));
-            app.waterfallHead = (app.waterfallHead + 1) % app.wfRows;
+        // Cattura circolare per lo spettro (FFT calcolata piu' sotto,
+        // a frequenza fissa: molto piu' leggero di una FFT per chunk).
+        if (app.captureBuf.size() != size_t(app.fftSize)) {
+            app.captureBuf.assign(size_t(app.fftSize), sdrjo::cfloat(0, 0));
+            app.capturePos = 0;
+            app.captureFilled = 0;
         }
+        for (size_t i = 0; i < kChunkSize; i++) {
+            app.captureBuf[app.capturePos] = chunk[i];
+            app.capturePos = (app.capturePos + 1) % app.captureBuf.size();
+        }
+        app.captureFilled =
+            std::min(app.captureFilled + kChunkSize, app.captureBuf.size());
+        app.samplesSinceFft += kChunkSize;
 
         // Distribuisci a ogni modulo il SUO canale (VFO dedicato).
         for (size_t m = 0; m < app.modules.size(); m++) {
             auto& ch = app.channels[m];
             if (ch.vfo) {
                 ch.buf.clear();
-                ch.vfo->process(chunk.data(), kFftSize, ch.buf);
+                ch.vfo->process(chunk.data(), kChunkSize, ch.buf);
                 if (!ch.buf.empty())
                     app.modules[m].module()->processIq(ch.buf.data(),
                                                        ch.buf.size());
             } else {
-                app.modules[m].module()->processIq(chunk.data(), kFftSize);
+                app.modules[m].module()->processIq(chunk.data(), kChunkSize);
             }
         }
 
@@ -317,7 +328,7 @@ void updateSpectrum(AppState& app)
         if (app.listenMode != AppState::ListenMode::Off && app.listenVfo) {
             static std::vector<sdrjo::cfloat> lchan;
             lchan.clear();
-            app.listenVfo->process(chunk.data(), kFftSize, lchan);
+            app.listenVfo->process(chunk.data(), kChunkSize, lchan);
             if (lchan.empty()) continue;
 
             // Filtro di canale (larghezza scelta trascinando i bordi).
@@ -396,20 +407,58 @@ void updateSpectrum(AppState& app)
             }
         }
     }
+
+    // FFT ad alta risoluzione a ~30 Hz sugli ultimi fftSize campioni.
+    if (app.captureFilled >= size_t(app.fftSize) &&
+        app.samplesSinceFft >= size_t(app.sampleRate / 30.0)) {
+        app.samplesSinceFft = 0;
+
+        static std::vector<sdrjo::cfloat> lin;
+        lin.resize(app.captureBuf.size());
+        std::copy(app.captureBuf.begin() + ptrdiff_t(app.capturePos),
+                  app.captureBuf.end(), lin.begin());
+        std::copy(app.captureBuf.begin(),
+                  app.captureBuf.begin() + ptrdiff_t(app.capturePos),
+                  lin.begin() +
+                      ptrdiff_t(app.captureBuf.size() - app.capturePos));
+
+        {
+            std::lock_guard<std::mutex> lk(app.spectrumMutex);
+            app.spectrum.resize(lin.size());
+            sdrjo::dsp::powerSpectrumDb(lin.data(), lin.size(),
+                                        app.spectrum.data());
+        }
+
+        // Riga del waterfall (max-decimata a kWfWidth colonne).
+        if (++app.wfSpeedCounter >= app.wfSpeedDiv) {
+            app.wfSpeedCounter = 0;
+            float* row = &app.waterfall[size_t(app.waterfallHead) * kWfWidth];
+            const size_t n = app.spectrum.size();
+            for (int x = 0; x < kWfWidth; x++) {
+                size_t b0 = size_t(x) * n / kWfWidth;
+                size_t b1 = std::max(b0 + 1, size_t(x + 1) * n / kWfWidth);
+                float v = -160.0f;
+                for (size_t b = b0; b < b1 && b < n; b++)
+                    v = std::max(v, app.spectrum[b]);
+                row[x] = v;
+            }
+            app.waterfallHead = (app.waterfallHead + 1) % app.wfRows;
+        }
+    }
 }
 
 // Cambia il numero di righe di storia del waterfall.
 void resizeWaterfall(AppState& app, int rows)
 {
     app.wfRows = rows;
-    app.waterfall.assign(size_t(kFftSize) * size_t(rows), -120.0f);
+    app.waterfall.assign(size_t(kWfWidth) * size_t(rows), -120.0f);
     app.waterfallHead = 0;
 }
 
 void uploadWaterfallTexture(AppState& app)
 {
     static std::vector<uint32_t> pixels;
-    pixels.resize(size_t(kFftSize) * size_t(app.wfRows));
+    pixels.resize(size_t(kWfWidth) * size_t(app.wfRows));
 
     const float lo = app.rangeMinDb;
     const float span = std::max(1.0f, app.rangeMaxDb - app.rangeMinDb);
@@ -438,9 +487,9 @@ void uploadWaterfallTexture(AppState& app)
 
     for (int row = 0; row < app.wfRows; row++) {
         int src = (app.waterfallHead + row) % app.wfRows;
-        for (size_t x = 0; x < kFftSize; x++)
-            pixels[size_t(row) * kFftSize + x] =
-                colorize(app.waterfall[size_t(src) * kFftSize + x]);
+        for (int x = 0; x < kWfWidth; x++)
+            pixels[size_t(row) * kWfWidth + size_t(x)] =
+                colorize(app.waterfall[size_t(src) * kWfWidth + size_t(x)]);
     }
     if (!app.waterfallTex) {
         glGenTextures(1, &app.waterfallTex);
@@ -449,7 +498,7 @@ void uploadWaterfallTexture(AppState& app)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     }
     glBindTexture(GL_TEXTURE_2D, app.waterfallTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kFftSize, app.wfRows, 0,
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kWfWidth, app.wfRows, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
 }
 
@@ -807,8 +856,7 @@ void drawSpectrumPanel(AppState& app)
                                1.0f, -140.0f, 0.0f, "min %.0f", "max %.0f");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(140);
-        double rowsPerSec =
-            app.sampleRate / double(kFftSize) / double(app.wfSpeedDiv);
+        double rowsPerSec = 30.0 / double(app.wfSpeedDiv);
         char speedLbl[32];
         std::snprintf(speedLbl, sizeof(speedLbl), "%.0f righe/s", rowsPerSec);
         ImGui::SliderInt("Velocita'", &app.wfSpeedDiv, 1, 100, speedLbl,
@@ -826,6 +874,16 @@ void drawSpectrumPanel(AppState& app)
         ImGui::SetNextItemWidth(90);
         static const char* kPalNames[] = {"Classica", "Grigi", "Fuoco"};
         ImGui::Combo("Palette", &app.wfPalette, kPalNames, 3);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(90);
+        static const char* kFftNames[] = {"4096", "8192", "16384", "32768",
+                                          "65536"};
+        static const int kFftVals[] = {4096, 8192, 16384, 32768, 65536};
+        int fftIdx = 2;
+        for (int i = 0; i < 5; i++)
+            if (kFftVals[i] == app.fftSize) fftIdx = i;
+        if (ImGui::Combo("FFT", &fftIdx, kFftNames, 5))
+            app.fftSize = kFftVals[fftIdx]; // la cattura si adegua da sola
         ImGui::Spacing();
     }
 
@@ -889,11 +947,14 @@ void drawSpectrumPanel(AppState& app)
     double step = niceStep((v1 - v0) / 8.0);
     ImU32 gridCol = ImGui::GetColorU32(ImVec4(0.3f, 0.42f, 0.53f, 0.18f));
     ImU32 textCol = ImGui::GetColorU32(ImVec4(0.55f, 0.65f, 0.75f, 0.9f));
+    // Decimali adattivi: con lo zoom spinto servono piu' cifre.
+    int freqDecimals = std::clamp(
+        -int(std::floor(std::log10(step / 1e6))), 0, 6);
     for (double f = std::ceil(v0 / step) * step; f < v1; f += step) {
         float x = xOf(f);
         dl->AddLine(ImVec2(x, s0.y), ImVec2(x, s1.y), gridCol);
         char lbl[32];
-        std::snprintf(lbl, sizeof(lbl), "%.4g MHz", f / 1e6);
+        std::snprintf(lbl, sizeof(lbl), "%.*f MHz", freqDecimals, f / 1e6);
         dl->AddText(ImVec2(x + 4, s1.y - 16), textCol, lbl);
     }
     for (float db = dbMin + 20; db < dbMax; db += 20) {
@@ -914,13 +975,26 @@ void drawSpectrumPanel(AppState& app)
         ImU32 fill = ImGui::GetColorU32(ImVec4(0.22f, 0.71f, 1.0f, 0.18f));
         float prevY = 0;
         for (int px = 0; px < int(w); px++) {
-            size_t b0 = size_t(std::max(0.0, startBin + px * binsPerPx));
-            size_t b1 = std::max(b0 + 1,
-                                 size_t(std::max(0.0, startBin +
-                                                          (px + 1) * binsPerPx)));
             float v = -160.0f;
-            for (size_t b = b0; b < b1 && b < n; b++)
-                v = std::max(v, app.spectrum[b]);
+            if (binsPerPx >= 1.0) {
+                // Vista larga: massimo dei bin che cadono nel pixel.
+                size_t b0 = size_t(std::max(0.0, startBin + px * binsPerPx));
+                size_t b1 = std::max(
+                    b0 + 1,
+                    size_t(std::max(0.0, startBin + (px + 1) * binsPerPx)));
+                for (size_t b = b0; b < b1 && b < n; b++)
+                    v = std::max(v, app.spectrum[b]);
+            } else {
+                // Zoom spinto: interpolazione lineare tra bin adiacenti,
+                // cosi' la traccia resta una linea liscia (niente gradini).
+                double bp = startBin + (double(px) + 0.5) * binsPerPx - 0.5;
+                bp = std::clamp(bp, 0.0, double(n - 1));
+                size_t b = size_t(bp);
+                double fr = bp - double(b);
+                float a = app.spectrum[b];
+                float c = app.spectrum[std::min(b + 1, n - 1)];
+                v = float(a * (1.0 - fr) + c * fr);
+            }
             float y = yOf(v);
             dl->AddLine(ImVec2(s0.x + px, y), ImVec2(s0.x + px, s1.y), fill);
             if (px > 0)
@@ -1429,7 +1503,21 @@ int main(int argc, char** argv)
     });
     app.cockpit.setSpectrumProvider([&app] {
         std::lock_guard<std::mutex> lk(app.spectrumMutex);
-        return app.source ? app.spectrum : std::vector<float>{};
+        if (!app.source) return std::vector<float>{};
+        // Decimazione (max) a 2048 bin: il JSON resta leggero anche
+        // con la FFT a 65536 punti.
+        const auto& sp = app.spectrum;
+        const size_t n = sp.size();
+        if (n <= 2048) return sp;
+        std::vector<float> out(2048);
+        for (size_t x = 0; x < 2048; x++) {
+            size_t b0 = x * n / 2048;
+            size_t b1 = std::max(b0 + 1, (x + 1) * n / 2048);
+            float v = -160.0f;
+            for (size_t b = b0; b < b1; b++) v = std::max(v, sp[b]);
+            out[x] = v;
+        }
+        return out;
     });
     app.cockpit.setTuneHandler([&app](double freqHz) {
         std::lock_guard<std::mutex> lk(app.remoteMutex);
