@@ -453,11 +453,8 @@ void uploadWaterfallTexture(AppState& app)
                  GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
 }
 
-void drawDevicePanel(AppState& app)
+void drawDeviceSection(AppState& app)
 {
-    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(330, 300), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Dispositivo");
 
     if (!app.source) {
         if (!sdrjo::RtlSdrSource::available()) {
@@ -595,11 +592,23 @@ void drawDevicePanel(AppState& app)
             app.source = std::move(src);
         }
     }
-    ImGui::End();
 }
 
-// Applica la frequenza del visore: VFO se dentro lo span, altrimenti
-// risintonizza l'hardware.
+// Con lo zoom attivo tiene la frequenza sintonizzata al centro della
+// vista (cosi' seguendo la sintonia lo spettro "scorre" sotto il VFO).
+void centerViewOnTuned(AppState& app)
+{
+    if (app.viewSpanFrac >= 0.999) return;
+    double tuned = app.freqMHz * 1e6 + app.listenOffsetHz;
+    double f0 = app.freqMHz * 1e6 - app.sampleRate / 2.0;
+    app.viewCenterFrac = std::clamp((tuned - f0) / app.sampleRate,
+                                    app.viewSpanFrac / 2.0,
+                                    1.0 - app.viewSpanFrac / 2.0);
+}
+
+// Applica la frequenza sintonizzata: VFO se dentro lo span, altrimenti
+// risintonizza l'hardware (mostrando cosi' le frequenze successive);
+// in entrambi i casi la vista zoomata resta centrata sulla sintonia.
 void applyTunedFrequency(AppState& app, double f)
 {
     f = std::clamp(f, 0.0, 1.999e9);
@@ -612,6 +621,7 @@ void applyTunedFrequency(AppState& app, double f)
         app.listenOffsetHz = 0.0;
     }
     if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
+    centerViewOnTuned(app);
 }
 
 // Frequenzimetro a cifre stile SDR Console: rotellina su una cifra per
@@ -781,8 +791,8 @@ ImU32 bandColor(const char* cat, float alpha)
 void drawSpectrumPanel(AppState& app)
 {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(350, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - 360, 520),
+    ImGui::SetNextWindowPos(ImVec2(360, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - 370, 520),
                              ImGuiCond_FirstUseEver);
     ImGui::Begin("Spettro");
 
@@ -886,8 +896,12 @@ void drawSpectrumPanel(AppState& app)
         std::snprintf(lbl, sizeof(lbl), "%.4g MHz", f / 1e6);
         dl->AddText(ImVec2(x + 4, s1.y - 16), textCol, lbl);
     }
-    for (float db = dbMin + 20; db < dbMax; db += 20)
+    for (float db = dbMin + 20; db < dbMax; db += 20) {
         dl->AddLine(ImVec2(s0.x, yOf(db)), ImVec2(s1.x, yOf(db)), gridCol);
+        char dbLbl[16];
+        std::snprintf(dbLbl, sizeof(dbLbl), "%.0f dB", double(db));
+        dl->AddText(ImVec2(s0.x + 4, yOf(db) - 14), textCol, dbLbl);
+    }
 
     // Traccia dello spettro (max dei bin per colonna di pixel).
     {
@@ -956,16 +970,24 @@ void drawSpectrumPanel(AppState& app)
         }
     }
 
-    // Interazione: tooltip, click = VFO (con snap), doppio = centra,
-    // rotellina = sintonia a passi di snap, Ctrl+rotellina = zoom.
+    // Interazione: click = sintonizza (snap), trascina = sintonia continua,
+    // rotellina = passi di snap (oltre il bordo scorre da solo),
+    // Ctrl+rotellina = zoom, doppio click = centra l'hardware qui.
+    static bool draggingTune = false;
+    static bool dragMoved = false;
+    static float dragStartX = 0.0f;
+    static double dragStartFreq = 0.0;
+
     if (hovered && !draggingBw) {
         double f = freqAt(mx);
         dl->AddLine(ImVec2(mx, s0.y), ImVec2(mx, s1.y),
                     ImGui::GetColorU32(ImVec4(1, 1, 1, 0.25f)));
-        ImGui::SetTooltip("%.4f MHz\nclick: sintonizza (snap %.4g kHz)\n"
-                          "rotellina: sintonia  Ctrl+rotellina: zoom\n"
-                          "doppio click: centra qui  bordi banda: trascina",
-                          f / 1e6, app.snapHz / 1e3);
+        if (!draggingTune)
+            ImGui::SetTooltip(
+                "%.4f MHz\nclick: sintonizza (snap %.4g kHz)\n"
+                "trascina: sintonia continua  rotellina: passi di snap\n"
+                "Ctrl+rotellina: zoom  doppio click: centra qui",
+                f / 1e6, app.snapHz / 1e3);
 
         float wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.0f) {
@@ -980,26 +1002,49 @@ void drawSpectrumPanel(AppState& app)
                 app.viewCenterFrac =
                     (newV0 + newSpan / 2.0 - f0) / (f1 - f0);
             } else {
+                // Oltre il 45%% dello span l'hardware si risintonizza da
+                // solo: continuando con la rotellina si "scorre" la banda.
                 double cur = centerHz + app.listenOffsetHz;
                 double next = std::round((cur + double(wheel) * app.snapHz) /
                                          app.snapHz) * app.snapHz;
-                app.listenOffsetHz = std::clamp(
-                    next - centerHz, -app.sampleRate * 0.49,
-                    app.sampleRate * 0.49);
-                if (app.listenVfo)
-                    app.listenVfo->setOffset(app.listenOffsetHz);
+                applyTunedFrequency(app, next);
             }
         }
 
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            draggingTune = false;
             app.freqMHz = f / 1e6;
             if (app.source) app.source->setCenterFrequency(f);
             app.listenOffsetHz = 0.0;
             if (app.listenVfo) app.listenVfo->setOffset(0.0);
-        } else if (!nearEdge && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            double snapped = std::round(f / app.snapHz) * app.snapHz;
-            app.listenOffsetHz = snapped - centerHz;
-            if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
+            centerViewOnTuned(app);
+        } else if (!nearEdge && !draggingTune &&
+                   ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            draggingTune = true;
+            dragMoved = false;
+            dragStartX = mx;
+            dragStartFreq = centerHz + app.listenOffsetHz;
+        }
+    }
+
+    // Trascinamento attivo: continua anche se il cursore esce dall'area.
+    if (draggingTune) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            float dx = mx - dragStartX;
+            if (std::fabs(dx) > 4.0f) dragMoved = true;
+            if (dragMoved) {
+                // Trascini lo spettro: mouse a destra = frequenze piu' basse.
+                double hzPerPx = (v1 - v0) / double(w);
+                applyTunedFrequency(app, dragStartFreq - double(dx) * hzPerPx);
+            }
+        } else {
+            if (!dragMoved && hovered) {
+                // Click secco: sintonizza con lo snap.
+                double snapped =
+                    std::round(freqAt(mx) / app.snapHz) * app.snapHz;
+                applyTunedFrequency(app, snapped);
+            }
+            draggingTune = false;
         }
     }
 
@@ -1033,12 +1078,8 @@ void drawSpectrumPanel(AppState& app)
     ImGui::End();
 }
 
-void drawReceiverPanel(AppState& app)
+void drawReceiverSection(AppState& app)
 {
-    ImGui::SetNextWindowPos(ImVec2(10, 320), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(330, 420), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Ricevitore");
-
     drawSMeter(app);
 
     int mode = int(app.listenMode);
@@ -1106,14 +1147,35 @@ void drawReceiverPanel(AppState& app)
         app.filterR.configure(48000.0, double(app.audioHighPassHz),
                               double(app.audioLowPassHz));
     }
-    ImGui::End();
 }
 
 // Frequency manager: memorie salvate su file, riordinate per frequenza.
+void drawAudioSection(AppState& app); // definita piu' avanti
+
+// Sidebar unica: tutte le sezioni di controllo in una colonna, apribili
+// e richiudibili come menu a tendina.
+void drawSidebar(AppState& app)
+{
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(340, vp->WorkSize.y - 20),
+                             ImGuiCond_FirstUseEver);
+    ImGui::Begin("Controlli");
+
+    if (ImGui::CollapsingHeader("Dispositivo", ImGuiTreeNodeFlags_DefaultOpen))
+        drawDeviceSection(app);
+    if (ImGui::CollapsingHeader("Ricevitore", ImGuiTreeNodeFlags_DefaultOpen))
+        drawReceiverSection(app);
+    if (ImGui::CollapsingHeader("Audio"))
+        drawAudioSection(app);
+
+    ImGui::End();
+}
+
 void drawFrequenciesPanel(AppState& app)
 {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(350, 540), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(360, 540), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(430, vp->WorkSize.y - 550),
                              ImGuiCond_FirstUseEver);
     ImGui::Begin("Frequenze");
@@ -1162,17 +1224,6 @@ void drawFrequenciesPanel(AppState& app)
             ImGui::TableNextColumn();
             ImGui::PushID(i);
             if (ImGui::SmallButton("Vai")) {
-                // Dentro lo span attuale: sposta solo il VFO; fuori: centra.
-                double center = app.freqMHz * 1e6;
-                if (app.source &&
-                    std::fabs(ff.freqHz - center) < app.sampleRate * 0.45) {
-                    app.listenOffsetHz = ff.freqHz - center;
-                } else {
-                    app.freqMHz = ff.freqHz / 1e6;
-                    if (app.source)
-                        app.source->setCenterFrequency(ff.freqHz);
-                    app.listenOffsetHz = 0.0;
-                }
                 for (int m = 0; m < 6; m++)
                     if (ff.mode == kListenModeNames[m])
                         app.listenMode = AppState::ListenMode(m);
@@ -1181,8 +1232,7 @@ void drawFrequenciesPanel(AppState& app)
                     app.listenBwHz = ff.bandwidthHz;
                     rebuildChanFilter(app);
                 }
-                if (app.listenVfo)
-                    app.listenVfo->setOffset(app.listenOffsetHz);
+                applyTunedFrequency(app, ff.freqHz);
             }
             ImGui::SameLine();
             if (ImGui::SmallButton("X")) removeIdx = i;
@@ -1197,11 +1247,8 @@ void drawFrequenciesPanel(AppState& app)
     ImGui::End();
 }
 
-void drawAudioPanel(AppState& app)
+void drawAudioSection(AppState& app)
 {
-    ImGui::SetNextWindowPos(ImVec2(10, 750), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(330, 190), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Audio");
 
     ImGui::TextDisabled("backend: %s", app.audio.backendName().c_str());
 
@@ -1265,7 +1312,6 @@ void drawAudioPanel(AppState& app)
         }
     }
     ImGui::TextDisabled("utente: sdrjo - da internet usa una VPN (README)");
-    ImGui::End();
 }
 
 void drawModulesPanel(AppState& app)
@@ -1453,11 +1499,9 @@ int main(int argc, char** argv)
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        drawDevicePanel(app);
+        drawSidebar(app);
         drawSpectrumPanel(app);
-        drawReceiverPanel(app);
         drawFrequenciesPanel(app);
-        drawAudioPanel(app);
         drawModulesPanel(app);
         drawLogPanel(app);
 
