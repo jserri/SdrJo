@@ -156,6 +156,12 @@ struct AppState : public sdrjo::IModuleHost {
     sdrjo::FrequencyStore freqStore;
     std::string freqStorePath;
 
+    // Posizione della stazione (per mappa ADS-B, distanze, satelliti),
+    // salvata in sdrjo.cfg accanto all'eseguibile.
+    double stationLat = 0.0;
+    double stationLon = 0.0;
+    std::string configPath;
+
     // Comandi arrivati dal Cockpit web (thread HTTP): applicati nel loop
     // principale per non toccare lo stato da thread diversi.
     std::mutex remoteMutex;
@@ -212,6 +218,36 @@ void rebuildChannels(AppState& app)
         }
         app.channels.push_back(std::move(ch));
     }
+}
+
+// Config minimale (chiave=valore) accanto all'eseguibile.
+void loadConfig(AppState& app)
+{
+    FILE* f = std::fopen(app.configPath.c_str(), "r");
+    if (!f) return;
+    char line[256];
+    while (std::fgets(line, sizeof(line), f)) {
+        double v = 0;
+        if (std::sscanf(line, "station_lat=%lf", &v) == 1) app.stationLat = v;
+        else if (std::sscanf(line, "station_lon=%lf", &v) == 1)
+            app.stationLon = v;
+    }
+    std::fclose(f);
+}
+
+void saveConfig(AppState& app)
+{
+    FILE* f = std::fopen(app.configPath.c_str(), "w");
+    if (!f) return;
+    std::fprintf(f, "station_lat=%.6f\nstation_lon=%.6f\n", app.stationLat,
+                 app.stationLon);
+    std::fclose(f);
+}
+
+void applyStationToModules(AppState& app)
+{
+    for (auto& lm : app.modules)
+        lm.module()->setStationLocation(app.stationLat, app.stationLon);
 }
 
 // Larghezza di banda mostrata/usata per ogni modalita' di ascolto.
@@ -485,8 +521,9 @@ void uploadWaterfallTexture(AppState& app)
         return 0xFF000000u | (uint32_t(b) << 16) | (uint32_t(g) << 8) | r;
     };
 
+    // Riga piu' recente in alto: il waterfall scende verso il basso.
     for (int row = 0; row < app.wfRows; row++) {
-        int src = (app.waterfallHead + row) % app.wfRows;
+        int src = (app.waterfallHead + app.wfRows - 1 - row) % app.wfRows;
         for (int x = 0; x < kWfWidth; x++)
             pixels[size_t(row) * kWfWidth + size_t(x)] =
                 colorize(app.waterfall[size_t(src) * kWfWidth + size_t(x)]);
@@ -641,6 +678,21 @@ void drawDeviceSection(AppState& app)
             app.source = std::move(src);
         }
     }
+
+    // Posizione dell'antenna: serve alla mappa ADS-B (marker + cerchi di
+    // portata + distanze) e in futuro ai passaggi satellite.
+    ImGui::SeparatorText("Posizione antenna");
+    bool posChanged = false;
+    posChanged |= ImGui::InputDouble("Latitudine", &app.stationLat, 0, 0,
+                                     "%.5f");
+    posChanged |= ImGui::InputDouble("Longitudine", &app.stationLon, 0, 0,
+                                     "%.5f");
+    if (posChanged) {
+        saveConfig(app);
+        applyStationToModules(app);
+    }
+    if (app.stationLat == 0.0 && app.stationLon == 0.0)
+        ImGui::TextDisabled("(imposta lat/lon per vederti sulla mappa ADS-B)");
 }
 
 // Con lo zoom attivo tiene la frequenza sintonizzata al centro della
@@ -839,11 +891,14 @@ ImU32 bandColor(const char* cat, float alpha)
 // il VFO di ascolto, doppio click per risintonizzare l'hardware.
 void drawSpectrumPanel(AppState& app)
 {
+    // Layout proporzionale: segue il ridimensionamento della finestra.
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(360, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - 370, 520),
-                             ImGuiCond_FirstUseEver);
-    ImGui::Begin("Spettro");
+    const float sideW = std::clamp(vp->WorkSize.x * 0.24f, 300.0f, 420.0f);
+    const float specHWin = std::max(300.0f, (vp->WorkSize.y - 30) * 0.62f);
+    ImGui::SetNextWindowPos(ImVec2(sideW + 20, 10), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - sideW - 30, specHWin),
+                             ImGuiCond_Always);
+    ImGui::Begin("Spettro", nullptr, ImGuiWindowFlags_NoMove);
 
     // Frequenza sintonizzata: cifre cliccabili e scrollabili.
     drawFrequencyDial(app);
@@ -957,11 +1012,21 @@ void drawSpectrumPanel(AppState& app)
         std::snprintf(lbl, sizeof(lbl), "%.*f MHz", freqDecimals, f / 1e6);
         dl->AddText(ImVec2(x + 4, s1.y - 16), textCol, lbl);
     }
-    for (float db = dbMin + 20; db < dbMax; db += 20) {
-        dl->AddLine(ImVec2(s0.x, yOf(db)), ImVec2(s1.x, yOf(db)), gridCol);
-        char dbLbl[16];
-        std::snprintf(dbLbl, sizeof(dbLbl), "%.0f dB", double(db));
-        dl->AddText(ImVec2(s0.x + 4, yOf(db) - 14), textCol, dbLbl);
+    // ~10 righe orizzontali con passo "bello" sul range dB corrente.
+    {
+        double dbStep = niceStep(double(dbMax - dbMin) / 10.0);
+        for (double db = std::ceil(dbMin / dbStep) * dbStep; db < dbMax;
+             db += dbStep) {
+            dl->AddLine(ImVec2(s0.x, yOf(float(db))),
+                        ImVec2(s1.x, yOf(float(db))), gridCol);
+            // Niente etichetta dove si sovrapporrebbe alla riga dei MHz.
+            if (yOf(float(db)) < s1.y - 26.0f) {
+                char dbLbl[16];
+                std::snprintf(dbLbl, sizeof(dbLbl), "%.0f dB", db);
+                dl->AddText(ImVec2(s0.x + 4, yOf(float(db)) - 14), textCol,
+                            dbLbl);
+            }
+        }
     }
 
     // Traccia dello spettro (max dei bin per colonna di pixel).
@@ -1231,10 +1296,11 @@ void drawAudioSection(AppState& app); // definita piu' avanti
 void drawSidebar(AppState& app)
 {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(340, vp->WorkSize.y - 20),
-                             ImGuiCond_FirstUseEver);
-    ImGui::Begin("Controlli");
+    const float sideW = std::clamp(vp->WorkSize.x * 0.24f, 300.0f, 420.0f);
+    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(sideW, vp->WorkSize.y - 20),
+                             ImGuiCond_Always);
+    ImGui::Begin("Controlli", nullptr, ImGuiWindowFlags_NoMove);
 
     if (ImGui::CollapsingHeader("Dispositivo", ImGuiTreeNodeFlags_DefaultOpen))
         drawDeviceSection(app);
@@ -1249,10 +1315,13 @@ void drawSidebar(AppState& app)
 void drawFrequenciesPanel(AppState& app)
 {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(360, 540), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(430, vp->WorkSize.y - 550),
-                             ImGuiCond_FirstUseEver);
-    ImGui::Begin("Frequenze");
+    const float sideW = std::clamp(vp->WorkSize.x * 0.24f, 300.0f, 420.0f);
+    const float rowY = 10 + std::max(300.0f, (vp->WorkSize.y - 30) * 0.62f) + 10;
+    const float rowH = vp->WorkSize.y - rowY - 10;
+    const float rowW = vp->WorkSize.x - sideW - 30;
+    ImGui::SetNextWindowPos(ImVec2(sideW + 20, rowY), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(rowW * 0.38f, rowH), ImGuiCond_Always);
+    ImGui::Begin("Frequenze", nullptr, ImGuiWindowFlags_NoMove);
 
     static char nameBuf[64] = "";
     ImGui::SetNextItemWidth(180);
@@ -1391,10 +1460,15 @@ void drawAudioSection(AppState& app)
 void drawModulesPanel(AppState& app)
 {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(790, 540), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(330, vp->WorkSize.y - 550),
-                             ImGuiCond_FirstUseEver);
-    ImGui::Begin("Moduli");
+    const float sideW = std::clamp(vp->WorkSize.x * 0.24f, 300.0f, 420.0f);
+    const float rowY = 10 + std::max(300.0f, (vp->WorkSize.y - 30) * 0.62f) + 10;
+    const float rowH = vp->WorkSize.y - rowY - 10;
+    const float rowW = vp->WorkSize.x - sideW - 30;
+    ImGui::SetNextWindowPos(ImVec2(sideW + 20 + rowW * 0.38f + 10, rowY),
+                            ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(rowW * 0.30f - 10, rowH),
+                             ImGuiCond_Always);
+    ImGui::Begin("Moduli", nullptr, ImGuiWindowFlags_NoMove);
     if (app.modules.empty()) {
         ImGui::TextWrapped("Nessun modulo caricato. Copia i moduli (*.dll) "
                            "nella cartella 'modules' accanto all'eseguibile.");
@@ -1406,6 +1480,21 @@ void drawModulesPanel(AppState& app)
             ImGui::TextDisabled("%s", info.description.c_str());
             uint16_t port = lm.module()->webPort();
             if (port) ImGui::Text("Interfaccia web: http://localhost:%u", port);
+            if (info.preferredFreqHz > 0) {
+                char lbl[64];
+                std::snprintf(lbl, sizeof(lbl), "Sintonizza (%.3f MHz)##%s",
+                              info.preferredFreqHz / 1e6, info.name.c_str());
+                // L'hardware e' uno solo: il modulo riceve davvero il suo
+                // segnale solo quando la chiavetta e' sulla sua frequenza.
+                if (ImGui::SmallButton(lbl)) {
+                    app.freqMHz = info.preferredFreqHz / 1e6;
+                    if (app.source)
+                        app.source->setCenterFrequency(info.preferredFreqHz);
+                    app.listenOffsetHz = 0.0;
+                    if (app.listenVfo) app.listenVfo->setOffset(0.0);
+                    centerViewOnTuned(app);
+                }
+            }
             lm.module()->drawUi();
         }
     }
@@ -1418,11 +1507,15 @@ void drawModulesPanel(AppState& app)
 void drawLogPanel(AppState& app)
 {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(1130, 540), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - 1140,
-                                    vp->WorkSize.y - 550),
-                             ImGuiCond_FirstUseEver);
-    ImGui::Begin("Log");
+    const float sideW = std::clamp(vp->WorkSize.x * 0.24f, 300.0f, 420.0f);
+    const float rowY = 10 + std::max(300.0f, (vp->WorkSize.y - 30) * 0.62f) + 10;
+    const float rowH = vp->WorkSize.y - rowY - 10;
+    const float rowW = vp->WorkSize.x - sideW - 30;
+    const float logX = sideW + 20 + rowW * 0.68f + 10;
+    ImGui::SetNextWindowPos(ImVec2(logX, rowY), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(
+        ImVec2(vp->WorkSize.x - logX - 10, rowH), ImGuiCond_Always);
+    ImGui::Begin("Log", nullptr, ImGuiWindowFlags_NoMove);
     std::lock_guard<std::mutex> lk(app.logMutex);
     for (auto& line : app.logLines)
         ImGui::TextUnformatted(line.c_str());
@@ -1489,6 +1582,13 @@ int main(int argc, char** argv)
          "frequenze.csv")
             .string();
     app.freqStore.load(app.freqStorePath);
+    app.configPath =
+        (std::filesystem::path(sdrjo::ModuleLoader::defaultModulesDir())
+             .parent_path() /
+         "sdrjo.cfg")
+            .string();
+    loadConfig(app);
+    applyStationToModules(app);
 
     // Cockpit web: la plancia di SdrJo, anche per tablet/telefono in LAN.
     app.cockpit.setStatusProvider([&app] {

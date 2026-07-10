@@ -25,7 +25,7 @@ namespace sdrjo {
 
 // Versione dell'ABI: da incrementare a ogni modifica incompatibile
 // di questa interfaccia. L'host rifiuta i moduli con ABI diversa.
-constexpr uint32_t kModuleAbiVersion = 2;
+constexpr uint32_t kModuleAbiVersion = 3;
 
 struct ModuleInfo {
     std::string name;        // es. "ADS-B"
@@ -77,6 +77,14 @@ public:
     // Porta dell'eventuale interfaccia web dedicata (0 = nessuna),
     // es. la mappa voli del modulo ADS-B.
     virtual uint16_t webPort() const { return 0; }
+
+    // Posizione della stazione/antenna (per mappe, distanze, passaggi
+    // satellite). Default: ignorata.
+    virtual void setStationLocation(double latDeg, double lonDeg)
+    {
+        (void)latDeg;
+        (void)lonDeg;
+    }
 };
 
 } // namespace sdrjo

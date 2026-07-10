@@ -41,6 +41,8 @@ public:
 
         // Avvia la mappa web dei voli (stile SDRAngel / tar1090).
         web_ = std::make_unique<AdsbWebServer>(tracker_, mutex_);
+        if (stationLat_ != 0.0 || stationLon_ != 0.0)
+            web_->setAntennaPosition(stationLat_, stationLon_);
         if (web_->start()) {
             host.log("ADS-B", "mappa voli su http://localhost:" +
                                   std::to_string(web_->port()));
@@ -95,6 +97,13 @@ public:
         return web_ ? web_->port() : 0;
     }
 
+    void setStationLocation(double latDeg, double lonDeg) override
+    {
+        stationLat_ = latDeg;
+        stationLon_ = lonDeg;
+        if (web_) web_->setAntennaPosition(latDeg, lonDeg);
+    }
+
     AircraftTracker& tracker() { return tracker_; }
 
 private:
@@ -129,6 +138,7 @@ private:
     mutable std::mutex mutex_;
     std::unique_ptr<AdsbWebServer> web_;
     SbsOutput sbs_;
+    double stationLat_ = 0.0, stationLon_ = 0.0;
 };
 
 } // namespace sdrjo::adsb
