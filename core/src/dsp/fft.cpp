@@ -46,9 +46,16 @@ void hannWindow(float* out, size_t n)
 
 void powerSpectrumDb(const cfloat* in, size_t n, float* out)
 {
-    std::vector<cfloat> work(n);
-    std::vector<float> win(n);
-    hannWindow(win.data(), n);
+    // Buffer e finestra riutilizzati tra le chiamate (niente allocazioni
+    // ne' ricalcolo del coseno a ogni FFT: questa funzione gira ~30 volte
+    // al secondo anche a 65536 punti).
+    static thread_local std::vector<cfloat> work;
+    static thread_local std::vector<float> win;
+    work.resize(n);
+    if (win.size() != n) {
+        win.resize(n);
+        hannWindow(win.data(), n);
+    }
     for (size_t i = 0; i < n; i++) work[i] = in[i] * win[i];
 
     fft(work.data(), n);

@@ -32,6 +32,8 @@
 #include <sdrjo/util/ring_buffer.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -168,6 +170,24 @@ struct AppState : public sdrjo::IModuleHost {
     double pendingTuneHz = -1.0;
     std::string pendingMode;
 
+    // Thread DSP: drena l'anello IQ e fa TUTTO il calcolo (moduli, ascolto,
+    // FFT, righe waterfall). La GUI si limita a disegnare: niente freeze.
+    std::thread dspThread;
+    std::atomic<bool> dspRunning{false};
+    // Ricorsivo: le rebuild* si richiamano tra loro dal thread GUI.
+    std::recursive_mutex dspMutex;
+
+    // Waterfall: aggiornamento incrementale della texture (solo le righe
+    // nuove), con redraw completo solo quando cambiano palette/range.
+    std::mutex wfMutex;
+    std::vector<int> wfNewRows;
+    bool wfFullRedraw = true;
+
+    // Limitatore dei retune hardware (il set_center_freq via USB e'
+    // bloccante: durante il drag ne basterebbero 60/s per inchiodare).
+    double pendingHwTuneHz = -1.0;
+    std::chrono::steady_clock::time_point lastHwTune{};
+
     void ensureAudio()
     {
         if (!audio.isActive())
@@ -208,6 +228,7 @@ struct AppState : public sdrjo::IModuleHost {
 // (Ri)costruisce i VFO dei moduli per il sample rate corrente.
 void rebuildChannels(AppState& app)
 {
+    std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
     app.channels.clear();
     for (auto& lm : app.modules) {
         AppState::ModuleChannel ch;
@@ -266,6 +287,7 @@ double listenBandwidthHz(AppState::ListenMode m)
 // Ricostruisce il filtro di canale/SSB per la larghezza corrente.
 void rebuildChanFilter(AppState& app)
 {
+    std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
     app.chanFilter.reset();
     if (app.listenMode == AppState::ListenMode::Off ||
         app.listenMode == AppState::ListenMode::WfmStereo)
@@ -283,6 +305,7 @@ void rebuildChanFilter(AppState& app)
 // (Ri)costruisce la catena di ascolto per modalita'/rate correnti.
 void rebuildListener(AppState& app)
 {
+    std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
     app.listenVfo.reset();
     app.wfmDemod.reset();
     app.nfmDemod.reset();
@@ -322,10 +345,18 @@ void rebuildListener(AppState& app)
     app.filterR.reset();
 }
 
-void updateSpectrum(AppState& app)
+// Corpo del thread DSP: gira finche' l'app e' viva, drena l'anello IQ
+// e fa tutto il lavoro pesante fuori dal thread di rendering.
+void dspLoop(AppState& app)
 {
     static std::vector<sdrjo::cfloat> chunk(kChunkSize);
-    while (app.iqRing.available() >= kChunkSize) {
+    while (app.dspRunning.load()) {
+        if (app.iqRing.available() < kChunkSize) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            continue;
+        }
+        std::lock_guard<std::recursive_mutex> dspLk(app.dspMutex);
+        while (app.iqRing.available() >= kChunkSize) {
         app.iqRing.read(chunk.data(), kChunkSize);
         app.dcBlocker.processInPlace(chunk.data(), kChunkSize);
         if (app.recorder.isRecording())
@@ -468,6 +499,7 @@ void updateSpectrum(AppState& app)
         // Riga del waterfall (max-decimata a kWfWidth colonne).
         if (++app.wfSpeedCounter >= app.wfSpeedDiv) {
             app.wfSpeedCounter = 0;
+            std::lock_guard<std::mutex> wlk(app.wfMutex);
             float* row = &app.waterfall[size_t(app.waterfallHead) * kWfWidth];
             const size_t n = app.spectrum.size();
             for (int x = 0; x < kWfWidth; x++) {
@@ -478,23 +510,38 @@ void updateSpectrum(AppState& app)
                     v = std::max(v, app.spectrum[b]);
                 row[x] = v;
             }
+            app.wfNewRows.push_back(app.waterfallHead);
+            if (app.wfNewRows.size() > size_t(app.wfRows))
+                app.wfFullRedraw = true; // troppo indietro: riparti
             app.waterfallHead = (app.waterfallHead + 1) % app.wfRows;
         }
+    }
     }
 }
 
 // Cambia il numero di righe di storia del waterfall.
 void resizeWaterfall(AppState& app, int rows)
 {
+    std::lock_guard<std::mutex> lk(app.wfMutex);
     app.wfRows = rows;
     app.waterfall.assign(size_t(kWfWidth) * size_t(rows), -120.0f);
     app.waterfallHead = 0;
+    app.wfNewRows.clear();
+    app.wfFullRedraw = true;
 }
 
 void uploadWaterfallTexture(AppState& app)
 {
-    static std::vector<uint32_t> pixels;
-    pixels.resize(size_t(kWfWidth) * size_t(app.wfRows));
+    // Righe nuove dal thread DSP (di norma 0 o 1 per frame video).
+    static std::vector<int> newRows;
+    newRows.clear();
+    bool full = false;
+    {
+        std::lock_guard<std::mutex> lk(app.wfMutex);
+        newRows.swap(app.wfNewRows);
+        full = app.wfFullRedraw;
+        app.wfFullRedraw = false;
+    }
 
     const float lo = app.rangeMinDb;
     const float span = std::max(1.0f, app.rangeMaxDb - app.rangeMinDb);
@@ -521,22 +568,43 @@ void uploadWaterfallTexture(AppState& app)
         return 0xFF000000u | (uint32_t(b) << 16) | (uint32_t(g) << 8) | r;
     };
 
-    // Riga piu' recente in alto: il waterfall scende verso il basso.
-    for (int row = 0; row < app.wfRows; row++) {
-        int src = (app.waterfallHead + app.wfRows - 1 - row) % app.wfRows;
-        for (int x = 0; x < kWfWidth; x++)
-            pixels[size_t(row) * kWfWidth + size_t(x)] =
-                colorize(app.waterfall[size_t(src) * kWfWidth + size_t(x)]);
-    }
+    static int allocatedRows = 0;
     if (!app.waterfallTex) {
         glGenTextures(1, &app.waterfallTex);
         glBindTexture(GL_TEXTURE_2D, app.waterfallTex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        full = true;
     }
     glBindTexture(GL_TEXTURE_2D, app.waterfallTex);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kWfWidth, app.wfRows, 0,
-                 GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+
+    if (full || allocatedRows != app.wfRows) {
+        // Redraw completo: solo su cambio palette/range/memoria.
+        static std::vector<uint32_t> pixels;
+        std::lock_guard<std::mutex> lk(app.wfMutex);
+        pixels.resize(size_t(kWfWidth) * size_t(app.wfRows));
+        for (size_t i = 0; i < pixels.size(); i++)
+            pixels[i] = colorize(app.waterfall[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, kWfWidth, app.wfRows, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        allocatedRows = app.wfRows;
+        return;
+    }
+
+    // Aggiornamento incrementale: solo le righe appena scritte.
+    static std::vector<float> rowF(kWfWidth);
+    static std::vector<uint32_t> rowPix(kWfWidth);
+    for (int r : newRows) {
+        if (r < 0 || r >= allocatedRows) continue;
+        {
+            std::lock_guard<std::mutex> lk(app.wfMutex);
+            std::memcpy(rowF.data(), &app.waterfall[size_t(r) * kWfWidth],
+                        kWfWidth * sizeof(float));
+        }
+        for (int x = 0; x < kWfWidth; x++) rowPix[size_t(x)] = colorize(rowF[size_t(x)]);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, r, kWfWidth, 1, GL_RGBA,
+                        GL_UNSIGNED_BYTE, rowPix.data());
+    }
 }
 
 void drawDeviceSection(AppState& app)
@@ -652,10 +720,14 @@ void drawDeviceSection(AppState& app)
                 char name[64];
                 std::snprintf(name, sizeof(name), "sdrjo_%.4fMHz.bin",
                               app.freqMHz);
+                std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
                 app.recorder.start(name, app.freqMHz * 1e6, app.sampleRate);
             }
         } else {
-            if (ImGui::Button("Stop registrazione")) app.recorder.stop();
+            if (ImGui::Button("Stop registrazione")) {
+                std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+                app.recorder.stop();
+            }
             ImGui::SameLine();
             ImGui::Text("%s  %.1f s (%.1f MB)", app.recorder.path().c_str(),
                         app.recorder.secondsWritten(),
@@ -712,14 +784,26 @@ void centerViewOnTuned(AppState& app)
 // in entrambi i casi la vista zoomata resta centrata sulla sintonia.
 void applyTunedFrequency(AppState& app, double f)
 {
+    std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
     f = std::clamp(f, 0.0, 1.999e9);
     double center = app.freqMHz * 1e6;
     if (app.source && std::fabs(f - center) < app.sampleRate * 0.45) {
         app.listenOffsetHz = f - center;
     } else {
         app.freqMHz = f / 1e6;
-        if (app.source) app.source->setCenterFrequency(f);
         app.listenOffsetHz = 0.0;
+        if (app.source) {
+            // Retune hardware con limitatore: max ~20/s, il resto si
+            // accoda (il drag continuo non blocca piu' la GUI sull'USB).
+            auto now = std::chrono::steady_clock::now();
+            if (now - app.lastHwTune > std::chrono::milliseconds(50)) {
+                app.lastHwTune = now;
+                app.source->setCenterFrequency(f);
+                app.pendingHwTuneHz = -1.0;
+            } else {
+                app.pendingHwTuneHz = f;
+            }
+        }
     }
     if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
     centerViewOnTuned(app);
@@ -907,8 +991,10 @@ void drawSpectrumPanel(AppState& app)
     if (ImGui::CollapsingHeader("Regolazioni waterfall",
                                 ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::SetNextItemWidth(220);
-        ImGui::DragFloatRange2("Range dB", &app.rangeMinDb, &app.rangeMaxDb,
-                               1.0f, -140.0f, 0.0f, "min %.0f", "max %.0f");
+        if (ImGui::DragFloatRange2("Range dB", &app.rangeMinDb,
+                                   &app.rangeMaxDb, 1.0f, -140.0f, 0.0f,
+                                   "min %.0f", "max %.0f"))
+            app.wfFullRedraw = true;
         ImGui::SameLine();
         ImGui::SetNextItemWidth(140);
         double rowsPerSec = 30.0 / double(app.wfSpeedDiv);
@@ -928,7 +1014,8 @@ void drawSpectrumPanel(AppState& app)
         ImGui::SameLine();
         ImGui::SetNextItemWidth(90);
         static const char* kPalNames[] = {"Classica", "Grigi", "Fuoco"};
-        ImGui::Combo("Palette", &app.wfPalette, kPalNames, 3);
+        if (ImGui::Combo("Palette", &app.wfPalette, kPalNames, 3))
+            app.wfFullRedraw = true;
         ImGui::SameLine();
         ImGui::SetNextItemWidth(90);
         static const char* kFftNames[] = {"4096", "8192", "16384", "32768",
@@ -1206,13 +1293,30 @@ void drawSpectrumPanel(AppState& app)
     }
 
     // Waterfall nel resto dello spazio (ritagliato sulla vista/zoom).
+    // La texture e' in ordine di scrittura: la riga piu' recente va in
+    // alto disegnando due segmenti con la V invertita.
     if (app.waterfallTex) {
+        int rows, head;
+        {
+            std::lock_guard<std::mutex> lk(app.wfMutex);
+            rows = app.wfRows;
+            head = app.waterfallHead;
+        }
         float u0 = float((v0 - f0) / (f1 - f0));
         float u1 = float((v1 - f0) / (f1 - f0));
-        ImGui::Image((ImTextureID)(intptr_t)app.waterfallTex,
-                     ImVec2(ImGui::GetContentRegionAvail().x,
-                            ImGui::GetContentRegionAvail().y),
-                     ImVec2(u0, 0.0f), ImVec2(u1, 1.0f));
+        ImVec2 wfAvail = ImGui::GetContentRegionAvail();
+        ImVec2 wp = ImGui::GetCursorScreenPos();
+        ImTextureID tex = (ImTextureID)(intptr_t)app.waterfallTex;
+        float vh = float(head) / float(rows);
+        float h1 = wfAvail.y * vh;
+        if (h1 > 0.5f)
+            dl->AddImage(tex, wp, ImVec2(wp.x + wfAvail.x, wp.y + h1),
+                         ImVec2(u0, vh), ImVec2(u1, 0.0f));
+        if (wfAvail.y - h1 > 0.5f)
+            dl->AddImage(tex, ImVec2(wp.x, wp.y + h1),
+                         ImVec2(wp.x + wfAvail.x, wp.y + wfAvail.y),
+                         ImVec2(u0, 1.0f), ImVec2(u1, vh));
+        ImGui::Dummy(wfAvail);
     }
     ImGui::End();
 }
@@ -1281,6 +1385,7 @@ void drawReceiverSection(AppState& app)
                                   0.0f, 12000.0f, app.audioLowPassHz < 1
                                                       ? "spento" : "%.0f");
     if (changed) {
+        std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
         app.filterL.configure(48000.0, double(app.audioHighPassHz),
                               double(app.audioLowPassHz));
         app.filterR.configure(48000.0, double(app.audioHighPassHz),
@@ -1633,6 +1738,10 @@ int main(int argc, char** argv)
         app.log("Cockpit", "http://localhost:" +
                                std::to_string(app.cockpit.port()));
 
+    // Thread DSP: tutto il calcolo fuori dal thread di rendering.
+    app.dspRunning.store(true);
+    app.dspThread = std::thread(dspLoop, std::ref(app));
+
     // Avvio con replay da riga di comando: sdrjo <file.bin> [rate_MSps] [MHz]
     if (argc >= 2) {
         double rate = (argc >= 3) ? std::atof(argv[2]) * 1e6 : app.sampleRate;
@@ -1675,7 +1784,18 @@ int main(int argc, char** argv)
             if (tuneHz > 0) applyTunedFrequency(app, tuneHz);
         }
 
-        updateSpectrum(app);
+        // Retune hardware accodato dal limitatore del drag.
+        {
+            std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+            if (app.pendingHwTuneHz > 0 && app.source &&
+                std::chrono::steady_clock::now() - app.lastHwTune >
+                    std::chrono::milliseconds(50)) {
+                app.lastHwTune = std::chrono::steady_clock::now();
+                app.source->setCenterFrequency(app.pendingHwTuneHz);
+                app.pendingHwTuneHz = -1.0;
+            }
+        }
+
         uploadWaterfallTexture(app);
         app.cockpit.setDeviceInfo(
             app.source ? app.source->name() : "nessuna sorgente",
@@ -1703,6 +1823,8 @@ int main(int argc, char** argv)
         glfwSwapBuffers(window);
     }
 
+    app.dspRunning.store(false);
+    if (app.dspThread.joinable()) app.dspThread.join();
     app.cockpit.stop();
     for (auto& lm : app.modules) lm.module()->stop();
     if (app.source) app.source->stop();
