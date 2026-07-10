@@ -81,3 +81,7 @@ add_test(NAME sat COMMAND test_sat)
 add_executable(test_sensors433 test_sensors433.cpp)
 target_link_libraries(test_sensors433 PRIVATE sensors433-decoder)
 add_test(NAME sensors433 COMMAND test_sensors433)
+
+add_executable(test_fft_window test_fft_window.cpp)
+target_link_libraries(test_fft_window PRIVATE sdrjo-core)
+add_test(NAME fft_window COMMAND test_fft_window)

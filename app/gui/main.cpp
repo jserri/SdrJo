@@ -88,6 +88,7 @@ struct AppState : public sdrjo::IModuleHost {
     // Regolazioni di spettro e waterfall.
     float rangeMinDb = -110.0f;      // fondo scala (luminosita')
     float rangeMaxDb = -10.0f;       // tetto scala (contrasto)
+    int fftWindow = 0;               // 0 = Hann, 1 = Blackman-Harris
     int wfRows = kWaterfallRows;     // memoria del waterfall (righe)
     int wfSpeedDiv = 4;              // 1 riga ogni N FFT (velocita')
     int wfSpeedCounter = 0;
@@ -562,8 +563,10 @@ void dspLoop(AppState& app)
         {
             std::lock_guard<std::mutex> lk(app.spectrumMutex);
             app.spectrum.resize(lin.size());
-            sdrjo::dsp::powerSpectrumDb(lin.data(), lin.size(),
-                                        app.spectrum.data());
+            sdrjo::dsp::powerSpectrumDb(
+                lin.data(), lin.size(), app.spectrum.data(),
+                app.fftWindow == 1 ? sdrjo::dsp::FftWindow::BlackmanHarris
+                                   : sdrjo::dsp::FftWindow::Hann);
         }
 
         // Riga del waterfall (max-decimata a kWfWidth colonne).
@@ -792,6 +795,47 @@ void drawDeviceSection(AppState& app)
             }
             if (ImGui::InputInt("Correzione PPM", &app.ppmCorrection))
                 app.rtl->setPpmCorrection(app.ppmCorrection);
+            // Stima automatica: sintonizzati ESATTAMENTE su una portante
+            // di frequenza nota (una FM forte va benissimo) e premi.
+            if (ImGui::SmallButton("Stima PPM dal segnale sintonizzato")) {
+                double centerHz = app.freqMHz * 1e6;
+                double expectedHz = centerHz + app.listenOffsetHz;
+                double err = 0.0;
+                {
+                    std::lock_guard<std::mutex> lk(app.spectrumMutex);
+                    err = sdrjo::dsp::estimatePpm(
+                        app.spectrum.data(), app.spectrum.size(),
+                        app.sampleRate, centerHz, expectedHz, 20e3);
+                }
+                if (err == 0.0) {
+                    app.log("PPM", "nessuna portante chiara vicino alla "
+                                   "sintonia: mettiti su una stazione "
+                                   "forte di frequenza nota e riprova");
+                } else {
+                    // err = scostamento del picco; la correzione va nel
+                    // verso opposto rispetto a quella gia' impostata.
+                    int suggested =
+                        app.ppmCorrection - int(std::lround(err));
+                    if (std::abs(suggested) > 200) {
+                        app.log("PPM", "stima fuori scala: sintonia "
+                                       "davvero sulla portante?");
+                    } else {
+                        app.ppmCorrection = suggested;
+                        app.rtl->setPpmCorrection(app.ppmCorrection);
+                        char msg[96];
+                        std::snprintf(msg, sizeof(msg),
+                                      "scostamento %+.1f ppm: correzione "
+                                      "impostata a %d ppm",
+                                      err, app.ppmCorrection);
+                        app.log("PPM", msg);
+                    }
+                }
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "Sintonizzati esattamente su una portante di frequenza "
+                    "nota\n(es. una radio FM forte), poi premi: il picco "
+                    "osservato\nviene confrontato con quello atteso.");
         }
 
 
@@ -1166,6 +1210,12 @@ void drawSpectrumPanel(AppState& app)
             if (kFftVals[i] == app.fftSize) fftIdx = i;
         if (ImGui::Combo("FFT", &fftIdx, kFftNames, 5))
             app.fftSize = kFftVals[fftIdx]; // la cattura si adegua da sola
+        // Blackman-Harris: lobi laterali bassissimi, i segnali forti non
+        // coprono quelli deboli accanto (picchi un po' piu' larghi).
+        ImGui::SetNextItemWidth(150);
+        static const char* kWinNames[] = {"Hann", "Blackman-Harris"};
+        ImGui::Combo("Finestra", &app.fftWindow, kWinNames, 2);
+        ImGui::SameLine();
         // Tracce extra: media (liscia il rumore) e max hold (segnali
         // intermittenti: rimane il picco piu' alto visto).
         ImGui::Checkbox("Media", &app.specAvgOn);

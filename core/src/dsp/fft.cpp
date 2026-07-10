@@ -44,17 +44,33 @@ void hannWindow(float* out, size_t n)
         out[i] = 0.5f - 0.5f * std::cos(2.0f * float(M_PI) * float(i) / float(n - 1));
 }
 
-void powerSpectrumDb(const cfloat* in, size_t n, float* out)
+void blackmanHarrisWindow(float* out, size_t n)
+{
+    // Coefficienti standard della Blackman-Harris a 4 termini.
+    const double a0 = 0.35875, a1 = 0.48829, a2 = 0.14128, a3 = 0.01168;
+    for (size_t i = 0; i < n; i++) {
+        double x = 2.0 * M_PI * double(i) / double(n - 1);
+        out[i] = float(a0 - a1 * std::cos(x) + a2 * std::cos(2.0 * x) -
+                       a3 * std::cos(3.0 * x));
+    }
+}
+
+void powerSpectrumDb(const cfloat* in, size_t n, float* out, FftWindow window)
 {
     // Buffer e finestra riutilizzati tra le chiamate (niente allocazioni
     // ne' ricalcolo del coseno a ogni FFT: questa funzione gira ~30 volte
     // al secondo anche a 65536 punti).
     static thread_local std::vector<cfloat> work;
     static thread_local std::vector<float> win;
+    static thread_local FftWindow winType = FftWindow::Hann;
     work.resize(n);
-    if (win.size() != n) {
+    if (win.size() != n || winType != window) {
         win.resize(n);
-        hannWindow(win.data(), n);
+        winType = window;
+        if (window == FftWindow::BlackmanHarris)
+            blackmanHarrisWindow(win.data(), n);
+        else
+            hannWindow(win.data(), n);
     }
     for (size_t i = 0; i < n; i++) work[i] = in[i] * win[i];
 
