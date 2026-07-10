@@ -23,9 +23,12 @@
 #include <sdrjo/dsp/wfm_stereo.hpp>
 #include <sdrjo/module/module_loader.hpp>
 #include <sdrjo/dsp/audio_filters.hpp>
+#include <sdrjo/sat/orbit.hpp>
+#include <sdrjo/sat/tle.hpp>
 #include <sdrjo/util/frequency_store.hpp>
 #include <sdrjo/util/geolocate.hpp>
 #include <sdrjo/util/iq_recorder.hpp>
+#include <sdrjo/util/wav_writer.hpp>
 #include <sdrjo/web/cockpit_server.hpp>
 #include <sdrjo/source/sample_source.hpp>
 #include <sdrjo/source/file_source.hpp>
@@ -37,6 +40,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <cstring>
 #include <memory>
@@ -149,10 +153,46 @@ struct AppState : public sdrjo::IModuleHost {
     float chanLevelDb = -120.0f;
     bool squelchOpen = true;
 
-    // Filtri audio (passa-alto/passa-basso).
+    // Filtri audio (passa-alto/passa-basso/notch).
     float audioHighPassHz = 0.0f;
     float audioLowPassHz = 0.0f;
+    float notchHz = 0.0f;
     sdrjo::dsp::AudioFilterChain filterL, filterR;
+
+    // Noise blanker sul canale IQ di ascolto.
+    bool nbOn = false;
+    float nbThreshold = 4.0f;
+    sdrjo::dsp::NoiseBlanker noiseBlanker;
+
+    // Tracce extra dello spettro (media EMA e max hold).
+    bool specAvgOn = false;
+    bool specMaxOn = false;
+    std::vector<float> specAvg, specMax;
+
+    // Presa sull'audio demodulato per lo spettro audio (2048 campioni).
+    std::mutex audioTapMutex;
+    std::vector<float> audioTap = std::vector<float>(2048, 0.0f);
+    size_t audioTapPos = 0;
+
+    // Scanner delle memorie salvate.
+    bool scanOn = false;
+    int scanDwellMs = 500;       // attesa su ogni memoria
+    float scanResumeSec = 2.0f;  // riprende dopo N s di squelch chiuso
+    bool scanRecord = false;
+    int scanIndex = -1;
+    bool scanPaused = false;
+    std::chrono::steady_clock::time_point scanLastHop{}, scanSigLost{};
+    sdrjo::WavWriter scanWav;
+
+    // Satelliti: TLE, passaggi calcolati e inseguimento Doppler.
+    std::vector<sdrjo::sat::Tle> tles;
+    std::string tlePath;
+    int satSel = 0;
+    std::vector<sdrjo::sat::SatPass> satPasses;
+    bool dopplerOn = false;
+    double dopplerBaseMHz = 137.1;
+    double dopplerCurrentHz = 0.0;
+    std::chrono::steady_clock::time_point lastDopplerTune{};
 
     // Filtro di canale con la larghezza scelta dal grafico (NFM/AM).
     std::unique_ptr<sdrjo::dsp::FirFilter> chanFilter;
@@ -408,6 +448,9 @@ void dspLoop(AppState& app)
             app.listenVfo->process(chunk.data(), kChunkSize, lchan);
             if (lchan.empty()) continue;
 
+            // Noise blanker: schiaccia i disturbi impulsivi sul canale.
+            app.noiseBlanker.processInPlace(lchan.data(), lchan.size());
+
             // Filtro di canale (larghezza scelta trascinando i bordi).
             if (app.chanFilter) {
                 static std::vector<sdrjo::cfloat> filt;
@@ -432,6 +475,16 @@ void dspLoop(AppState& app)
                 app.squelchOpen = true;
             }
 
+            // Presa per lo spettro audio (anello degli ultimi campioni).
+            auto tapAudio = [&app](const float* s, size_t n) {
+                std::lock_guard<std::mutex> tlk(app.audioTapMutex);
+                for (size_t i = 0; i < n; i++) {
+                    app.audioTap[app.audioTapPos] = s[i];
+                    app.audioTapPos =
+                        (app.audioTapPos + 1) % app.audioTap.size();
+                }
+            };
+
             app.ensureAudio();
             if (app.wfmDemod) {
                 app.audioL.clear();
@@ -440,6 +493,7 @@ void dspLoop(AppState& app)
                                       app.audioR);
                 app.filterL.process(app.audioL.data(), app.audioL.size());
                 app.filterR.process(app.audioR.data(), app.audioR.size());
+                tapAudio(app.audioL.data(), app.audioL.size());
                 float g = app.squelchOpen ? app.volume : 0.0f;
                 app.audioInterleaved.resize(app.audioL.size() * 2);
                 for (size_t i = 0; i < app.audioL.size(); i++) {
@@ -455,6 +509,8 @@ void dspLoop(AppState& app)
                     mix[i] = 0.5f * (app.audioInterleaved[2 * i] +
                                      app.audioInterleaved[2 * i + 1]);
                 app.cockpit.pushAudio(mix.data(), mix.size());
+                if (app.scanWav.isOpen())
+                    app.scanWav.write(mix.data(), mix.size());
             } else {
                 app.audioMono.clear();
                 if (app.nfmDemod) {
@@ -475,11 +531,15 @@ void dspLoop(AppState& app)
                 }
                 app.filterL.process(app.audioMono.data(),
                                     app.audioMono.size());
+                tapAudio(app.audioMono.data(), app.audioMono.size());
                 float g = app.squelchOpen ? app.volume : 0.0f;
                 for (auto& v : app.audioMono) v *= g;
                 app.audio.writeMono(app.audioMono.data(),
                                     app.audioMono.size());
                 app.cockpit.pushAudio(app.audioMono.data(),
+                                      app.audioMono.size());
+                if (app.scanWav.isOpen())
+                    app.scanWav.write(app.audioMono.data(),
                                       app.audioMono.size());
             }
         }
@@ -764,6 +824,7 @@ void drawDeviceSection(AppState& app)
         if (ImGui::Button("Riproduci") && replayPath[0]) {
             auto src = std::make_unique<sdrjo::FileSource>(replayPath,
                                                            app.sampleRate);
+            src->setLoop(true); // a fine file si ricomincia
             src->setCenterFrequency(app.freqMHz * 1e6);
             src->start([&app](const sdrjo::cfloat* s, size_t n) {
                 app.iqRing.write(s, n);
@@ -1105,6 +1166,13 @@ void drawSpectrumPanel(AppState& app)
             if (kFftVals[i] == app.fftSize) fftIdx = i;
         if (ImGui::Combo("FFT", &fftIdx, kFftNames, 5))
             app.fftSize = kFftVals[fftIdx]; // la cattura si adegua da sola
+        // Tracce extra: media (liscia il rumore) e max hold (segnali
+        // intermittenti: rimane il picco piu' alto visto).
+        ImGui::Checkbox("Media", &app.specAvgOn);
+        ImGui::SameLine();
+        ImGui::Checkbox("Max hold", &app.specMaxOn);
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Azzera max")) app.specMax.clear();
         ImGui::Spacing();
     }
 
@@ -1190,44 +1258,78 @@ void drawSpectrumPanel(AppState& app)
         }
     }
 
-    // Traccia dello spettro (max dei bin per colonna di pixel).
+    // Traccia dello spettro (max dei bin per colonna di pixel), con
+    // media EMA e max-hold opzionali.
     {
         std::lock_guard<std::mutex> lk(app.spectrumMutex);
         const size_t n = app.spectrum.size();
+        const float* raw = app.spectrum.data();
+
+        if (app.specAvgOn) {
+            if (app.specAvg.size() != n)
+                app.specAvg.assign(raw, raw + n);
+            else
+                for (size_t i = 0; i < n; i++)
+                    app.specAvg[i] += 0.25f * (raw[i] - app.specAvg[i]);
+        }
+        if (app.specMaxOn) {
+            if (app.specMax.size() != n)
+                app.specMax.assign(raw, raw + n);
+            else
+                for (size_t i = 0; i < n; i++)
+                    app.specMax[i] = std::max(app.specMax[i], raw[i]);
+        }
+
         // Mappa i pixel sui bin della finestra di vista (zoom incluso).
         const double startBin = (v0 - f0) / (f1 - f0) * double(n);
         const double binsPerPx = (v1 - v0) / (f1 - f0) * double(n) / w;
-        ImU32 line = ImGui::GetColorU32(ImVec4(0.22f, 0.71f, 1.0f, 1.0f));
-        ImU32 fill = ImGui::GetColorU32(ImVec4(0.22f, 0.71f, 1.0f, 0.18f));
-        float prevY = 0;
-        for (int px = 0; px < int(w); px++) {
-            float v = -160.0f;
-            if (binsPerPx >= 1.0) {
-                // Vista larga: massimo dei bin che cadono nel pixel.
-                size_t b0 = size_t(std::max(0.0, startBin + px * binsPerPx));
-                size_t b1 = std::max(
-                    b0 + 1,
-                    size_t(std::max(0.0, startBin + (px + 1) * binsPerPx)));
-                for (size_t b = b0; b < b1 && b < n; b++)
-                    v = std::max(v, app.spectrum[b]);
-            } else {
-                // Zoom spinto: interpolazione lineare tra bin adiacenti,
-                // cosi' la traccia resta una linea liscia (niente gradini).
-                double bp = startBin + (double(px) + 0.5) * binsPerPx - 0.5;
-                bp = std::clamp(bp, 0.0, double(n - 1));
-                size_t b = size_t(bp);
-                double fr = bp - double(b);
-                float a = app.spectrum[b];
-                float c = app.spectrum[std::min(b + 1, n - 1)];
-                v = float(a * (1.0 - fr) + c * fr);
+        auto plotTrace = [&](const float* src, ImU32 line, ImU32 fill,
+                             bool withFill, float thickness) {
+            float prevY = 0;
+            for (int px = 0; px < int(w); px++) {
+                float v = -160.0f;
+                if (binsPerPx >= 1.0) {
+                    // Vista larga: massimo dei bin che cadono nel pixel.
+                    size_t b0 =
+                        size_t(std::max(0.0, startBin + px * binsPerPx));
+                    size_t b1 = std::max(
+                        b0 + 1, size_t(std::max(
+                                    0.0, startBin + (px + 1) * binsPerPx)));
+                    for (size_t b = b0; b < b1 && b < n; b++)
+                        v = std::max(v, src[b]);
+                } else {
+                    // Zoom spinto: interpolazione lineare tra bin, cosi'
+                    // la traccia resta una linea liscia (niente gradini).
+                    double bp = startBin + (double(px) + 0.5) * binsPerPx -
+                                0.5;
+                    bp = std::clamp(bp, 0.0, double(n - 1));
+                    size_t b = size_t(bp);
+                    double fr = bp - double(b);
+                    float a = src[b];
+                    float c = src[std::min(b + 1, n - 1)];
+                    v = float(a * (1.0 - fr) + c * fr);
+                }
+                float y = yOf(v);
+                if (withFill)
+                    dl->AddLine(ImVec2(s0.x + px, y),
+                                ImVec2(s0.x + px, s1.y), fill);
+                if (px > 0)
+                    dl->AddLine(ImVec2(s0.x + px - 1, prevY),
+                                ImVec2(s0.x + px, y), line, thickness);
+                prevY = y;
             }
-            float y = yOf(v);
-            dl->AddLine(ImVec2(s0.x + px, y), ImVec2(s0.x + px, s1.y), fill);
-            if (px > 0)
-                dl->AddLine(ImVec2(s0.x + px - 1, prevY),
-                            ImVec2(s0.x + px, y), line, 1.4f);
-            prevY = y;
-        }
+        };
+
+        if (app.specMaxOn && app.specMax.size() == n)
+            plotTrace(app.specMax.data(),
+                      ImGui::GetColorU32(ImVec4(1.0f, 0.85f, 0.3f, 0.55f)),
+                      0, false, 1.0f);
+        const float* main = (app.specAvgOn && app.specAvg.size() == n)
+                                ? app.specAvg.data()
+                                : raw;
+        plotTrace(main, ImGui::GetColorU32(ImVec4(0.22f, 0.71f, 1.0f, 1.0f)),
+                  ImGui::GetColorU32(ImVec4(0.22f, 0.71f, 1.0f, 0.18f)),
+                  true, 1.4f);
     }
 
     // Marker del VFO di ascolto: banda evidenziata, bordi trascinabili.
@@ -1525,10 +1627,36 @@ void drawReceiverSection(AppState& app)
         app.filterR.configure(48000.0, double(app.audioHighPassHz),
                               double(app.audioLowPassHz));
     }
+    // Notch: scava il fischio alla frequenza scelta (anche con un click
+    // sullo Spettro audio).
+    if (ImGui::SliderFloat("Notch (Hz)", &app.notchHz, 0.0f, 6000.0f,
+                           app.notchHz < 1 ? "spento" : "%.0f")) {
+        std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+        app.filterL.configureNotch(48000.0, double(app.notchHz));
+        app.filterR.configureNotch(48000.0, double(app.notchHz));
+    }
+
+    ImGui::SeparatorText("Noise blanker");
+    bool nbChanged = false;
+    nbChanged |= ImGui::Checkbox("Attivo##nb", &app.nbOn);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(140);
+    nbChanged |= ImGui::SliderFloat("Soglia##nb", &app.nbThreshold, 2.0f,
+                                    10.0f, "%.1fx");
+    if (nbChanged) {
+        std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+        app.noiseBlanker.configure(app.nbOn, app.nbThreshold);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Taglia i disturbi impulsivi (accensioni, motori):"
+                          "\npiu' bassa la soglia, piu' aggressivo.");
 }
 
 // Definite piu' avanti; nella sidebar compaiono come menu a tendina.
 void drawAudioSection(AppState& app);
+void drawAudioSpectrumSection(AppState& app);
+void drawScannerSection(AppState& app);
+void drawSatellitesSection(AppState& app);
 void drawFrequenciesSection(AppState& app);
 void drawModulesSection(AppState& app);
 void drawLogSection(AppState& app);
@@ -1549,6 +1677,12 @@ void drawSidebar(AppState& app)
         drawDeviceSection(app);
     if (ImGui::CollapsingHeader("Ricevitore", ImGuiTreeNodeFlags_DefaultOpen))
         drawReceiverSection(app);
+    if (ImGui::CollapsingHeader("Spettro audio"))
+        drawAudioSpectrumSection(app);
+    if (ImGui::CollapsingHeader("Scanner"))
+        drawScannerSection(app);
+    if (ImGui::CollapsingHeader("Satelliti"))
+        drawSatellitesSection(app);
     if (ImGui::CollapsingHeader("Frequenze"))
         drawFrequenciesSection(app);
     if (ImGui::CollapsingHeader("Moduli"))
@@ -1748,6 +1882,331 @@ void drawLogSection(AppState& app)
     ImGui::EndChild();
 }
 
+// Spettro dell'audio demodulato (0-6 kHz): utile per CW/SSB/RTTY e per
+// mirare il notch: un click sul grafico lo piazza sul fischio.
+void drawAudioSpectrumSection(AppState& app)
+{
+    if (app.listenMode == AppState::ListenMode::Off) {
+        ImGui::TextDisabled("accendi un demodulatore per vedere l'audio");
+        return;
+    }
+
+    const size_t n = app.audioTap.size();
+    static std::vector<float> tap;
+    tap.resize(n);
+    {
+        std::lock_guard<std::mutex> lk(app.audioTapMutex);
+        for (size_t i = 0; i < n; i++)
+            tap[i] = app.audioTap[(app.audioTapPos + i) % n];
+    }
+    static std::vector<sdrjo::cfloat> cbuf;
+    static std::vector<float> spec;
+    cbuf.resize(n);
+    spec.resize(n);
+    for (size_t i = 0; i < n; i++) cbuf[i] = sdrjo::cfloat(tap[i], 0.0f);
+    sdrjo::dsp::powerSpectrumDb(cbuf.data(), n, spec.data());
+
+    // DC al centro: le frequenze audio positive sono la seconda meta'.
+    const double rate = 48000.0;
+    const double maxHz = 6000.0;
+    const size_t bins = size_t(maxHz / rate * double(n));
+    const float dbLo = -100.0f, dbHi = -10.0f;
+
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float h = 110.0f;
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImGui::InvisibleButton("##audiospec", ImVec2(std::max(60.0f, w), h));
+    bool hov = ImGui::IsItemHovered();
+    dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h),
+                      ImGui::GetColorU32(ImVec4(0.03f, 0.04f, 0.06f, 1)));
+
+    ImU32 gridCol = ImGui::GetColorU32(ImVec4(0.3f, 0.42f, 0.53f, 0.2f));
+    ImU32 textCol = ImGui::GetColorU32(ImVec4(0.55f, 0.65f, 0.75f, 0.9f));
+    for (int k = 1; k <= 5; k++) {
+        float x = p.x + float(k * 1000.0 / maxHz) * w;
+        dl->AddLine(ImVec2(x, p.y), ImVec2(x, p.y + h), gridCol);
+        char lbl[8];
+        std::snprintf(lbl, sizeof(lbl), "%dk", k);
+        dl->AddText(ImVec2(x + 2, p.y + h - 15), textCol, lbl);
+    }
+
+    ImU32 line = ImGui::GetColorU32(ImVec4(0.35f, 0.9f, 0.55f, 1.0f));
+    float prevY = 0;
+    for (int px = 0; px < int(w); px++) {
+        size_t b = n / 2 + size_t(double(px) / double(w) * double(bins));
+        if (b >= n) b = n - 1;
+        float v = std::clamp(spec[b], dbLo, dbHi);
+        float y = p.y + h - (v - dbLo) / (dbHi - dbLo) * h;
+        if (px > 0)
+            dl->AddLine(ImVec2(p.x + px - 1, prevY), ImVec2(p.x + px, y),
+                        line, 1.2f);
+        prevY = y;
+    }
+
+    // Notch attivo: riga rossa sulla frequenza scavata.
+    if (app.notchHz >= 1.0f && app.notchHz < maxHz) {
+        float x = p.x + float(app.notchHz / maxHz) * w;
+        dl->AddLine(ImVec2(x, p.y), ImVec2(x, p.y + h),
+                    ImGui::GetColorU32(ImVec4(1.0f, 0.35f, 0.35f, 0.9f)),
+                    1.5f);
+    }
+
+    if (hov) {
+        float mxs = ImGui::GetIO().MousePos.x;
+        double f = std::clamp(double(mxs - p.x) / double(w), 0.0, 1.0) *
+                   maxHz;
+        ImGui::SetTooltip("%.0f Hz - click: notch qui", f);
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            // Si aggancia al picco piu' forte entro +/-120 Hz dal click:
+            // il fischio viene centrato anche con un click impreciso.
+            double lo = std::max(0.0, f - 120.0), hi = f + 120.0;
+            size_t b0 = n / 2 + size_t(lo / rate * double(n));
+            size_t b1 = n / 2 + size_t(hi / rate * double(n));
+            size_t bBest = b0;
+            for (size_t b = b0; b <= b1 && b < n; b++)
+                if (spec[b] > spec[bBest]) bBest = b;
+            f = double(bBest - n / 2) * rate / double(n);
+            app.notchHz = float(f);
+            std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+            app.filterL.configureNotch(48000.0, double(app.notchHz), 15.0);
+            app.filterR.configureNotch(48000.0, double(app.notchHz), 15.0);
+        }
+    }
+    if (ImGui::SmallButton("Notch spento")) {
+        app.notchHz = 0.0f;
+        std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+        app.filterL.configureNotch(48000.0, 0.0);
+        app.filterR.configureNotch(48000.0, 0.0);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("click sul grafico = notch sul fischio");
+}
+
+// ---- Scanner delle memorie: salta di frequenza in frequenza e si ferma
+// dove lo squelch apre; opzionalmente registra il segnale su WAV. ----
+void scannerHop(AppState& app)
+{
+    auto& items = app.freqStore.items();
+    if (items.empty()) return;
+    app.scanIndex = (app.scanIndex + 1) % int(items.size());
+    const auto& ff = items[size_t(app.scanIndex)];
+    for (int m = 1; m < 6; m++) {
+        if (ff.mode == kListenModeNames[m] &&
+            app.listenMode != AppState::ListenMode(m)) {
+            app.listenMode = AppState::ListenMode(m);
+            rebuildListener(app);
+        }
+    }
+    if (ff.bandwidthHz > 0) {
+        app.listenBwHz = ff.bandwidthHz;
+        rebuildChanFilter(app);
+    }
+    applyTunedFrequency(app, ff.freqHz);
+    app.scanLastHop = std::chrono::steady_clock::now();
+}
+
+void updateScanner(AppState& app)
+{
+    using namespace std::chrono;
+    if (!app.scanOn) {
+        if (app.scanWav.isOpen()) {
+            std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+            app.scanWav.stop();
+        }
+        app.scanPaused = false;
+        app.scanIndex = -1;
+        return;
+    }
+    if (app.freqStore.items().empty() ||
+        app.listenMode == AppState::ListenMode::Off || !app.squelchOn)
+        return;
+
+    auto now = steady_clock::now();
+    if (app.scanPaused) {
+        // Fermo su un segnale: si riparte quando lo squelch resta chiuso
+        // abbastanza a lungo.
+        if (app.squelchOpen) {
+            app.scanSigLost = now;
+        } else if (now - app.scanSigLost >
+                   milliseconds(int(app.scanResumeSec * 1000.0f))) {
+            if (app.scanWav.isOpen()) {
+                std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+                app.scanWav.stop();
+            }
+            app.scanPaused = false;
+            scannerHop(app);
+        }
+        return;
+    }
+
+    // Dopo il salto il livello del canale deve assestarsi prima di
+    // fidarsi dello squelch.
+    bool settled = now - app.scanLastHop >
+                   milliseconds(std::max(150, app.scanDwellMs / 3));
+    if (app.scanIndex >= 0 && settled && app.squelchOpen) {
+        app.scanPaused = true;
+        app.scanSigLost = now;
+        if (app.scanRecord) {
+            const auto& ff = app.freqStore.items()[size_t(app.scanIndex)];
+            char name[96];
+            std::snprintf(name, sizeof(name), "scan_%.4fMHz.wav",
+                          ff.freqHz / 1e6);
+            std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+            app.scanWav.start(name, 48000, 1);
+        }
+        return;
+    }
+    if (app.scanIndex < 0 ||
+        now - app.scanLastHop >= milliseconds(app.scanDwellMs))
+        scannerHop(app);
+}
+
+void drawScannerSection(AppState& app)
+{
+    auto& items = app.freqStore.items();
+    bool ready = !items.empty() &&
+                 app.listenMode != AppState::ListenMode::Off &&
+                 app.squelchOn;
+    if (!ready)
+        ImGui::TextWrapped("Servono: memorie salvate in Frequenze, un "
+                           "demodulatore acceso e lo squelch attivo (lo "
+                           "scanner si ferma dove lo squelch apre).");
+    ImGui::Checkbox("Attivo##scan", &app.scanOn);
+    ImGui::SliderInt("Attesa (ms)", &app.scanDwellMs, 200, 3000);
+    ImGui::SliderFloat("Riprendi dopo (s)", &app.scanResumeSec, 0.5f, 10.0f,
+                       "%.1f");
+    ImGui::Checkbox("Registra su WAV il segnale trovato", &app.scanRecord);
+    if (app.scanOn && app.scanIndex >= 0 &&
+        app.scanIndex < int(items.size())) {
+        const auto& ff = items[size_t(app.scanIndex)];
+        ImGui::Text("%s %s (%.4f MHz)",
+                    app.scanPaused ? "FERMO su" : "ascolto",
+                    ff.name.c_str(), ff.freqHz / 1e6);
+    }
+    if (app.scanWav.isOpen())
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                           "REC %s (%.1f s)", app.scanWav.path().c_str(),
+                           app.scanWav.secondsWritten());
+}
+
+// ---- Satelliti: passaggi dai TLE e inseguimento Doppler. ----
+void updateDoppler(AppState& app)
+{
+    using namespace std::chrono;
+    if (!app.dopplerOn || app.tles.empty() ||
+        app.satSel >= int(app.tles.size()))
+        return;
+    auto now = steady_clock::now();
+    if (now - app.lastDopplerTune < seconds(1)) return;
+    app.lastDopplerTune = now;
+
+    sdrjo::sat::OrbitPropagator orb(app.tles[size_t(app.satSel)]);
+    double t = double(std::time(nullptr));
+    auto ae = orb.observe(t, app.stationLat, app.stationLon);
+    if (ae.elDeg <= 0.0) {
+        app.dopplerCurrentHz = 0.0;
+        return; // sotto l'orizzonte: non toccare la sintonia
+    }
+    app.dopplerCurrentHz =
+        orb.dopplerHz(t, app.stationLat, app.stationLon,
+                      app.dopplerBaseMHz * 1e6);
+    applyTunedFrequency(app, app.dopplerBaseMHz * 1e6 +
+                                 app.dopplerCurrentHz);
+}
+
+void drawSatellitesSection(AppState& app)
+{
+    if (ImGui::SmallButton("Ricarica TLE")) {
+        app.tles = sdrjo::sat::loadTleFile(app.tlePath);
+        app.satPasses.clear();
+        app.log("Satelliti",
+                std::to_string(app.tles.size()) + " TLE caricati da " +
+                    app.tlePath);
+    }
+    ImGui::SameLine();
+    ImGui::Text("%zu satelliti", app.tles.size());
+    if (app.tles.empty()) {
+        ImGui::TextWrapped(
+            "Scarica gli elementi orbitali (celestrak.org, gruppo "
+            "'weather' per NOAA/Meteor) e salvali come tle.txt accanto "
+            "all'eseguibile. Rinnovali ogni pochi giorni.");
+        return;
+    }
+
+    if (app.satSel >= int(app.tles.size())) app.satSel = 0;
+    const auto& tle = app.tles[size_t(app.satSel)];
+    if (ImGui::BeginCombo("Satellite", tle.name.c_str())) {
+        for (int i = 0; i < int(app.tles.size()); i++) {
+            if (ImGui::Selectable(app.tles[size_t(i)].name.c_str(),
+                                  app.satSel == i)) {
+                app.satSel = i;
+                app.satPasses.clear();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    double ageDays = (double(std::time(nullptr)) - tle.epochUnix) / 86400.0;
+    ImGui::TextDisabled("elementi di %.1f giorni fa%s", ageDays,
+                        ageDays > 7.0 ? " (vecchi: meglio rinnovarli)" : "");
+
+    if (app.stationLat == 0.0 && app.stationLon == 0.0) {
+        ImGui::TextWrapped("Imposta (o rileva) la posizione dell'antenna "
+                           "nella sezione Dispositivo.");
+        return;
+    }
+
+    if (ImGui::Button("Calcola passaggi (24h)")) {
+        sdrjo::sat::OrbitPropagator orb(tle);
+        app.satPasses = orb.findPasses(double(std::time(nullptr)), 24.0,
+                                       app.stationLat, app.stationLon, 5.0);
+    }
+    if (!app.satPasses.empty() &&
+        ImGui::BeginTable("passi", 4, ImGuiTableFlags_RowBg)) {
+        ImGui::TableSetupColumn("Inizio");
+        ImGui::TableSetupColumn("Durata");
+        ImGui::TableSetupColumn("El.max");
+        ImGui::TableSetupColumn("Az.");
+        ImGui::TableHeadersRow();
+        for (const auto& p : app.satPasses) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            time_t aos = time_t(p.aosUnix);
+            struct tm tmv;
+#if defined(_WIN32)
+            localtime_s(&tmv, &aos);
+#else
+            localtime_r(&aos, &tmv);
+#endif
+            char when[32];
+            std::strftime(when, sizeof(when), "%d/%m %H:%M", &tmv);
+            ImGui::TextUnformatted(when);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f min", (p.losUnix - p.aosUnix) / 60.0);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f\xc2\xb0", p.maxElDeg);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f>%.0f", p.aosAzDeg, p.losAzDeg);
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText("Doppler");
+    ImGui::SetNextItemWidth(140);
+    ImGui::InputDouble("Downlink (MHz)", &app.dopplerBaseMHz, 0, 0, "%.4f");
+    ImGui::Checkbox("Insegui Doppler (sintonia automatica)", &app.dopplerOn);
+    if (app.dopplerOn) {
+        sdrjo::sat::OrbitPropagator orb(tle);
+        auto ae = orb.observe(double(std::time(nullptr)), app.stationLat,
+                              app.stationLon);
+        if (ae.elDeg > 0.0)
+            ImGui::Text("el %.0f  az %.0f  offset %+.0f Hz", ae.elDeg,
+                        ae.azDeg, app.dopplerCurrentHz);
+        else
+            ImGui::TextDisabled("sotto l'orizzonte: aspetto il passaggio");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1814,6 +2273,17 @@ int main(int argc, char** argv)
     loadConfig(app);
     applyStationToModules(app);
 
+    // Elementi orbitali per la sezione Satelliti (se il file esiste).
+    app.tlePath =
+        (std::filesystem::path(sdrjo::ModuleLoader::defaultModulesDir())
+             .parent_path() /
+         "tle.txt")
+            .string();
+    app.tles = sdrjo::sat::loadTleFile(app.tlePath);
+    if (!app.tles.empty())
+        app.log("Satelliti",
+                std::to_string(app.tles.size()) + " TLE caricati");
+
     // Cockpit web: la plancia di SdrJo, anche per tablet/telefono in LAN.
     app.cockpit.setStatusProvider([&app] {
         std::vector<sdrjo::CockpitServer::ModuleStatus> out;
@@ -1868,6 +2338,7 @@ int main(int argc, char** argv)
         app.sampleRate = rate;
         rebuildChannels(app);
         auto src = std::make_unique<sdrjo::FileSource>(argv[1], rate);
+        src->setLoop(true);
         src->setCenterFrequency(app.freqMHz * 1e6);
         src->start([&app](const sdrjo::cfloat* s, size_t n) {
             app.iqRing.write(s, n);
@@ -1883,6 +2354,10 @@ int main(int argc, char** argv)
             rebuildChannels(app);
             app.channelsDirty = false;
         }
+
+        // Scanner delle memorie e inseguimento Doppler dei satelliti.
+        updateScanner(app);
+        updateDoppler(app);
 
         // Applica i comandi arrivati dal Cockpit web.
         {
@@ -1942,6 +2417,7 @@ int main(int argc, char** argv)
     app.dspRunning.store(false);
     if (app.dspThread.joinable()) app.dspThread.join();
     if (app.geoThread.joinable()) app.geoThread.join();
+    app.scanWav.stop();
     app.cockpit.stop();
     for (auto& lm : app.modules) lm.module()->stop();
     if (app.source) app.source->stop();

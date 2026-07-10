@@ -40,9 +40,19 @@ void FileSource::workerLoop()
     using clock = std::chrono::steady_clock;
     auto next = clock::now();
 
+    bool readAnything = false;
     while (running_.load()) {
         size_t rd = std::fread(raw.data(), 2, kChunkSamples, f);
-        if (rd == 0) break; // fine file
+        if (rd == 0) {
+            // Fine file: in loop si riparte dall'inizio (se il file non
+            // era vuoto, altrimenti si eviterebbe solo un giro a vuoto).
+            if (loop_ && readAnything) {
+                std::rewind(f);
+                continue;
+            }
+            break;
+        }
+        readAnything = true;
         convertU8Iq(raw.data(), rd, conv.data());
         if (callback_) callback_(conv.data(), rd);
 

@@ -65,3 +65,19 @@ add_test(NAME freq_store COMMAND test_freq_store)
 add_executable(test_geolocate test_geolocate.cpp)
 target_link_libraries(test_geolocate PRIVATE sdrjo-core)
 add_test(NAME geolocate COMMAND test_geolocate)
+
+add_executable(test_filters_nb test_filters_nb.cpp)
+target_link_libraries(test_filters_nb PRIVATE sdrjo-core)
+add_test(NAME filters_nb COMMAND test_filters_nb)
+
+add_executable(test_wav test_wav.cpp)
+target_link_libraries(test_wav PRIVATE sdrjo-core)
+add_test(NAME wav COMMAND test_wav)
+
+add_executable(test_sat test_sat.cpp)
+target_link_libraries(test_sat PRIVATE sdrjo-core)
+add_test(NAME sat COMMAND test_sat)
+
+add_executable(test_sensors433 test_sensors433.cpp)
+target_link_libraries(test_sensors433 PRIVATE sensors433-decoder)
+add_test(NAME sensors433 COMMAND test_sensors433)

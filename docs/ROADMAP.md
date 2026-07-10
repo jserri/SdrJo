@@ -87,12 +87,26 @@ Fatti (3a tornata):
 - ✅ DLL della chiavetta caricate da `driver/` accanto all'eseguibile.
 - ✅ Posizione stazione **rilevata via IP** (ip-api.com) con un click.
 
+Fatti (4a tornata):
+
+- ✅ **Notch** biquad (click sullo Spettro audio: si aggancia da solo al
+  fischio) e **noise blanker** con soglia regolabile.
+- ✅ **Spettro audio** 0-6 kHz del canale demodulato nella sidebar.
+- ✅ Tracce **media** e **max hold** sullo spettro RF.
+- ✅ **Scanner delle memorie**: si ferma dove lo squelch apre, riprende
+  dopo N secondi di silenzio, registrazione automatica su WAV.
+- ✅ **Satelliti**: TLE da tle.txt, passaggi 24h (Kepler+J2, per LEO con
+  TLE freschi) e **inseguimento Doppler** automatico del downlink.
+- ✅ Nuovo modulo **Sensori 433 MHz** (OOK, protocollo Nexus-TH:
+  temperatura/umidita' stile rtl_433).
+- ✅ Replay dei file IQ **in loop** (prima si fermava a fine file).
+
 Prossimi:
 
-- Notch regolabile e noise blanker sul canale di ascolto.
-- Max-hold / media sullo spettro e spettro audio (per CW/SSB).
-- Scanner di memorie con squelch e registrazione automatica.
+- SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).
+- Scarico automatico dei TLE (serve HTTPS) e piu' protocolli 433 MHz
+  (Oregon Scientific, TFA, TPMS...).
 - Cockpit: audio Opus/WebSocket per latenza e banda migliori (oggi WAV).
 - VFO con offset regolabile per modulo dalla GUI (oggi centrati).
-- Predizione passaggi satellite (TLE + SGP4) con correzione Doppler.
+- Registratore pianificato (parte da solo al passaggio del satellite).
 - MSIX per il Microsoft Store.

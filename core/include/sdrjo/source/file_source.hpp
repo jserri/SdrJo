@@ -27,6 +27,10 @@ public:
 
     bool setGain(double) override { return true; }
 
+    // Riproduzione ciclica: a fine file si riparte dall'inizio (comodo
+    // per replay e demo; da chiamare prima di start()).
+    void setLoop(bool on) { loop_ = on; }
+
     bool start(IqCallback cb) override;
     void stop() override;
     bool isRunning() const override { return running_.load(); }
@@ -38,6 +42,7 @@ private:
     double freqHz_ = 0.0;
     double rateHz_;
     bool throttle_;
+    bool loop_ = false;
     IqCallback callback_;
     std::thread worker_;
     std::atomic<bool> running_{false};

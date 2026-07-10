@@ -14,7 +14,10 @@ add_library(sdrjo-core STATIC
     src/module/module_loader.cpp
     src/util/http_server.cpp
     src/util/geolocate.cpp
+    src/util/wav_writer.cpp
     src/util/tcp_line_server.cpp
+    src/sat/tle.cpp
+    src/sat/orbit.cpp
     src/util/bmp_writer.cpp
     src/web/cockpit_server.cpp
     src/web/cockpit_page.cpp
