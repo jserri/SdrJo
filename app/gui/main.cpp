@@ -24,6 +24,7 @@
 #include <sdrjo/module/module_loader.hpp>
 #include <sdrjo/dsp/audio_filters.hpp>
 #include <sdrjo/util/frequency_store.hpp>
+#include <sdrjo/util/geolocate.hpp>
 #include <sdrjo/util/iq_recorder.hpp>
 #include <sdrjo/web/cockpit_server.hpp>
 #include <sdrjo/source/sample_source.hpp>
@@ -41,6 +42,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -129,6 +131,7 @@ struct AppState : public sdrjo::IModuleHost {
     // Vista tipata sulla sorgente quando e' una RTL-SDR (per bias-T/PPM).
     sdrjo::RtlSdrSource* rtl = nullptr;
     bool tunerAgc = true;
+    bool rtlAgc = false; // AGC digitale dell'RTL2832 (come in SDR#)
     bool biasTee = false;
     int ppmCorrection = 0;
 
@@ -163,6 +166,13 @@ struct AppState : public sdrjo::IModuleHost {
     double stationLat = 0.0;
     double stationLon = 0.0;
     std::string configPath;
+
+    // Rilevamento posizione via IP: gira in un thread suo, l'esito viene
+    // applicato dal thread GUI (0 fermo, 1 in corso, 2 esito pronto).
+    std::atomic<int> geoState{0};
+    sdrjo::GeoIpResult geoResult;
+    std::mutex geoMutex;
+    std::thread geoThread;
 
     // Comandi arrivati dal Cockpit web (thread HTTP): applicati nel loop
     // principale per non toccare lo stato da thread diversi.
@@ -702,6 +712,17 @@ void drawDeviceSection(AppState& app)
                                        49.6f, "%.1f"))
                     app.rtl->setGain(double(app.gainDb));
             }
+            if (ImGui::Checkbox("AGC RTL (digitale)", &app.rtlAgc)) {
+                if (!app.rtl->setRtlAgc(app.rtlAgc)) {
+                    app.log("Dispositivo",
+                            "AGC RTL non supportato da questa rtlsdr.dll");
+                    app.rtlAgc = false;
+                }
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Amplificazione digitale dell'RTL2832: "
+                                  "utile sui segnali deboli (il 'RTL AGC' "
+                                  "di SDR#).");
             if (ImGui::Checkbox("Bias-T (alimenta LNA)", &app.biasTee)) {
                 if (!app.rtl->setBiasTee(app.biasTee)) {
                     app.log("Dispositivo",
@@ -763,6 +784,48 @@ void drawDeviceSection(AppState& app)
         saveConfig(app);
         applyStationToModules(app);
     }
+
+    // Rilevamento automatico via IP (precisione a livello di citta').
+    int geoSt = app.geoState.load();
+    if (geoSt == 1) {
+        ImGui::TextDisabled("rilevamento in corso...");
+    } else if (ImGui::Button("Rileva dalla rete")) {
+        if (app.geoThread.joinable()) app.geoThread.join();
+        app.geoState.store(1);
+        app.geoThread = std::thread([&app] {
+            auto r = sdrjo::geolocateByIp();
+            {
+                std::lock_guard<std::mutex> lk(app.geoMutex);
+                app.geoResult = r;
+            }
+            app.geoState.store(2);
+        });
+    }
+    if (geoSt == 2) {
+        sdrjo::GeoIpResult r;
+        {
+            std::lock_guard<std::mutex> lk(app.geoMutex);
+            r = app.geoResult;
+        }
+        app.geoState.store(0);
+        if (r.ok) {
+            app.stationLat = r.latDeg;
+            app.stationLon = r.lonDeg;
+            saveConfig(app);
+            applyStationToModules(app);
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), "rilevata via IP: %.4f, %.4f %s%s",
+                          r.latDeg, r.lonDeg, r.city.empty() ? "" : "- ",
+                          r.city.c_str());
+            app.log("Posizione", msg);
+        } else {
+            app.log("Posizione", "rilevamento fallito: " + r.error);
+        }
+    }
+    if (ImGui::IsItemHovered() && geoSt == 0)
+        ImGui::SetTooltip("Stima la posizione dal tuo IP (precisione: "
+                          "citta'). Puoi sempre rifinire lat/lon a mano.");
+
     if (app.stationLat == 0.0 && app.stationLon == 0.0)
         ImGui::TextDisabled("(imposta lat/lon per vederti sulla mappa ADS-B)");
 }
@@ -782,26 +845,40 @@ void centerViewOnTuned(AppState& app)
 // Applica la frequenza sintonizzata: VFO se dentro lo span, altrimenti
 // risintonizza l'hardware (mostrando cosi' le frequenze successive);
 // in entrambi i casi la vista zoomata resta centrata sulla sintonia.
-void applyTunedFrequency(AppState& app, double f)
+// forceHwRetune = true sposta comunque la banda hardware attorno a f
+// (doppio click: nuova "finestra" sul segnale, mai sulla riga DC).
+void applyTunedFrequency(AppState& app, double f, bool forceHwRetune = false)
 {
     std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
     f = std::clamp(f, 0.0, 1.999e9);
     double center = app.freqMHz * 1e6;
-    if (app.source && std::fabs(f - center) < app.sampleRate * 0.45) {
+    if (!forceHwRetune && app.source &&
+        std::fabs(f - center) < app.sampleRate * 0.45) {
         app.listenOffsetHz = f - center;
     } else {
-        app.freqMHz = f / 1e6;
-        app.listenOffsetHz = 0.0;
+        // Fuori dallo span: risintonizza l'hardware. Il segnale ascoltato
+        // NON va messo esattamente al centro: li' ogni RTL-SDR ha la riga
+        // della DC (e il DC blocker la scava). Un quarto di span piu' in
+        // la' l'ascolto resta pulito, come l'offset tuning di SDR#.
+        double offset = 0.0;
+        if (app.listenMode != AppState::ListenMode::Off) {
+            double maxOff = app.sampleRate * 0.45 - app.listenBwHz * 0.5;
+            offset = std::clamp(app.sampleRate * 0.25, 0.0,
+                                std::max(0.0, maxOff));
+        }
+        double newCenter = f - offset;
+        app.freqMHz = newCenter / 1e6;
+        app.listenOffsetHz = offset;
         if (app.source) {
             // Retune hardware con limitatore: max ~20/s, il resto si
             // accoda (il drag continuo non blocca piu' la GUI sull'USB).
             auto now = std::chrono::steady_clock::now();
             if (now - app.lastHwTune > std::chrono::milliseconds(50)) {
                 app.lastHwTune = now;
-                app.source->setCenterFrequency(f);
+                app.source->setCenterFrequency(newCenter);
                 app.pendingHwTuneHz = -1.0;
             } else {
-                app.pendingHwTuneHz = f;
+                app.pendingHwTuneHz = newCenter;
             }
         }
     }
@@ -975,21 +1052,23 @@ ImU32 bandColor(const char* cat, float alpha)
 // il VFO di ascolto, doppio click per risintonizzare l'hardware.
 void drawSpectrumPanel(AppState& app)
 {
-    // Layout proporzionale: segue il ridimensionamento della finestra.
+    // Layout proporzionale: spettro e waterfall hanno la priorita' e
+    // occupano tutta la parte destra (il resto vive nella sidebar).
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     const float sideW = std::clamp(vp->WorkSize.x * 0.24f, 300.0f, 420.0f);
-    const float specHWin = std::max(300.0f, (vp->WorkSize.y - 30) * 0.62f);
     ImGui::SetNextWindowPos(ImVec2(sideW + 20, 10), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - sideW - 30, specHWin),
-                             ImGuiCond_Always);
-    ImGui::Begin("Spettro", nullptr, ImGuiWindowFlags_NoMove);
+    ImGui::SetNextWindowSize(
+        ImVec2(vp->WorkSize.x - sideW - 30, vp->WorkSize.y - 20),
+        ImGuiCond_Always);
+    ImGui::Begin("Spettro", nullptr,
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoScrollWithMouse);
 
     // Frequenza sintonizzata: cifre cliccabili e scrollabili.
     drawFrequencyDial(app);
 
-    // Leve di regolazione (contrasto, velocita', memoria, palette).
-    if (ImGui::CollapsingHeader("Regolazioni waterfall",
-                                ImGuiTreeNodeFlags_DefaultOpen)) {
+    // Leve di regolazione (chiuse di default: spazio al grafico).
+    if (ImGui::CollapsingHeader("Regolazioni")) {
         ImGui::SetNextItemWidth(220);
         if (ImGui::DragFloatRange2("Range dB", &app.rangeMinDb,
                                    &app.rangeMaxDb, 1.0f, -140.0f, 0.0f,
@@ -1032,8 +1111,11 @@ void drawSpectrumPanel(AppState& app)
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 avail = ImGui::GetContentRegionAvail();
     const float bandH = 20.0f;
+    const float scaleH = 22.0f; // righello delle frequenze (cliccabile)
+    const float splitH = 7.0f;
     // Altezza dello spettro regolabile con il divisore trascinabile.
-    float specH = std::clamp(avail.y * app.wfSplit, 90.0f, avail.y - 90.0f);
+    const float usableH = std::max(180.0f, avail.y - bandH - scaleH - splitH);
+    float specH = std::clamp(usableH * app.wfSplit, 90.0f, usableH - 90.0f);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
     const float w = avail.x;
 
@@ -1076,7 +1158,7 @@ void drawSpectrumPanel(AppState& app)
     dl->AddRectFilled(s0, s1, ImGui::GetColorU32(ImVec4(0.03f, 0.04f, 0.06f, 1)));
 
     ImGui::InvisibleButton("##specarea", ImVec2(w, bandH + specH));
-    bool hovered = ImGui::IsItemHovered();
+    bool hovSpec = ImGui::IsItemHovered();
 
     const float dbMin = app.rangeMinDb, dbMax = app.rangeMaxDb;
     auto yOf = [&](float db) {
@@ -1085,20 +1167,15 @@ void drawSpectrumPanel(AppState& app)
         return s1.y - t * specH;
     };
 
-    // Griglia di frequenza con etichette in MHz.
+    // Griglia di frequenza (le etichette MHz vivono nel righello sotto).
     double step = niceStep((v1 - v0) / 8.0);
     ImU32 gridCol = ImGui::GetColorU32(ImVec4(0.3f, 0.42f, 0.53f, 0.18f));
     ImU32 textCol = ImGui::GetColorU32(ImVec4(0.55f, 0.65f, 0.75f, 0.9f));
     // Decimali adattivi: con lo zoom spinto servono piu' cifre.
     int freqDecimals = std::clamp(
         -int(std::floor(std::log10(step / 1e6))), 0, 6);
-    for (double f = std::ceil(v0 / step) * step; f < v1; f += step) {
-        float x = xOf(f);
-        dl->AddLine(ImVec2(x, s0.y), ImVec2(x, s1.y), gridCol);
-        char lbl[32];
-        std::snprintf(lbl, sizeof(lbl), "%.*f MHz", freqDecimals, f / 1e6);
-        dl->AddText(ImVec2(x + 4, s1.y - 16), textCol, lbl);
-    }
+    for (double f = std::ceil(v0 / step) * step; f < v1; f += step)
+        dl->AddLine(ImVec2(xOf(f), s0.y), ImVec2(xOf(f), s1.y), gridCol);
     // ~10 righe orizzontali con passo "bello" sul range dB corrente.
     {
         double dbStep = niceStep(double(dbMax - dbMin) / 10.0);
@@ -1106,13 +1183,10 @@ void drawSpectrumPanel(AppState& app)
              db += dbStep) {
             dl->AddLine(ImVec2(s0.x, yOf(float(db))),
                         ImVec2(s1.x, yOf(float(db))), gridCol);
-            // Niente etichetta dove si sovrapporrebbe alla riga dei MHz.
-            if (yOf(float(db)) < s1.y - 26.0f) {
-                char dbLbl[16];
-                std::snprintf(dbLbl, sizeof(dbLbl), "%.0f dB", db);
-                dl->AddText(ImVec2(s0.x + 4, yOf(float(db)) - 14), textCol,
-                            dbLbl);
-            }
+            char dbLbl[16];
+            std::snprintf(dbLbl, sizeof(dbLbl), "%.0f dB", db);
+            dl->AddText(ImVec2(s0.x + 4, yOf(float(db)) - 14), textCol,
+                        dbLbl);
         }
     }
 
@@ -1157,27 +1231,31 @@ void drawSpectrumPanel(AppState& app)
     }
 
     // Marker del VFO di ascolto: banda evidenziata, bordi trascinabili.
+    // Le coordinate servono anche a righello e waterfall piu' sotto.
     static bool draggingBw = false;
     bool nearEdge = false;
+    bool hasVfo = false;
+    float vfoX = 0.0f, vfoX0 = 0.0f, vfoX1 = 0.0f;
+    const ImU32 vfoCol = ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.9f));
+    const ImU32 vfoColSoft =
+        ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.5f));
     float mx = ImGui::GetIO().MousePos.x;
     if (app.listenMode != AppState::ListenMode::Off) {
         double bw = app.listenBwHz;
         double vfoHz = centerHz + app.listenOffsetHz;
-        float xc = xOf(vfoHz);
-        float xb0 = xOf(vfoHz - bw / 2);
-        float xb1 = xOf(vfoHz + bw / 2);
-        dl->AddRectFilled(ImVec2(xb0, s0.y), ImVec2(xb1, s1.y),
+        hasVfo = true;
+        vfoX = xOf(vfoHz);
+        vfoX0 = xOf(vfoHz - bw / 2);
+        vfoX1 = xOf(vfoHz + bw / 2);
+        dl->AddRectFilled(ImVec2(vfoX0, s0.y), ImVec2(vfoX1, s1.y),
                           ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.15f)));
-        dl->AddLine(ImVec2(xc, s0.y), ImVec2(xc, s1.y),
-                    ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.9f)), 1.5f);
-        dl->AddLine(ImVec2(xb0, s0.y), ImVec2(xb0, s1.y),
-                    ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.5f)));
-        dl->AddLine(ImVec2(xb1, s0.y), ImVec2(xb1, s1.y),
-                    ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.5f)));
+        dl->AddLine(ImVec2(vfoX, s0.y), ImVec2(vfoX, s1.y), vfoCol, 1.5f);
+        dl->AddLine(ImVec2(vfoX0, s0.y), ImVec2(vfoX0, s1.y), vfoColSoft);
+        dl->AddLine(ImVec2(vfoX1, s0.y), ImVec2(vfoX1, s1.y), vfoColSoft);
 
         // Trascinamento dei bordi = cambia la larghezza del canale.
-        nearEdge = hovered && (std::fabs(mx - xb0) < 6.0f ||
-                               std::fabs(mx - xb1) < 6.0f);
+        nearEdge = hovSpec && (std::fabs(mx - vfoX0) < 6.0f ||
+                               std::fabs(mx - vfoX1) < 6.0f);
         if (nearEdge || draggingBw)
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         if (nearEdge && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -1196,91 +1274,45 @@ void drawSpectrumPanel(AppState& app)
         }
     }
 
-    // Interazione: click = sintonizza (snap), trascina = sintonia continua,
-    // rotellina = passi di snap (oltre il bordo scorre da solo),
-    // Ctrl+rotellina = zoom, doppio click = centra l'hardware qui.
-    static bool draggingTune = false;
-    static bool dragMoved = false;
-    static float dragStartX = 0.0f;
-    static double dragStartFreq = 0.0;
-
-    if (hovered && !draggingBw) {
-        double f = freqAt(mx);
-        dl->AddLine(ImVec2(mx, s0.y), ImVec2(mx, s1.y),
-                    ImGui::GetColorU32(ImVec4(1, 1, 1, 0.25f)));
-        if (!draggingTune)
-            ImGui::SetTooltip(
-                "%.4f MHz\nclick: sintonizza (snap %.4g kHz)\n"
-                "trascina: sintonia continua  rotellina: passi di snap\n"
-                "Ctrl+rotellina: zoom  doppio click: centra qui",
-                f / 1e6, app.snapHz / 1e3);
-
-        float wheel = ImGui::GetIO().MouseWheel;
-        if (wheel != 0.0f) {
-            if (ImGui::GetIO().KeyCtrl) {
-                // Zoom mantenendo ferma la frequenza sotto il cursore.
-                double frac = double((mx - p0.x) / w);
-                app.viewSpanFrac =
-                    std::clamp(app.viewSpanFrac * std::pow(0.8, double(wheel)),
-                               0.005, 1.0);
-                double newSpan = (f1 - f0) * app.viewSpanFrac;
-                double newV0 = f - frac * newSpan;
-                app.viewCenterFrac =
-                    (newV0 + newSpan / 2.0 - f0) / (f1 - f0);
-            } else {
-                // Oltre il 45%% dello span l'hardware si risintonizza da
-                // solo: continuando con la rotellina si "scorre" la banda.
-                double cur = centerHz + app.listenOffsetHz;
-                double next = std::round((cur + double(wheel) * app.snapHz) /
-                                         app.snapHz) * app.snapHz;
-                applyTunedFrequency(app, next);
+    // --- Righello delle frequenze (cliccabile e trascinabile) ---
+    ImGui::InvisibleButton("##freqscale", ImVec2(w, scaleH));
+    bool hovScale = ImGui::IsItemHovered();
+    {
+        ImVec2 r0 = ImGui::GetItemRectMin();
+        ImVec2 r1 = ImGui::GetItemRectMax();
+        dl->AddRectFilled(r0, r1,
+                          ImGui::GetColorU32(ImVec4(0.07f, 0.09f, 0.13f, 1)));
+        // Tacche minori (1/5 di passo) e maggiori con etichetta centrata.
+        const double minor = step / 5.0;
+        for (long long k = (long long)std::ceil(v0 / minor);
+             double(k) * minor < v1; k++) {
+            double f = double(k) * minor;
+            float x = xOf(f);
+            bool major = (k % 5) == 0;
+            dl->AddLine(ImVec2(x, r0.y), ImVec2(x, r0.y + (major ? 8.f : 4.f)),
+                        textCol);
+            if (major) {
+                char lbl[32];
+                std::snprintf(lbl, sizeof(lbl), "%.*f", freqDecimals, f / 1e6);
+                ImVec2 sz = ImGui::CalcTextSize(lbl);
+                dl->AddText(ImVec2(x - sz.x / 2, r1.y - sz.y - 1), textCol,
+                            lbl);
             }
         }
-
-        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            draggingTune = false;
-            app.freqMHz = f / 1e6;
-            if (app.source) app.source->setCenterFrequency(f);
-            app.listenOffsetHz = 0.0;
-            if (app.listenVfo) app.listenVfo->setOffset(0.0);
-            centerViewOnTuned(app);
-        } else if (!nearEdge && !draggingTune &&
-                   ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            draggingTune = true;
-            dragMoved = false;
-            dragStartX = mx;
-            dragStartFreq = centerHz + app.listenOffsetHz;
-        }
-    }
-
-    // Trascinamento attivo: continua anche se il cursore esce dall'area.
-    if (draggingTune) {
-        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            float dx = mx - dragStartX;
-            if (std::fabs(dx) > 4.0f) dragMoved = true;
-            if (dragMoved) {
-                // Trascini lo spettro: mouse a destra = frequenze piu' basse.
-                double hzPerPx = (v1 - v0) / double(w);
-                applyTunedFrequency(app, dragStartFreq - double(dx) * hzPerPx);
-            }
-        } else {
-            if (!dragMoved && hovered) {
-                // Click secco: sintonizza con lo snap.
-                double snapped =
-                    std::round(freqAt(mx) / app.snapHz) * app.snapHz;
-                applyTunedFrequency(app, snapped);
-            }
-            draggingTune = false;
-        }
+        // Indice del VFO sul righello (triangolino arancione).
+        if (hasVfo && vfoX >= r0.x && vfoX <= r1.x)
+            dl->AddTriangleFilled(ImVec2(vfoX - 5, r0.y),
+                                  ImVec2(vfoX + 5, r0.y),
+                                  ImVec2(vfoX, r0.y + 7), vfoCol);
     }
 
     // Divisore trascinabile: regola l'altezza spettro/waterfall.
-    ImGui::InvisibleButton("##split", ImVec2(w, 7.0f));
+    ImGui::InvisibleButton("##split", ImVec2(w, splitH));
     if (ImGui::IsItemHovered() || ImGui::IsItemActive())
         ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
-    if (ImGui::IsItemActive() && avail.y > 1.0f)
+    if (ImGui::IsItemActive() && usableH > 1.0f)
         app.wfSplit = std::clamp(
-            app.wfSplit + ImGui::GetIO().MouseDelta.y / avail.y, 0.12f, 0.85f);
+            app.wfSplit + ImGui::GetIO().MouseDelta.y / usableH, 0.12f, 0.85f);
     {
         ImVec2 sp0 = ImGui::GetItemRectMin();
         ImVec2 sp1 = ImGui::GetItemRectMax();
@@ -1295,7 +1327,14 @@ void drawSpectrumPanel(AppState& app)
     // Waterfall nel resto dello spazio (ritagliato sulla vista/zoom).
     // La texture e' in ordine di scrittura: la riga piu' recente va in
     // alto disegnando due segmenti con la V invertita.
-    if (app.waterfallTex) {
+    ImVec2 wfAvail = ImGui::GetContentRegionAvail();
+    ImVec2 wp = ImGui::GetCursorScreenPos();
+    bool hovWf = false;
+    if (wfAvail.y > 4.0f) {
+        ImGui::InvisibleButton("##wfarea", wfAvail);
+        hovWf = ImGui::IsItemHovered();
+    }
+    if (app.waterfallTex && wfAvail.y > 4.0f) {
         int rows, head;
         {
             std::lock_guard<std::mutex> lk(app.wfMutex);
@@ -1304,8 +1343,6 @@ void drawSpectrumPanel(AppState& app)
         }
         float u0 = float((v0 - f0) / (f1 - f0));
         float u1 = float((v1 - f0) / (f1 - f0));
-        ImVec2 wfAvail = ImGui::GetContentRegionAvail();
-        ImVec2 wp = ImGui::GetCursorScreenPos();
         ImTextureID tex = (ImTextureID)(intptr_t)app.waterfallTex;
         float vh = float(head) / float(rows);
         float h1 = wfAvail.y * vh;
@@ -1316,7 +1353,104 @@ void drawSpectrumPanel(AppState& app)
             dl->AddImage(tex, ImVec2(wp.x, wp.y + h1),
                          ImVec2(wp.x + wfAvail.x, wp.y + wfAvail.y),
                          ImVec2(u0, 1.0f), ImVec2(u1, vh));
-        ImGui::Dummy(wfAvail);
+
+        // Linea del VFO anche sul waterfall: stessa X dello spettro,
+        // per calibrare la frequenza sulle tracce che scorrono.
+        if (hasVfo && vfoX >= wp.x && vfoX <= wp.x + wfAvail.x) {
+            dl->AddLine(ImVec2(vfoX, wp.y), ImVec2(vfoX, wp.y + wfAvail.y),
+                        vfoCol, 1.2f);
+            if (vfoX0 >= wp.x && vfoX1 <= wp.x + wfAvail.x &&
+                vfoX1 - vfoX0 > 6.0f) {
+                dl->AddLine(ImVec2(vfoX0, wp.y),
+                            ImVec2(vfoX0, wp.y + wfAvail.y), vfoColSoft, 0.8f);
+                dl->AddLine(ImVec2(vfoX1, wp.y),
+                            ImVec2(vfoX1, wp.y + wfAvail.y), vfoColSoft, 0.8f);
+            }
+        }
+    }
+
+    // --- Interazione di sintonia, comune a spettro/righello/waterfall ---
+    // click  = sintonizza (snap) alla frequenza PREMUTA (non a quella al
+    //          rilascio: cosi' un tremolio del mouse non sposta il tiro);
+    // trascina             = sintonia continua ("afferri" lo spettro);
+    // rotellina            = zoom ancorato al cursore;
+    // Ctrl+rotellina (o rotellina sul righello) = passi di snap;
+    // doppio click         = centra l'hardware qui.
+    static bool draggingTune = false;
+    static bool dragMoved = false;
+    static float dragStartX = 0.0f;
+    static double dragStartFreq = 0.0;
+    static double pressFreq = 0.0;
+
+    const bool tuneHover = (hovSpec || hovScale || hovWf) && !draggingBw;
+    if (tuneHover) {
+        double f = freqAt(mx);
+        // Guida verticale su tutta l'altezza: aiuta ad allineare spettro,
+        // righello e waterfall sulla stessa frequenza.
+        dl->AddLine(ImVec2(mx, s0.y), ImVec2(mx, wp.y + wfAvail.y),
+                    ImGui::GetColorU32(ImVec4(1, 1, 1, 0.25f)));
+        if (!draggingTune)
+            ImGui::SetTooltip(
+                "%.4f MHz\nclick: sintonizza (snap %.4g kHz)  "
+                "trascina: sintonia continua\n"
+                "rotellina: zoom  Ctrl+rotellina o righello: passi di snap\n"
+                "doppio click: centra qui",
+                f / 1e6, app.snapHz / 1e3);
+
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.0f) {
+            if (ImGui::GetIO().KeyCtrl || hovScale) {
+                // Passi di snap (oltre il bordo l'hardware scorre da solo).
+                double cur = centerHz + app.listenOffsetHz;
+                double next = std::round((cur + double(wheel) * app.snapHz) /
+                                         app.snapHz) * app.snapHz;
+                applyTunedFrequency(app, next);
+            } else {
+                // Zoom mantenendo ferma la frequenza sotto il cursore.
+                double frac = double((mx - p0.x) / w);
+                app.viewSpanFrac =
+                    std::clamp(app.viewSpanFrac * std::pow(0.8, double(wheel)),
+                               0.005, 1.0);
+                double newSpan = (f1 - f0) * app.viewSpanFrac;
+                double newV0 = f - frac * newSpan;
+                app.viewCenterFrac =
+                    (newV0 + newSpan / 2.0 - f0) / (f1 - f0);
+            }
+        }
+
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            draggingTune = false;
+            double snapped = std::round(f / app.snapHz) * app.snapHz;
+            applyTunedFrequency(app, snapped, /*forceHwRetune=*/true);
+        } else if (!nearEdge && !draggingTune &&
+                   ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            draggingTune = true;
+            dragMoved = false;
+            dragStartX = mx;
+            dragStartFreq = centerHz + app.listenOffsetHz;
+            pressFreq = f; // frequenza sotto il mouse ADESSO
+        }
+    }
+
+    // Trascinamento attivo: continua anche se il cursore esce dall'area.
+    if (draggingTune) {
+        if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            float dx = mx - dragStartX;
+            if (std::fabs(dx) > 5.0f) dragMoved = true;
+            if (dragMoved) {
+                // Trascini lo spettro: mouse a destra = frequenze piu' basse.
+                double hzPerPx = (v1 - v0) / double(w);
+                applyTunedFrequency(app, dragStartFreq - double(dx) * hzPerPx);
+            }
+        } else {
+            if (!dragMoved) {
+                // Click secco: sintonizza sul punto premuto, con lo snap.
+                double snapped =
+                    std::round(pressFreq / app.snapHz) * app.snapHz;
+                applyTunedFrequency(app, snapped);
+            }
+            draggingTune = false;
+        }
     }
     ImGui::End();
 }
@@ -1393,11 +1527,15 @@ void drawReceiverSection(AppState& app)
     }
 }
 
-// Frequency manager: memorie salvate su file, riordinate per frequenza.
-void drawAudioSection(AppState& app); // definita piu' avanti
+// Definite piu' avanti; nella sidebar compaiono come menu a tendina.
+void drawAudioSection(AppState& app);
+void drawFrequenciesSection(AppState& app);
+void drawModulesSection(AppState& app);
+void drawLogSection(AppState& app);
 
 // Sidebar unica: tutte le sezioni di controllo in una colonna, apribili
-// e richiudibili come menu a tendina.
+// e richiudibili come menu a tendina (spettro e waterfall tengono cosi'
+// tutta la parte destra dello schermo).
 void drawSidebar(AppState& app)
 {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -1411,23 +1549,21 @@ void drawSidebar(AppState& app)
         drawDeviceSection(app);
     if (ImGui::CollapsingHeader("Ricevitore", ImGuiTreeNodeFlags_DefaultOpen))
         drawReceiverSection(app);
+    if (ImGui::CollapsingHeader("Frequenze"))
+        drawFrequenciesSection(app);
+    if (ImGui::CollapsingHeader("Moduli"))
+        drawModulesSection(app);
     if (ImGui::CollapsingHeader("Audio"))
         drawAudioSection(app);
+    if (ImGui::CollapsingHeader("Log"))
+        drawLogSection(app);
 
     ImGui::End();
 }
 
-void drawFrequenciesPanel(AppState& app)
+// Frequency manager: memorie salvate su file, riordinate per frequenza.
+void drawFrequenciesSection(AppState& app)
 {
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float sideW = std::clamp(vp->WorkSize.x * 0.24f, 300.0f, 420.0f);
-    const float rowY = 10 + std::max(300.0f, (vp->WorkSize.y - 30) * 0.62f) + 10;
-    const float rowH = vp->WorkSize.y - rowY - 10;
-    const float rowW = vp->WorkSize.x - sideW - 30;
-    ImGui::SetNextWindowPos(ImVec2(sideW + 20, rowY), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(rowW * 0.38f, rowH), ImGuiCond_Always);
-    ImGui::Begin("Frequenze", nullptr, ImGuiWindowFlags_NoMove);
-
     static char nameBuf[64] = "";
     ImGui::SetNextItemWidth(180);
     ImGui::InputTextWithHint("##nome", "nome memoria", nameBuf,
@@ -1451,7 +1587,8 @@ void drawFrequenciesPanel(AppState& app)
     }
 
     if (ImGui::BeginTable("freqs", 4,
-                          ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
+                          ImVec2(0, 220))) {
         ImGui::TableSetupColumn("Nome", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("MHz", ImGuiTableColumnFlags_WidthFixed, 90);
         ImGui::TableSetupColumn("Modo", ImGuiTableColumnFlags_WidthFixed, 60);
@@ -1492,7 +1629,6 @@ void drawFrequenciesPanel(AppState& app)
         }
         ImGui::EndTable();
     }
-    ImGui::End();
 }
 
 void drawAudioSection(AppState& app)
@@ -1562,18 +1698,8 @@ void drawAudioSection(AppState& app)
     ImGui::TextDisabled("utente: sdrjo - da internet usa una VPN (README)");
 }
 
-void drawModulesPanel(AppState& app)
+void drawModulesSection(AppState& app)
 {
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float sideW = std::clamp(vp->WorkSize.x * 0.24f, 300.0f, 420.0f);
-    const float rowY = 10 + std::max(300.0f, (vp->WorkSize.y - 30) * 0.62f) + 10;
-    const float rowH = vp->WorkSize.y - rowY - 10;
-    const float rowW = vp->WorkSize.x - sideW - 30;
-    ImGui::SetNextWindowPos(ImVec2(sideW + 20 + rowW * 0.38f + 10, rowY),
-                            ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(rowW * 0.30f - 10, rowH),
-                             ImGuiCond_Always);
-    ImGui::Begin("Moduli", nullptr, ImGuiWindowFlags_NoMove);
     if (app.modules.empty()) {
         ImGui::TextWrapped("Nessun modulo caricato. Copia i moduli (*.dll) "
                            "nella cartella 'modules' accanto all'eseguibile.");
@@ -1606,27 +1732,20 @@ void drawModulesPanel(AppState& app)
     ImGui::Separator();
     ImGui::TextDisabled("Cockpit completo: http://localhost:%u",
                         app.cockpit.port());
-    ImGui::End();
 }
 
-void drawLogPanel(AppState& app)
+void drawLogSection(AppState& app)
 {
-    const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float sideW = std::clamp(vp->WorkSize.x * 0.24f, 300.0f, 420.0f);
-    const float rowY = 10 + std::max(300.0f, (vp->WorkSize.y - 30) * 0.62f) + 10;
-    const float rowH = vp->WorkSize.y - rowY - 10;
-    const float rowW = vp->WorkSize.x - sideW - 30;
-    const float logX = sideW + 20 + rowW * 0.68f + 10;
-    ImGui::SetNextWindowPos(ImVec2(logX, rowY), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(
-        ImVec2(vp->WorkSize.x - logX - 10, rowH), ImGuiCond_Always);
-    ImGui::Begin("Log", nullptr, ImGuiWindowFlags_NoMove);
-    std::lock_guard<std::mutex> lk(app.logMutex);
-    for (auto& line : app.logLines)
-        ImGui::TextUnformatted(line.c_str());
-    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
-        ImGui::SetScrollHereY(1.0f);
-    ImGui::End();
+    // Riquadro scorrevole: il log non deve allungare tutta la sidebar.
+    if (ImGui::BeginChild("##logscroll", ImVec2(0, 180),
+                          ImGuiChildFlags_Borders)) {
+        std::lock_guard<std::mutex> lk(app.logMutex);
+        for (auto& line : app.logLines)
+            ImGui::TextUnformatted(line.c_str());
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+            ImGui::SetScrollHereY(1.0f);
+    }
+    ImGui::EndChild();
 }
 
 } // namespace
@@ -1809,9 +1928,6 @@ int main(int argc, char** argv)
 
         drawSidebar(app);
         drawSpectrumPanel(app);
-        drawFrequenciesPanel(app);
-        drawModulesPanel(app);
-        drawLogPanel(app);
 
         ImGui::Render();
         int w, h;
@@ -1825,6 +1941,7 @@ int main(int argc, char** argv)
 
     app.dspRunning.store(false);
     if (app.dspThread.joinable()) app.dspThread.join();
+    if (app.geoThread.joinable()) app.geoThread.join();
     app.cockpit.stop();
     for (auto& lm : app.modules) lm.module()->stop();
     if (app.source) app.source->stop();

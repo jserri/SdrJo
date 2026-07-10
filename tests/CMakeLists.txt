@@ -61,3 +61,7 @@ add_test(NAME bands COMMAND test_bands)
 add_executable(test_freq_store test_freq_store.cpp)
 target_link_libraries(test_freq_store PRIVATE sdrjo-core)
 add_test(NAME freq_store COMMAND test_freq_store)
+
+add_executable(test_geolocate test_geolocate.cpp)
+target_link_libraries(test_geolocate PRIVATE sdrjo-core)
+add_test(NAME geolocate COMMAND test_geolocate)

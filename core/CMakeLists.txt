@@ -13,6 +13,7 @@ add_library(sdrjo-core STATIC
     src/util/frequency_store.cpp
     src/module/module_loader.cpp
     src/util/http_server.cpp
+    src/util/geolocate.cpp
     src/util/tcp_line_server.cpp
     src/util/bmp_writer.cpp
     src/web/cockpit_server.cpp

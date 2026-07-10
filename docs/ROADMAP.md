@@ -73,9 +73,26 @@ Fatti (2a tornata):
 - ✅ **Frequency manager** persistente (frequenze.csv accanto all'exe).
 - ✅ Pannello Audio: scelta scheda di uscita e frequenza audio.
 
+Fatti (3a tornata):
+
+- ✅ Rotellina = **zoom** sullo spettro (Ctrl+rotellina o rotellina sul
+  righello = passi di snap); click sintonizza sul punto **premuto**.
+- ✅ **Righello delle frequenze** sotto lo spettro, cliccabile e
+  trascinabile; sintonia anche con click/trascina sul waterfall.
+- ✅ **Linea del VFO sul waterfall** allineata al marker dello spettro.
+- ✅ Frequenze/Moduli/Log dentro la sidebar: spettro+waterfall a tutta
+  altezza.
+- ✅ Retune hardware con **offset anti-DC** (il segnale ascoltato non
+  finisce piu' sulla riga della DC al centro) e checkbox **AGC RTL**.
+- ✅ DLL della chiavetta caricate da `driver/` accanto all'eseguibile.
+- ✅ Posizione stazione **rilevata via IP** (ip-api.com) con un click.
+
 Prossimi:
 
 - Notch regolabile e noise blanker sul canale di ascolto.
+- Max-hold / media sullo spettro e spettro audio (per CW/SSB).
+- Scanner di memorie con squelch e registrazione automatica.
 - Cockpit: audio Opus/WebSocket per latenza e banda migliori (oggi WAV).
 - VFO con offset regolabile per modulo dalla GUI (oggi centrati).
+- Predizione passaggi satellite (TLE + SGP4) con correzione Doppler.
 - MSIX per il Microsoft Store.

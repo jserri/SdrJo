@@ -2,7 +2,8 @@
 //
 // Sorgente RTL-SDR con caricamento di librtlsdr A RUNTIME (come SDR#):
 // nessuna dipendenza in fase di build. All'avvio si cerca:
-//   - Windows: rtlsdr.dll / librtlsdr.dll accanto all'eseguibile o nel PATH
+//   - Windows: rtlsdr.dll / librtlsdr.dll nella cartella "driver" accanto
+//     all'eseguibile, poi accanto all'eseguibile stesso, poi nel PATH
 //   - Linux:   librtlsdr.so.2 / .so.0 / .so
 //
 // NOTA per RTL-SDR Blog V4: la V4 monta il tuner R828D ed e' PIENAMENTE
@@ -54,6 +55,10 @@ public:
 
     // Correzione PPM del quarzo (le V4 hanno TCXO: di solito 0).
     bool setPpmCorrection(int ppm);
+
+    // AGC digitale dell'RTL2832 (il "RTL AGC" di SDR#): aiuta con i
+    // segnali deboli quando il guadagno del tuner non basta.
+    bool setRtlAgc(bool on);
 
     // Bias-T per alimentare LNA esterni (utile per LRPT/ADS-B).
     // Ritorna false se la DLL caricata non espone la funzione.

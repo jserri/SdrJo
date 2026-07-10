@@ -6,7 +6,24 @@
 #if defined(_WIN32)
   #include <windows.h>
   static void* osOpenLib(const char* n) { return (void*)LoadLibraryA(n); }
+  // Carica da un percorso completo risolvendo anche le DLL dipendenti
+  // (libusb-1.0.dll ecc.) dalla stessa cartella.
+  static void* osOpenLibAt(const std::string& path)
+  {
+      return (void*)LoadLibraryExA(path.c_str(), nullptr,
+                                   LOAD_WITH_ALTERED_SEARCH_PATH);
+  }
   static void* osSym(void* h, const char* s) { return (void*)GetProcAddress((HMODULE)h, s); }
+  // Cartella dell'eseguibile (per cercare in exe\driver\).
+  static std::string exeDirectory()
+  {
+      char buf[MAX_PATH] = {0};
+      DWORD n = GetModuleFileNameA(nullptr, buf, MAX_PATH);
+      if (n == 0 || n >= MAX_PATH) return {};
+      std::string p(buf, n);
+      size_t slash = p.find_last_of("\\/");
+      return (slash == std::string::npos) ? std::string() : p.substr(0, slash);
+  }
 #else
   #include <dlfcn.h>
   static void* osOpenLib(const char* n) { return dlopen(n, RTLD_NOW | RTLD_GLOBAL); }
@@ -38,7 +55,8 @@ struct RtlLib {
     int (*reset_buffer)(rtlsdr_dev*) = nullptr;
     int (*read_async)(rtlsdr_dev*, ReadAsyncCb, void*, uint32_t, uint32_t) = nullptr;
     int (*cancel_async)(rtlsdr_dev*) = nullptr;
-    // Facoltative (presenti in librtlsdr >= 0.6 e nel fork rtl-sdr-blog).
+    // Facoltative (tollerate assenti nelle DLL piu' vecchie).
+    int (*set_agc_mode)(rtlsdr_dev*, int) = nullptr;
     int (*set_bias_tee)(rtlsdr_dev*, int) = nullptr;
 
     bool complete() const
@@ -64,12 +82,32 @@ static RtlLib loadRtlLib()
     };
 
     RtlLib lib;
-    for (const char* name : kNames) {
-        void* h = osOpenLib(name);
-        if (!h) continue;
-        lib.handle = h;
-        lib.loadedName = name;
-        break;
+#if defined(_WIN32)
+    // Prima la cartella "driver" accanto all'eseguibile: basta scompattare
+    // li' le DLL del fork rtl-sdr-blog, senza copia-incolla accanto all'exe.
+    const std::string exeDir = exeDirectory();
+    if (!exeDir.empty()) {
+        for (const char* sub : {"\\driver\\", "\\"}) {
+            for (const char* name : kNames) {
+                std::string full = exeDir + sub + name;
+                void* h = osOpenLibAt(full);
+                if (!h) continue;
+                lib.handle = h;
+                lib.loadedName = full;
+                break;
+            }
+            if (lib.handle) break;
+        }
+    }
+#endif
+    if (!lib.handle) {
+        for (const char* name : kNames) {
+            void* h = osOpenLib(name);
+            if (!h) continue;
+            lib.handle = h;
+            lib.loadedName = name;
+            break;
+        }
     }
     if (!lib.handle) return lib;
 
@@ -87,6 +125,7 @@ static RtlLib loadRtlLib()
     lib.reset_buffer = (decltype(lib.reset_buffer))sym("rtlsdr_reset_buffer");
     lib.read_async = (decltype(lib.read_async))sym("rtlsdr_read_async");
     lib.cancel_async = (decltype(lib.cancel_async))sym("rtlsdr_cancel_async");
+    lib.set_agc_mode = (decltype(lib.set_agc_mode))sym("rtlsdr_set_agc_mode");
     lib.set_bias_tee = (decltype(lib.set_bias_tee))sym("rtlsdr_set_bias_tee");
     return lib;
 }
@@ -107,8 +146,9 @@ std::string RtlSdrSource::libraryHint()
 #if defined(_WIN32)
     return "rtlsdr.dll non trovata: scarica le DLL del driver rtl-sdr-blog "
            "(x86 o x64 come questa app) da "
-           "github.com/rtlsdrblog/rtl-sdr-blog/releases e copiale accanto "
-           "all'eseguibile. Serve anche il driver WinUSB (Zadig).";
+           "github.com/rtlsdrblog/rtl-sdr-blog/releases e mettile nella "
+           "cartella 'driver' accanto all'eseguibile (vengono caricate da "
+           "sole). Serve anche il driver WinUSB (Zadig).";
 #else
     return "librtlsdr non trovata: installala (es. 'sudo apt install "
            "librtlsdr0' o compila il fork rtl-sdr-blog).";
@@ -180,6 +220,12 @@ bool RtlSdrSource::setGain(double gainDb)
 bool RtlSdrSource::setPpmCorrection(int ppm)
 {
     return lib().set_freq_correction(dev_, ppm) == 0;
+}
+
+bool RtlSdrSource::setRtlAgc(bool on)
+{
+    if (!lib().set_agc_mode) return false; // DLL troppo vecchia
+    return lib().set_agc_mode(dev_, on ? 1 : 0) == 0;
 }
 
 bool RtlSdrSource::setBiasTee(bool on)
