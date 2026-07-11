@@ -93,3 +93,7 @@ add_test(NAME ws_audio COMMAND test_ws_audio)
 add_executable(test_rtty test_rtty.cpp)
 target_link_libraries(test_rtty PRIVATE sdrjo-core)
 add_test(NAME rtty COMMAND test_rtty)
+
+add_executable(test_psk31 test_psk31.cpp)
+target_link_libraries(test_psk31 PRIVATE sdrjo-core)
+add_test(NAME psk31 COMMAND test_psk31)

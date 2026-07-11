@@ -30,6 +30,11 @@ public:
 
     void reset();
 
+    // Inviluppi correnti dei due toni (per l'indicatore di taratura):
+    // ben sintonizzati mark e space "battono" alternandosi in modo netto.
+    float markLevel() const { return mark_.env; }
+    float spaceLevel() const { return space_.env; }
+
 private:
     // Risonatore a banda stretta: potenza del tono inseguita nel tempo.
     struct Tone {

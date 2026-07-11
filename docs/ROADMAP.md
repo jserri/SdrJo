@@ -194,12 +194,32 @@ Fatti (11a tornata, CW/RTTY fldigi-like + bookmark):
   come tacche viola con nome in cima allo spettro.
 - ✅ **Scala interfaccia** (font) regolabile e salvata (monitor 4K).
 
+Fatti (12a tornata, PSK31 + squelch decoder + S-meter in barra di stato):
+
+- ✅ **PSK31 (BPSK31)**: nuovo decoder nella catena del decoder testi.
+  NCO a banda base + integrate-and-dump con aggancio del tempo sui minimi
+  d'ampiezza + decisione BPSK differenziale + Varicode. Tono regolabile,
+  riga "PSK" sullo Spettro audio e **costellazione** di taratura (due lobi
+  opposti = agganciato). Test di andata/ritorno con e senza rumore.
+- ✅ **Squelch dei decoder**: soglia d'ampiezza (RMS) che blocca CW/RTTY/
+  PSK31 quando non c'e' segnale, cosi' non compare piu' testo casuale sul
+  solo rumore. Barra "segnale/silenzio" + valore salvato in configurazione.
+- ✅ **Indicatore di taratura RTTY**: barre livello **Mark/Space** da
+  pareggiare ruotando la sintonia (oltre alle righe M/S sullo spettro).
+- ✅ **S-meter spostato**: la barretta verticale (poco leggibile) nella
+  colonna "Vista" e' ora una **barra orizzontale in fondo all'app**, a
+  destra, staccata dall'indicatore buffer IQ.
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).
 - Scarico automatico dei TLE (serve HTTPS) e piu' protocolli 433 MHz
   (Oregon Scientific, TFA, TPMS...).
-- Altri modi digitali: PSK31, FT8, SSTV (sulla catena del decoder testi).
+- Altri modi digitali: FT8/FT4 (serve sincronizzazione tempo), SSTV,
+  RTTY con AFC automatico.
+- **TETRA**: fattibile solo un *rivelatore di attivita'/burst* (π/4-DQPSK,
+  18 kHz): la voce ACELP e' quasi sempre cifrata (TEA1/2/3) e decifrarla
+  non e' previsto. Vedi nota nel README.
 - VFO con offset regolabile per modulo dalla GUI (oggi centrati).
 - Registratore pianificato (parte da solo al passaggio del satellite).
 - MSIX per il Microsoft Store.

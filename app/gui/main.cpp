@@ -24,6 +24,7 @@
 #include <sdrjo/module/module_loader.hpp>
 #include <sdrjo/dsp/audio_filters.hpp>
 #include <sdrjo/dsp/rtty.hpp>
+#include <sdrjo/dsp/psk31.hpp>
 #include <sdrjo/morse/cw_decoder.hpp>
 #include <sdrjo/sat/orbit.hpp>
 #include <sdrjo/sat/tle.hpp>
@@ -241,7 +242,7 @@ struct AppState : public sdrjo::IModuleHost {
             return std::sqrt(re * re + im * im);
         }
     };
-    int textDecoderMode = 0; // 0 spento, 1 CW, 2 RTTY
+    int textDecoderMode = 0; // 0 spento, 1 CW, 2 RTTY, 3 PSK31
     float cwToneHz = 700.0f;
     bool cwAutoSpeed = true;   // CW: velocita' auto o WPM fissa
     float cwWpm = 20.0f;       // WPM usati in modalita' manuale
@@ -249,10 +250,14 @@ struct AppState : public sdrjo::IModuleHost {
     float rttyMarkHz = 2125.0f; // tono mark; space = mark + shift
     int rttyBaudIdx = 0;        // 0=45.45 1=50 2=75
     int rttyShiftIdx = 0;       // 0=170 1=425 2=850 Hz
+    float psk31ToneHz = 1000.0f; // tono audio del segnale BPSK31
+    float decoderSquelch = 0.15f; // soglia d'ampiezza: sotto = niente decodifica
     ToneEnvelope cwTone;
     std::unique_ptr<sdrjo::morse::CwDecoder> cwDecoder;
     std::unique_ptr<sdrjo::dsp::RttyDecoder> rttyDecoder;
+    std::unique_ptr<sdrjo::dsp::Psk31Decoder> psk31Decoder;
     std::string decodedText;
+    std::atomic<float> decoderLevel{0.0f}; // livello audio RMS visto dai decoder
 
     // Satelliti: TLE, passaggi calcolati e inseguimento Doppler.
     std::vector<sdrjo::sat::Tle> tles;
@@ -403,6 +408,8 @@ void loadConfig(AppState& app)
         else if (std::sscanf(line, "snap_hz=%lf", &v) == 1) app.snapHz = v;
         else if (std::sscanf(line, "ui_scale=%lf", &v) == 1)
             app.uiScale = std::clamp(float(v), 0.7f, 2.0f);
+        else if (std::sscanf(line, "decoder_squelch=%lf", &v) == 1)
+            app.decoderSquelch = std::clamp(float(v), 0.0f, 0.6f);
     }
     std::fclose(f);
 }
@@ -414,10 +421,11 @@ void saveConfig(AppState& app)
     std::fprintf(f,
                  "station_lat=%.6f\nstation_lon=%.6f\n"
                  "freq_mhz=%.6f\nmode=%d\nbandwidth_hz=%.1f\n"
-                 "volume=%.3f\nsnap_hz=%.1f\nui_scale=%.2f\n",
+                 "volume=%.3f\nsnap_hz=%.1f\nui_scale=%.2f\n"
+                 "decoder_squelch=%.3f\n",
                  app.stationLat, app.stationLon, app.freqMHz,
                  int(app.listenMode), app.listenBwHz, double(app.volume),
-                 app.snapHz, double(app.uiScale));
+                 app.snapHz, double(app.uiScale), double(app.decoderSquelch));
     std::fclose(f);
 }
 
@@ -609,8 +617,17 @@ void dspLoop(AppState& app)
                 }
             };
 
-            // Decoder di testi (CW/RTTY) sull'audio demodulato.
+            // Decoder di testi (CW/RTTY/PSK31) sull'audio demodulato. Uno
+            // squelch d'ampiezza blocca la decodifica quando non c'e' segnale
+            // (evita fiumi di testo spazzatura sul solo rumore).
             auto feedTextDecoders = [&app](const float* s, size_t n) {
+                if (app.textDecoderMode == 0 || n == 0) return;
+                double sum = 0.0;
+                for (size_t i = 0; i < n; i++) sum += double(s[i]) * s[i];
+                float rms = float(std::sqrt(sum / double(n)));
+                app.decoderLevel.store(rms, std::memory_order_relaxed);
+                if (rms < app.decoderSquelch) return; // sotto soglia: fermo
+
                 if (app.textDecoderMode == 1 && app.cwDecoder) {
                     static std::vector<float> env;
                     env.resize(n);
@@ -619,6 +636,8 @@ void dspLoop(AppState& app)
                     app.cwDecoder->processAudio(env.data(), n);
                 } else if (app.textDecoderMode == 2 && app.rttyDecoder) {
                     app.rttyDecoder->processAudio(s, n);
+                } else if (app.textDecoderMode == 3 && app.psk31Decoder) {
+                    app.psk31Decoder->processAudio(s, n);
                 }
             };
 
@@ -1949,34 +1968,7 @@ void drawRightStrip(AppState& app)
         app.wfFullRedraw = true;
     }
     helpTip("Sposta in alto/basso la scala dB (tetto del fondoscala).");
-
-    // S-meter verticale in fondo: barra a colori + valore, non tocca lo
-    // spettro (e' in questa finestra separata).
-    ImGui::Spacing();
-    label("S-meter");
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    float wv = ImGui::GetContentRegionAvail().x;
-    float barW = 26.0f, barH = std::max(60.0f, availH - ImGui::GetCursorPosY());
-    if (barH > 120.0f) barH = 120.0f;
-    float bx = p.x + std::max(0.0f, (wv - barW) * 0.5f);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(ImVec2(bx, p.y), ImVec2(bx + barW, p.y + barH),
-                      IM_COL32(20, 22, 28, 255), 3.0f);
-    float lvl = std::clamp((app.chanLevelDb + 120.0f) / 120.0f, 0.0f, 1.0f);
-    for (int seg = 0; seg < 24; seg++) {
-        float t0 = seg / 24.0f;
-        if (t0 > lvl) break;
-        ImU32 c = t0 < 0.55f ? IM_COL32(60, 200, 90, 255)
-                             : IM_COL32(220, 80, 60, 255);
-        float ya = p.y + barH - 2 - (t0 + 1.0f / 24.0f) * (barH - 4);
-        dl->AddRectFilled(ImVec2(bx + 2, ya),
-                          ImVec2(bx + barW - 2, ya + (barH - 4) / 24.0f - 1),
-                          c);
-    }
-    ImGui::Dummy(ImVec2(barW, barH + 2));
-    char sTxt[16];
-    std::snprintf(sTxt, sizeof(sTxt), "%.0f", double(app.chanLevelDb));
-    label(sTxt);
+    // (L'S-meter e' ora nella barra di stato in fondo, piu' leggibile.)
 
     ImGui::End();
 }
@@ -2235,6 +2227,37 @@ void drawStatusBar(AppState& app)
     if (app.muted) {
         bar();
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1), "MUTO");
+    }
+
+    // S-meter orizzontale a DESTRA della barra, staccato dal resto: piu'
+    // leggibile della vecchia barretta verticale nella colonna Vista.
+    if (app.listenMode != AppState::ListenMode::Off) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 wpos = ImGui::GetWindowPos();
+        ImVec2 wsz = ImGui::GetWindowSize();
+        const float mw = 180.0f, mh = 12.0f;
+        float mx0 = wpos.x + wsz.x - mw - 10.0f;
+        float my0 = wpos.y + (wsz.y - mh) * 0.5f;
+        // Etichetta "S" e valore in dB a sinistra della barra.
+        char sTxt[24];
+        std::snprintf(sTxt, sizeof(sTxt), "S %.0f dB", double(app.chanLevelDb));
+        ImVec2 tsz = ImGui::CalcTextSize(sTxt);
+        dl->AddText(ImVec2(mx0 - tsz.x - 8, wpos.y + (wsz.y - tsz.y) * 0.5f),
+                    ImGui::GetColorU32(ImVec4(0.8f, 0.86f, 0.94f, 1)), sTxt);
+        dl->AddRectFilled(ImVec2(mx0, my0), ImVec2(mx0 + mw, my0 + mh),
+                          IM_COL32(20, 22, 28, 255), 2.0f);
+        float lvl = std::clamp((app.chanLevelDb + 120.0f) / 120.0f, 0.0f,
+                               1.0f);
+        for (int seg = 0; seg < 30; seg++) {
+            float t0 = seg / 30.0f;
+            if (t0 > lvl) break;
+            ImU32 c = t0 < 0.55f ? IM_COL32(60, 200, 90, 255)
+                                 : IM_COL32(220, 80, 60, 255);
+            float xa = mx0 + 2 + t0 * (mw - 4);
+            dl->AddRectFilled(ImVec2(xa, my0 + 2),
+                              ImVec2(xa + (mw - 4) / 30.0f - 1, my0 + mh - 2),
+                              c);
+        }
     }
     ImGui::End();
 }
@@ -2614,6 +2637,9 @@ void drawAudioSpectrumSection(AppState& app)
         ImU32 c = ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.95f));
         marker(double(app.rttyMarkHz), c, "M");
         marker(double(app.rttyMarkHz) + shift, c, "S");
+    } else if (app.textDecoderMode == 3) {
+        marker(double(app.psk31ToneHz),
+               ImGui::GetColorU32(ImVec4(0.55f, 0.85f, 1.0f, 0.95f)), "PSK");
     }
 
     if (hov) {
@@ -2678,13 +2704,15 @@ void drawTextDecoderSection(AppState& app)
     ch |= ImGui::RadioButton("Spento##dec", &mode, 0);
     ImGui::SameLine();
     ch |= ImGui::RadioButton("CW (Morse)", &mode, 1);
-    ImGui::SameLine();
     ch |= ImGui::RadioButton("RTTY", &mode, 2);
+    ImGui::SameLine();
+    ch |= ImGui::RadioButton("PSK31", &mode, 3);
     if (ch) {
         std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
         app.textDecoderMode = mode;
         app.cwDecoder.reset();
         app.rttyDecoder.reset();
+        app.psk31Decoder.reset();
         if (mode == 1) {
             app.cwTone.configure(double(app.cwToneHz), 48000.0);
             app.cwDecoder =
@@ -2693,6 +2721,9 @@ void drawTextDecoderSection(AppState& app)
             if (!app.cwAutoSpeed) app.cwDecoder->setWpm(double(app.cwWpm));
         } else if (mode == 2) {
             rebuildRtty();
+        } else if (mode == 3) {
+            app.psk31Decoder = std::make_unique<sdrjo::dsp::Psk31Decoder>(
+                48000.0, textCb, double(app.psk31ToneHz));
         }
     }
 
@@ -2744,6 +2775,64 @@ void drawTextDecoderSection(AppState& app)
         if (rc) {
             std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
             rebuildRtty();
+        }
+    } else if (app.textDecoderMode == 3) {
+        // --- Taratura PSK31: solo il tono audio del segnale ---
+        if (ImGui::SliderFloat("Tono (Hz)", &app.psk31ToneHz, 300.0f, 2500.0f,
+                               "%.0f")) {
+            std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+            if (app.psk31Decoder)
+                app.psk31Decoder->setTone(double(app.psk31ToneHz));
+        }
+        helpTip("Porta la riga 'PSK' dello Spettro audio sul segnale BPSK31 "
+                "(sembra due righe vicine che pulsano). 31.25 baud.");
+    }
+
+    // --- Squelch dei decoder + indicatore di taratura ---
+    if (app.textDecoderMode != 0) {
+        ImGui::SliderFloat("Squelch decoder", &app.decoderSquelch, 0.0f, 0.6f,
+                           "%.2f");
+        helpTip("Sotto questa soglia d'ampiezza il decoder si ferma: alza il "
+                "valore se compare testo casuale sul rumore.");
+        float lvl = app.decoderLevel.load(std::memory_order_relaxed);
+        float frac = std::clamp(lvl / 0.6f, 0.0f, 1.0f);
+        bool open = lvl >= app.decoderSquelch;
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+                              open ? ImVec4(0.36f, 0.82f, 0.45f, 1.0f)
+                                   : ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
+        ImGui::ProgressBar(frac, ImVec2(-FLT_MIN, 12.0f),
+                           open ? "segnale" : "silenzio");
+        ImGui::PopStyleColor();
+
+        // Indicatore di taratura specifico del modo.
+        std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+        if (app.textDecoderMode == 2 && app.rttyDecoder) {
+            float m = app.rttyDecoder->markLevel();
+            float s = app.rttyDecoder->spaceLevel();
+            float mx = std::max({m, s, 1e-4f});
+            ImGui::TextDisabled("Mark/Space (allinea i due picchi):");
+            ImGui::ProgressBar(m / mx, ImVec2(-FLT_MIN, 10.0f), "M");
+            ImGui::ProgressBar(s / mx, ImVec2(-FLT_MIN, 10.0f), "S");
+        } else if (app.textDecoderMode == 3 && app.psk31Decoder) {
+            // Piccola costellazione: BPSK agganciato = due lobi opposti.
+            ImGui::TextDisabled("Costellazione (2 lobi = agganciato):");
+            ImVec2 o = ImGui::GetCursorScreenPos();
+            float side = 90.0f, r = side * 0.5f;
+            ImVec2 c(o.x + r, o.y + r);
+            ImDrawList* d = ImGui::GetWindowDrawList();
+            d->AddRectFilled(o, ImVec2(o.x + side, o.y + side),
+                             ImGui::GetColorU32(ImVec4(0.08f, 0.09f, 0.11f, 1)));
+            d->AddLine(ImVec2(c.x - r, c.y), ImVec2(c.x + r, c.y),
+                       ImGui::GetColorU32(ImVec4(0.3f, 0.3f, 0.3f, 1)));
+            d->AddLine(ImVec2(c.x, c.y - r), ImVec2(c.x, c.y + r),
+                       ImGui::GetColorU32(ImVec4(0.3f, 0.3f, 0.3f, 1)));
+            sdrjo::cfloat sy = app.psk31Decoder->lastSymbol();
+            float mag = std::sqrt(sy.real() * sy.real() + sy.imag() * sy.imag());
+            float k = mag > 1e-6f ? (r * 0.8f / mag) : 0.0f;
+            ImVec2 pt(c.x + sy.real() * k, c.y - sy.imag() * k);
+            d->AddCircleFilled(pt, 3.0f,
+                               ImGui::GetColorU32(ImVec4(0.55f, 0.85f, 1, 1)));
+            ImGui::Dummy(ImVec2(side, side));
         }
     }
 
