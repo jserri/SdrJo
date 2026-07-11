@@ -114,6 +114,7 @@ struct AppState : public sdrjo::IModuleHost {
     float rangeMinDb = -110.0f;      // fondo scala (luminosita')
     float rangeMaxDb = -10.0f;       // tetto scala (contrasto)
     float wfContrast = 1.0f;         // gamma della palette (slider laterale)
+    float uiScale = 1.0f;            // scala dei font dell'interfaccia
     int fftWindow = 0;               // 0 = Hann, 1 = Blackman-Harris
     int wfRows = kWaterfallRows;     // memoria del waterfall (righe)
     int wfSpeedDiv = 4;              // 1 riga ogni N FFT (velocita')
@@ -242,7 +243,12 @@ struct AppState : public sdrjo::IModuleHost {
     };
     int textDecoderMode = 0; // 0 spento, 1 CW, 2 RTTY
     float cwToneHz = 700.0f;
+    bool cwAutoSpeed = true;   // CW: velocita' auto o WPM fissa
+    float cwWpm = 20.0f;       // WPM usati in modalita' manuale
     bool rttyReverse = false;
+    float rttyMarkHz = 2125.0f; // tono mark; space = mark + shift
+    int rttyBaudIdx = 0;        // 0=45.45 1=50 2=75
+    int rttyShiftIdx = 0;       // 0=170 1=425 2=850 Hz
     ToneEnvelope cwTone;
     std::unique_ptr<sdrjo::morse::CwDecoder> cwDecoder;
     std::unique_ptr<sdrjo::dsp::RttyDecoder> rttyDecoder;
@@ -395,6 +401,8 @@ void loadConfig(AppState& app)
         else if (std::sscanf(line, "volume=%lf", &v) == 1)
             app.volume = float(v);
         else if (std::sscanf(line, "snap_hz=%lf", &v) == 1) app.snapHz = v;
+        else if (std::sscanf(line, "ui_scale=%lf", &v) == 1)
+            app.uiScale = std::clamp(float(v), 0.7f, 2.0f);
     }
     std::fclose(f);
 }
@@ -406,10 +414,10 @@ void saveConfig(AppState& app)
     std::fprintf(f,
                  "station_lat=%.6f\nstation_lon=%.6f\n"
                  "freq_mhz=%.6f\nmode=%d\nbandwidth_hz=%.1f\n"
-                 "volume=%.3f\nsnap_hz=%.1f\n",
+                 "volume=%.3f\nsnap_hz=%.1f\nui_scale=%.2f\n",
                  app.stationLat, app.stationLon, app.freqMHz,
                  int(app.listenMode), app.listenBwHz, double(app.volume),
-                 app.snapHz);
+                 app.snapHz, double(app.uiScale));
     std::fclose(f);
 }
 
@@ -1490,6 +1498,26 @@ void drawSpectrumPanel(AppState& app)
     ImVec2 s1(p0.x + w, p0.y + bandH + specH);
     dl->AddRectFilled(s0, s1, ImGui::GetColorU32(ImVec4(0.03f, 0.04f, 0.06f, 1)));
 
+    // --- Bookmark: le frequenze salvate che cadono nella vista ---
+    // Tacca viola in cima allo spettro + nome; per sintonizzarle usa
+    // "Vai" nella sezione Frequenze (qui sono un riferimento visivo).
+    {
+        const ImU32 bmCol = ImGui::GetColorU32(ImVec4(0.78f, 0.57f, 0.92f, 0.9f));
+        float lastLabelX = -1e9f;
+        for (const auto& ff : app.freqStore.items()) {
+            if (ff.freqHz < v0 || ff.freqHz > v1) continue;
+            float x = xOf(ff.freqHz);
+            dl->AddLine(ImVec2(x, s0.y), ImVec2(x, s0.y + 12.0f), bmCol, 1.5f);
+            dl->AddTriangleFilled(ImVec2(x - 3, s0.y), ImVec2(x + 3, s0.y),
+                                  ImVec2(x, s0.y + 5), bmCol);
+            // Etichette non sovrapposte: salta se troppo vicine.
+            if (x - lastLabelX > 46.0f) {
+                dl->AddText(ImVec2(x + 3, s0.y + 1), bmCol, ff.name.c_str());
+                lastLabelX = x;
+            }
+        }
+    }
+
     ImGui::InvisibleButton("##specarea", ImVec2(w, bandH + specH));
     bool hovSpec = ImGui::IsItemHovered();
     bool activeSpec = ImGui::IsItemActive();
@@ -2321,6 +2349,13 @@ void drawFrequenciesSection(AppState& app)
 
 void drawAudioSection(AppState& app)
 {
+    // Scala dell'interfaccia (utile su monitor 4K): agisce su tutti i font.
+    ImGui::SetNextItemWidth(160);
+    ImGui::SliderFloat("Scala interfaccia", &app.uiScale, 0.7f, 2.0f,
+                       "%.2fx");
+    helpTip("Ingrandisce/rimpicciolisce tutti i testi dell'app "
+            "(comodo sui monitor ad alta risoluzione).");
+    ImGui::Separator();
 
     ImGui::TextDisabled("backend: %s", app.audio.backendName().c_str());
 
@@ -2561,6 +2596,26 @@ void drawAudioSpectrumSection(AppState& app)
                     1.5f);
     }
 
+    // Aiuto di taratura (stile fldigi): dove il decoder si aspetta i toni.
+    // CW = una riga sul tono; RTTY = due righe (mark/space) da allineare
+    // ai due picchi del segnale ruotando la sintonia.
+    auto marker = [&](double hz, ImU32 col, const char* lbl) {
+        if (hz <= 0 || hz >= maxHz) return;
+        float x = p.x + float(hz / maxHz) * w;
+        dl->AddLine(ImVec2(x, p.y), ImVec2(x, p.y + h), col, 1.5f);
+        dl->AddText(ImVec2(x + 2, p.y + 2), col, lbl);
+    };
+    if (app.textDecoderMode == 1) {
+        marker(double(app.cwToneHz),
+               ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.95f)), "CW");
+    } else if (app.textDecoderMode == 2) {
+        static const double kShift[] = {170, 425, 850};
+        double shift = kShift[std::clamp(app.rttyShiftIdx, 0, 2)];
+        ImU32 c = ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.95f));
+        marker(double(app.rttyMarkHz), c, "M");
+        marker(double(app.rttyMarkHz) + shift, c, "S");
+    }
+
     if (hov) {
         float mxs = ImGui::GetIO().MousePos.x;
         double f = std::clamp(double(mxs - p.x) / double(w), 0.0, 1.0) *
@@ -2599,6 +2654,25 @@ void drawTextDecoderSection(AppState& app)
     if (app.listenMode == AppState::ListenMode::Off)
         ImGui::TextDisabled("suggerito: USB sul segnale da decodificare");
 
+    static const double kBaud[] = {45.45, 50.0, 75.0};
+    static const char* kBaudNames[] = {"45.45 (ama)", "50", "75"};
+    static const double kShift[] = {170.0, 425.0, 850.0};
+    static const char* kShiftNames[] = {"170 (ama)", "425", "850"};
+
+    auto textCb = [&app](char c) {
+        app.decodedText += c;
+        if (app.decodedText.size() > 4000) app.decodedText.erase(0, 1000);
+    };
+    // (Ri)costruisce il decoder RTTY coi parametri correnti.
+    auto rebuildRtty = [&app, textCb]() {
+        double baud = kBaud[std::clamp(app.rttyBaudIdx, 0, 2)];
+        double shift = kShift[std::clamp(app.rttyShiftIdx, 0, 2)];
+        app.rttyDecoder = std::make_unique<sdrjo::dsp::RttyDecoder>(
+            48000.0, textCb, double(app.rttyMarkHz),
+            double(app.rttyMarkHz) + shift, baud);
+        app.rttyDecoder->setReverse(app.rttyReverse);
+    };
+
     int mode = app.textDecoderMode;
     bool ch = false;
     ch |= ImGui::RadioButton("Spento##dec", &mode, 0);
@@ -2613,38 +2687,63 @@ void drawTextDecoderSection(AppState& app)
         app.rttyDecoder.reset();
         if (mode == 1) {
             app.cwTone.configure(double(app.cwToneHz), 48000.0);
-            app.cwDecoder = std::make_unique<sdrjo::morse::CwDecoder>(
-                48000.0, [&app](char c) {
-                    app.decodedText += c;
-                    if (app.decodedText.size() > 4000)
-                        app.decodedText.erase(0, 1000);
-                });
+            app.cwDecoder =
+                std::make_unique<sdrjo::morse::CwDecoder>(48000.0, textCb);
+            app.cwDecoder->setAutoSpeed(app.cwAutoSpeed);
+            if (!app.cwAutoSpeed) app.cwDecoder->setWpm(double(app.cwWpm));
         } else if (mode == 2) {
-            app.rttyDecoder = std::make_unique<sdrjo::dsp::RttyDecoder>(
-                48000.0, [&app](char c) {
-                    app.decodedText += c;
-                    if (app.decodedText.size() > 4000)
-                        app.decodedText.erase(0, 1000);
-                });
-            app.rttyDecoder->setReverse(app.rttyReverse);
+            rebuildRtty();
         }
     }
 
     if (app.textDecoderMode == 1) {
-        if (ImGui::SliderFloat("Tono CW (Hz)", &app.cwToneHz, 300.0f,
-                               1200.0f, "%.0f")) {
+        // --- Taratura CW (fldigi-style) ---
+        if (ImGui::SliderFloat("Tono (Hz)", &app.cwToneHz, 300.0f, 1200.0f,
+                               "%.0f")) {
             std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
             app.cwTone.configure(double(app.cwToneHz), 48000.0);
+        }
+        helpTip("Altezza del tono CW da decodificare: allinea la riga 'CW' "
+                "sullo Spettro audio al fischio del segnale.");
+        if (ImGui::Checkbox("Velocita' automatica", &app.cwAutoSpeed)) {
+            std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+            if (app.cwDecoder) {
+                app.cwDecoder->setAutoSpeed(app.cwAutoSpeed);
+                if (!app.cwAutoSpeed)
+                    app.cwDecoder->setWpm(double(app.cwWpm));
+            }
+        }
+        helpTip("Auto: aggancia da sola la velocita'. Manuale: fissa i WPM "
+                "(meglio sui segnali deboli/disturbati).");
+        if (!app.cwAutoSpeed) {
+            if (ImGui::SliderFloat("WPM", &app.cwWpm, 5.0f, 40.0f, "%.0f")) {
+                std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+                if (app.cwDecoder) app.cwDecoder->setWpm(double(app.cwWpm));
+            }
         }
         if (app.cwDecoder)
             ImGui::TextDisabled("velocita' stimata: %.0f WPM",
                                 app.cwDecoder->wpm());
     } else if (app.textDecoderMode == 2) {
-        ImGui::TextDisabled("Baudot 45.45 baud, mark 2125 / shift 170 Hz");
-        if (ImGui::Checkbox("Inverti mark/space", &app.rttyReverse)) {
+        // --- Taratura RTTY (fldigi-style): baud, shift, mark, reverse ---
+        bool rc = false;
+        fieldLabel("Velocita' (baud)");
+        rc |= ImGui::Combo("##rbaud", &app.rttyBaudIdx, kBaudNames, 3);
+        fieldLabel("Shift (Hz)");
+        rc |= ImGui::Combo("##rshift", &app.rttyShiftIdx, kShiftNames, 3);
+        if (ImGui::SliderFloat("Mark (Hz)", &app.rttyMarkHz, 800.0f, 2500.0f,
+                               "%.0f"))
+            rc = true;
+        helpTip("Allinea le righe 'M' (mark) e 'S' (space) sullo Spettro "
+                "audio ai due picchi del segnale ruotando la sintonia.");
+        bool rev = app.rttyReverse;
+        if (ImGui::Checkbox("Inverti mark/space", &rev)) {
+            app.rttyReverse = rev;
+            rc = true;
+        }
+        if (rc) {
             std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
-            if (app.rttyDecoder)
-                app.rttyDecoder->setReverse(app.rttyReverse);
+            rebuildRtty();
         }
     }
 
@@ -3110,6 +3209,9 @@ int main(int argc, char** argv)
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+
+        // Scala dei font dell'interfaccia (per monitor ad alta densita').
+        ImGui::GetIO().FontGlobalScale = std::clamp(app.uiScale, 0.7f, 2.0f);
 
         drawSidebar(app);
         drawSpectrumPanel(app);

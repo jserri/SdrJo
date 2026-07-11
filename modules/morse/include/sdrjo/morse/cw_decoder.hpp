@@ -26,6 +26,16 @@ public:
     // Stima corrente della velocita' in parole al minuto.
     double wpm() const { return (dotMs_ > 0) ? 1200.0 / dotMs_ : 0.0; }
 
+    // Velocita' manuale (fldigi-style): fissa la durata del punto a
+    // 1200/WPM ms e disattiva l'auto-adattamento. Utile sui segnali
+    // deboli, dove l'auto puo' agganciarsi male.
+    void setWpm(double wpm)
+    {
+        if (wpm > 0) dotMs_ = 1200.0 / wpm;
+    }
+    // true = adatta da sola la velocita' (default); false = usa la WPM fissa.
+    void setAutoSpeed(bool on) { autoSpeed_ = on; }
+
 private:
     void onStateChange(bool mark, double durationMs);
     void endLetter();
@@ -43,6 +53,7 @@ private:
 
     // Temporizzazione adattiva.
     double dotMs_ = 60.0; // 20 WPM iniziali
+    bool autoSpeed_ = true;
     std::string currentSymbol_;
     bool wordGapEmitted_ = true;
 };

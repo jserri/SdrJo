@@ -183,6 +183,17 @@ Fatti (10a tornata, check-up UI/UX):
   compatto (aiuto sul "(?)"), niente piu' sovrapposizione dB/righello,
   finestra "Vista" allargata (titolo intero, slider piu' afferrabili).
 
+Fatti (11a tornata, CW/RTTY fldigi-like + bookmark):
+
+- ✅ **CW**: velocita' automatica o **WPM manuale** (meglio sui deboli),
+  tono regolabile; riga "CW" sullo Spettro audio come mira di taratura.
+- ✅ **RTTY**: **baud** (45.45/50/75), **shift** (170/425/850), **mark**
+  regolabile e inversione; due righe "M"/"S" sullo Spettro audio da
+  allineare ai picchi ruotando la sintonia, come fldigi.
+- ✅ **Bookmark**: le frequenze salvate che cadono nella vista appaiono
+  come tacche viola con nome in cima allo spettro.
+- ✅ **Scala interfaccia** (font) regolabile e salvata (monitor 4K).
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).

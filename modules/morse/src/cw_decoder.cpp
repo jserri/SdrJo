@@ -55,13 +55,14 @@ void CwDecoder::onStateChange(bool wasMark, double durationMs)
     if (durationMs < 0.3 * dotMs_) return; // glitch/rumore: ignora
 
     if (wasMark) {
-        // Classifica punto o linea e aggiorna la stima del punto.
+        // Classifica punto o linea; la stima del punto si adatta solo in
+        // modalita' automatica (in manuale la WPM resta quella fissata).
         if (durationMs < 2.0 * dotMs_) {
             currentSymbol_ += '.';
-            dotMs_ = 0.8 * dotMs_ + 0.2 * durationMs;
+            if (autoSpeed_) dotMs_ = 0.8 * dotMs_ + 0.2 * durationMs;
         } else {
             currentSymbol_ += '-';
-            dotMs_ = 0.8 * dotMs_ + 0.2 * (durationMs / 3.0);
+            if (autoSpeed_) dotMs_ = 0.8 * dotMs_ + 0.2 * (durationMs / 3.0);
         }
         wordGapEmitted_ = false;
     } else {
