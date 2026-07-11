@@ -167,6 +167,22 @@ Fatti (9a tornata):
   avviso "fuori banda" e dettagli visibili solo quando il modulo e'
   acceso.
 
+Fatti (10a tornata, check-up UI/UX):
+
+- ✅ **Etichette non piu' troncate** nella sidebar: nome sopra il campo,
+  widget a piena larghezza.
+- ✅ **Barra di stato** in fondo: sorgente, sample rate, VFO/modo/banda,
+  moduli attivi e **riempimento anello IQ** (spia della salute del PC).
+- ✅ **Bande rapide**: un click imposta frequenza+modo+larghezza (FM,
+  aereo, PMR, CB, 2m, 70cm, 40m, 20m, onde medie).
+- ✅ **Scorciatoie tastiera**: spazio = mute, frecce = sintonia a snap,
+  M = ciclo modo, F = zoom 1x.
+- ✅ **Persistenza sessione**: freq/modo/banda/volume/snap salvati in
+  sdrjo.cfg; **avvio massimizzato**.
+- ✅ Tolti i controlli **duplicati** (Zoom/Range), tooltip spettro
+  compatto (aiuto sul "(?)"), niente piu' sovrapposizione dB/righello,
+  finestra "Vista" allargata (titolo intero, slider piu' afferrabili).
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).

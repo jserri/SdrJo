@@ -56,6 +56,7 @@
 namespace {
 
 constexpr size_t kChunkSize = 4096;   // blocco DSP per moduli/ascolto
+constexpr float kStatusBarH = 26.0f;  // barra di stato in fondo
 // Colonne della texture waterfall: piu' alte = zoom piu' nitido (meno
 // "sgranato"). 8192 raddoppia il dettaglio orizzontale con un costo di
 // memoria contenuto (la RAM scala col numero di righe scelto in "Memoria").
@@ -71,6 +72,15 @@ void helpTip(const char* text)
 {
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
         ImGui::SetTooltip("%s", text);
+}
+
+// Etichetta su una riga propria + widget successivo a piena larghezza
+// della colonna: evita i troncamenti delle label a destra nelle sidebar
+// strette (usare un id "##..." nel widget che segue).
+void fieldLabel(const char* text)
+{
+    ImGui::TextUnformatted(text);
+    ImGui::SetNextItemWidth(-FLT_MIN);
 }
 
 // Font caricati all'avvio (nullptr = fallback al font di default).
@@ -363,7 +373,9 @@ std::string randomToken()
     return t;
 }
 
-// Config minimale (chiave=valore) accanto all'eseguibile.
+// Config minimale (chiave=valore) accanto all'eseguibile. Oltre alla
+// posizione, ricorda l'ultima sessione radio (freq/modo/banda/volume/snap)
+// cosi' riaprendo l'app ritrovi dov'eri.
 void loadConfig(AppState& app)
 {
     FILE* f = std::fopen(app.configPath.c_str(), "r");
@@ -371,9 +383,18 @@ void loadConfig(AppState& app)
     char line[256];
     while (std::fgets(line, sizeof(line), f)) {
         double v = 0;
+        int iv = 0;
         if (std::sscanf(line, "station_lat=%lf", &v) == 1) app.stationLat = v;
         else if (std::sscanf(line, "station_lon=%lf", &v) == 1)
             app.stationLon = v;
+        else if (std::sscanf(line, "freq_mhz=%lf", &v) == 1) app.freqMHz = v;
+        else if (std::sscanf(line, "mode=%d", &iv) == 1 && iv >= 0 && iv <= 5)
+            app.listenMode = AppState::ListenMode(iv);
+        else if (std::sscanf(line, "bandwidth_hz=%lf", &v) == 1)
+            app.listenBwHz = v;
+        else if (std::sscanf(line, "volume=%lf", &v) == 1)
+            app.volume = float(v);
+        else if (std::sscanf(line, "snap_hz=%lf", &v) == 1) app.snapHz = v;
     }
     std::fclose(f);
 }
@@ -382,8 +403,13 @@ void saveConfig(AppState& app)
 {
     FILE* f = std::fopen(app.configPath.c_str(), "w");
     if (!f) return;
-    std::fprintf(f, "station_lat=%.6f\nstation_lon=%.6f\n", app.stationLat,
-                 app.stationLon);
+    std::fprintf(f,
+                 "station_lat=%.6f\nstation_lon=%.6f\n"
+                 "freq_mhz=%.6f\nmode=%d\nbandwidth_hz=%.1f\n"
+                 "volume=%.3f\nsnap_hz=%.1f\n",
+                 app.stationLat, app.stationLon, app.freqMHz,
+                 int(app.listenMode), app.listenBwHz, double(app.volume),
+                 app.snapHz);
     std::fclose(f);
 }
 
@@ -852,8 +878,8 @@ void drawDeviceSection(AppState& app)
         ImGui::Text("%s attivo", app.source->name().c_str());
         double freq = app.freqMHz * 1e6 + app.listenOffsetHz;
         double freqMHz = freq / 1e6;
-        if (ImGui::InputDouble("Frequenza (MHz)", &freqMHz, 0.1, 1.0,
-                               "%.4f")) {
+        fieldLabel("Frequenza (MHz)");
+        if (ImGui::InputDouble("##freqMHz", &freqMHz, 0.1, 1.0, "%.4f")) {
             tuneAbsolute(app, freqMHz * 1e6); // lo spettro segue subito
         }
         if (ImGui::IsItemHovered())
@@ -870,7 +896,8 @@ void drawDeviceSection(AppState& app)
         int rateIdx = 5;
         for (int i = 0; i < 8; i++)
             if (std::fabs(kRates[i] - app.sampleRate) < 1000) rateIdx = i;
-        if (ImGui::Combo("Sample rate", &rateIdx, kRateNames, 8)) {
+        fieldLabel("Sample rate");
+        if (ImGui::Combo("##srate", &rateIdx, kRateNames, 8)) {
             app.source->setSampleRate(kRates[rateIdx]);
             app.sampleRate = app.source->sampleRate();
             app.channelsDirty = true;
@@ -892,7 +919,8 @@ void drawDeviceSection(AppState& app)
                 else if (app.gainDb < 0) app.gainDb = 28.0f;
             }
             if (!app.tunerAgc) {
-                if (ImGui::SliderFloat("Guadagno (dB)", &app.gainDb, 0.0f,
+                fieldLabel("Guadagno (dB)");
+                if (ImGui::SliderFloat("##gain", &app.gainDb, 0.0f,
                                        49.6f, "%.1f"))
                     app.rtl->setGain(double(app.gainDb));
             }
@@ -914,7 +942,8 @@ void drawDeviceSection(AppState& app)
                     app.biasTee = false;
                 }
             }
-            if (ImGui::InputInt("Correzione PPM", &app.ppmCorrection))
+            fieldLabel("Correzione PPM");
+            if (ImGui::InputInt("##ppm", &app.ppmCorrection))
                 app.rtl->setPpmCorrection(app.ppmCorrection);
             // Stima automatica: sintonizzati ESATTAMENTE su una portante
             // di frequenza nota (una FM forte va benissimo) e premi.
@@ -985,7 +1014,8 @@ void drawDeviceSection(AppState& app)
     if (!app.source) {
         ImGui::SeparatorText("Riproduci registrazione");
         static char replayPath[260] = "";
-        ImGui::InputText("file IQ", replayPath, sizeof(replayPath));
+        fieldLabel("File IQ");
+        ImGui::InputText("##replay", replayPath, sizeof(replayPath));
         if (ImGui::Button("Riproduci") && replayPath[0]) {
             auto src = std::make_unique<sdrjo::FileSource>(replayPath,
                                                            app.sampleRate);
@@ -1002,10 +1032,10 @@ void drawDeviceSection(AppState& app)
     // portata + distanze) e in futuro ai passaggi satellite.
     ImGui::SeparatorText("Posizione antenna");
     bool posChanged = false;
-    posChanged |= ImGui::InputDouble("Latitudine", &app.stationLat, 0, 0,
-                                     "%.5f");
-    posChanged |= ImGui::InputDouble("Longitudine", &app.stationLon, 0, 0,
-                                     "%.5f");
+    fieldLabel("Latitudine");
+    posChanged |= ImGui::InputDouble("##lat", &app.stationLat, 0, 0, "%.5f");
+    fieldLabel("Longitudine");
+    posChanged |= ImGui::InputDouble("##lon", &app.stationLon, 0, 0, "%.5f");
     if (posChanged) {
         saveConfig(app);
         applyStationToModules(app);
@@ -1336,10 +1366,10 @@ void drawSpectrumPanel(AppState& app)
     // occupano tutta la parte destra (il resto vive nella sidebar).
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     const float sideW = std::clamp(vp->WorkSize.x * 0.24f, 300.0f, 420.0f);
-    const float stripW = 70.0f; // colonna leve/S-meter (finestra a parte)
+    const float stripW = 88.0f; // colonna leve/S-meter (finestra a parte)
     ImGui::SetNextWindowPos(ImVec2(sideW + 20, 10), ImGuiCond_Always);
     ImGui::SetNextWindowSize(
-        ImVec2(vp->WorkSize.x - sideW - 40 - stripW, vp->WorkSize.y - 20),
+        ImVec2(vp->WorkSize.x - sideW - 40 - stripW, vp->WorkSize.y - 20 - kStatusBarH),
         ImGuiCond_Always);
     ImGui::Begin("Spettro", nullptr,
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
@@ -1348,14 +1378,20 @@ void drawSpectrumPanel(AppState& app)
     // Frequenza sintonizzata: cifre cliccabili e scrollabili.
     drawFrequencyDial(app);
 
-    // Leve di regolazione (chiuse di default: spazio al grafico).
-    if (ImGui::CollapsingHeader("Regolazioni")) {
-        ImGui::SetNextItemWidth(220);
-        if (ImGui::DragFloatRange2("Range dB", &app.rangeMinDb,
-                                   &app.rangeMaxDb, 1.0f, -140.0f, 0.0f,
-                                   "min %.0f", "max %.0f"))
-            app.wfFullRedraw = true;
-        ImGui::SameLine();
+    // Leve di regolazione (chiuse di default: spazio al grafico). Il
+    // Range/Offset dB vivono sulle leve a destra dello spettro; qui
+    // restano velocita', memoria, palette, FFT, finestra e tracce.
+    bool regOpen = ImGui::CollapsingHeader("Regolazioni");
+    // Guida rapida all'interazione accanto al titolo (senza coprire il
+    // waterfall come faceva il vecchio tooltip grande).
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    helpTip("Sullo spettro/righello/waterfall:\n"
+            "click = sintonizza (snap)   trascina = sintonia continua\n"
+            "rotellina = cambia frequenza a passi di snap\n"
+            "Ctrl+rotellina o leva Zoom = ingrandisci\n"
+            "doppio click = ricentra la chiavetta qui");
+    if (regOpen) {
         ImGui::SetNextItemWidth(140);
         double rowsPerSec = 30.0 / double(app.wfSpeedDiv);
         char speedLbl[32];
@@ -1479,12 +1515,15 @@ void drawSpectrumPanel(AppState& app)
         double dbStep = niceStep(double(dbMax - dbMin) / 10.0);
         for (double db = std::ceil(dbMin / dbStep) * dbStep; db < dbMax;
              db += dbStep) {
-            dl->AddLine(ImVec2(s0.x, yOf(float(db))),
-                        ImVec2(s1.x, yOf(float(db))), gridCol);
-            char dbLbl[16];
-            std::snprintf(dbLbl, sizeof(dbLbl), "%.0f dB", db);
-            dl->AddText(ImVec2(s0.x + 4, yOf(float(db)) - 14), textCol,
-                        dbLbl);
+            float gy = yOf(float(db));
+            dl->AddLine(ImVec2(s0.x, gy), ImVec2(s1.x, gy), gridCol);
+            // Niente etichetta troppo in alto o troppo in basso: cosi'
+            // non si accavalla al bordo banda ne' al righello dei MHz.
+            if (gy > s0.y + 8.0f && gy < s1.y - 16.0f) {
+                char dbLbl[16];
+                std::snprintf(dbLbl, sizeof(dbLbl), "%.0f", db);
+                dl->AddText(ImVec2(s0.x + 4, gy - 14), textCol, dbLbl);
+            }
         }
     }
 
@@ -1749,13 +1788,9 @@ void drawSpectrumPanel(AppState& app)
         if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
             dl->AddLine(ImVec2(mx, s0.y), ImVec2(mx, wp.y + wfAvail.y),
                         ImGui::GetColorU32(ImVec4(1, 1, 1, 0.22f)));
-        ImGui::SetTooltip(
-            "%.4f MHz\nclick: sintonizza (snap %.4g kHz)  "
-            "trascina: sintonia continua\n"
-            "rotellina: cambia frequenza (passi di snap)\n"
-            "Ctrl+rotellina o leva Zoom: ingrandisci  "
-            "doppio click: centra qui",
-            f / 1e6, app.snapHz / 1e3);
+        // Tooltip compatto: solo la frequenza (l'aiuto completo sta nel
+        // titolo della sezione, non serve coprire il waterfall).
+        ImGui::SetTooltip("%.4f MHz", f / 1e6);
 
         float wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.0f) {
@@ -1822,10 +1857,10 @@ void drawSpectrumPanel(AppState& app)
 void drawRightStrip(AppState& app)
 {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    const float stripW = 70.0f;
+    const float stripW = 88.0f;
     ImGui::SetNextWindowPos(ImVec2(vp->WorkSize.x - stripW - 10, 10),
                             ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(stripW, vp->WorkSize.y - 20),
+    ImGui::SetNextWindowSize(ImVec2(stripW, vp->WorkSize.y - 20 - kStatusBarH),
                              ImGuiCond_Always);
     ImGui::Begin("Vista", nullptr,
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
@@ -1848,9 +1883,9 @@ void drawRightStrip(AppState& app)
     };
 
     label("Zoom");
-    centerSlider(24);
+    centerSlider(30);
     float zoomV = float(std::log(1.0 / app.viewSpanFrac) / std::log(200.0));
-    if (ImGui::VSliderFloat("##lvZoom", ImVec2(24, sliderH), &zoomV, 0.0f,
+    if (ImGui::VSliderFloat("##lvZoom", ImVec2(30, sliderH), &zoomV, 0.0f,
                             1.0f, "")) {
         app.viewSpanFrac = 1.0 / std::pow(200.0, double(zoomV));
         centerViewOnTuned(app);
@@ -1859,16 +1894,16 @@ void drawRightStrip(AppState& app)
             "sintonizzata.");
 
     label("Contr");
-    centerSlider(24);
-    if (ImGui::VSliderFloat("##lvContr", ImVec2(24, sliderH), &app.wfContrast,
+    centerSlider(30);
+    if (ImGui::VSliderFloat("##lvContr", ImVec2(30, sliderH), &app.wfContrast,
                             0.3f, 3.0f, ""))
         app.wfFullRedraw = true;
     helpTip("Contrasto del waterfall (curva dei colori).");
 
     label("Range");
-    centerSlider(24);
+    centerSlider(30);
     float span = app.rangeMaxDb - app.rangeMinDb;
-    if (ImGui::VSliderFloat("##lvRange", ImVec2(24, sliderH), &span, 20.0f,
+    if (ImGui::VSliderFloat("##lvRange", ImVec2(30, sliderH), &span, 20.0f,
                             140.0f, "")) {
         app.rangeMinDb = app.rangeMaxDb - span;
         app.wfFullRedraw = true;
@@ -1876,9 +1911,9 @@ void drawRightStrip(AppState& app)
     helpTip("Ampiezza della scala dB mostrata (dinamica).");
 
     label("Offset");
-    centerSlider(24);
+    centerSlider(30);
     float off = app.rangeMaxDb;
-    if (ImGui::VSliderFloat("##lvOffset", ImVec2(24, sliderH), &off, -60.0f,
+    if (ImGui::VSliderFloat("##lvOffset", ImVec2(30, sliderH), &off, -60.0f,
                             10.0f, "")) {
         float keepSpan = app.rangeMaxDb - app.rangeMinDb;
         app.rangeMaxDb = off;
@@ -1996,21 +2031,13 @@ void drawReceiverSection(AppState& app)
     int snapIdx = 4;
     for (int i = 0; i < 8; i++)
         if (std::fabs(kSnaps[i] - app.snapHz) < 1) snapIdx = i;
-    if (ImGui::Combo("Snap", &snapIdx, kSnapNames, 8))
+    fieldLabel("Snap (passo di sintonia)");
+    if (ImGui::Combo("##snap", &snapIdx, kSnapNames, 8))
         app.snapHz = kSnaps[snapIdx];
     helpTip("Passo di sintonia: click e rotellina saltano di questo valore "
             "(9 kHz onde medie, 12.5/25 kHz apparati, 5 kHz FM).");
-
-    // Zoom (equivalente a Ctrl+rotellina sullo spettro).
-    float zoom = float(1.0 / app.viewSpanFrac);
-    if (ImGui::SliderFloat("Zoom", &zoom, 1.0f, 100.0f, "%.0fx",
-                           ImGuiSliderFlags_Logarithmic))
-        app.viewSpanFrac = 1.0 / double(zoom);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("1x")) {
-        app.viewSpanFrac = 1.0;
-        app.viewCenterFrac = 0.5;
-    }
+    // Lo zoom vive sulla leva 'Zoom' a destra dello spettro (niente
+    // doppione qui).
 
     ImGui::SeparatorText("Squelch");
     ImGui::Checkbox("Attivo##sq", &app.squelchOn);
@@ -2019,7 +2046,8 @@ void drawReceiverSection(AppState& app)
     ImGui::SameLine();
     ImGui::TextDisabled(app.squelchOn ? (app.squelchOpen ? "APERTO" : "chiuso")
                                       : "");
-    ImGui::SliderFloat("Soglia (dB)", &app.squelchDb, -100.0f, 0.0f, "%.0f");
+    fieldLabel("Soglia (dB)");
+    ImGui::SliderFloat("##sqthr", &app.squelchDb, -100.0f, 0.0f, "%.0f");
     helpTip("Livello di apertura: alzalo finche' il fruscio tace ma il "
             "segnale utile passa ancora.");
     float lvl = std::clamp((app.chanLevelDb + 120.0f) / 120.0f, 0.0f, 1.0f);
@@ -2078,6 +2106,110 @@ void drawSatellitesSection(AppState& app);
 void drawFrequenciesSection(AppState& app);
 void drawModulesSection(AppState& app);
 void drawLogSection(AppState& app);
+void drawBandsSection(AppState& app);
+
+// Porta la radio su una banda: modo + larghezza + frequenza in un colpo.
+void goToBand(AppState& app, double freqHz, AppState::ListenMode mode,
+              double bwHz)
+{
+    if (app.listenMode != mode) {
+        app.listenMode = mode;
+        rebuildListener(app);
+    }
+    if (bwHz > 0 && mode != AppState::ListenMode::Off &&
+        mode != AppState::ListenMode::WfmStereo) {
+        app.listenBwHz = bwHz;
+        rebuildChanFilter(app);
+    }
+    tuneAbsolute(app, freqHz);
+}
+
+// Scorciatoie di banda: un click e sei sintonizzato col modo giusto.
+void drawBandsSection(AppState& app)
+{
+    ImGui::TextDisabled("Un click: frequenza + modo + larghezza pronti.");
+    struct Band {
+        const char* name;
+        double freqHz;
+        AppState::ListenMode mode;
+        double bwHz;
+    };
+    static const Band kBands[] = {
+        {"FM 98.0", 98.0e6, AppState::ListenMode::WfmStereo, 0},
+        {"Aereo 127", 127.0e6, AppState::ListenMode::Am, 9000},
+        {"PMR 446", 446.0e6, AppState::ListenMode::Nfm, 12500},
+        {"CB 27", 27.185e6, AppState::ListenMode::Am, 6000},
+        {"2m 145", 145.0e6, AppState::ListenMode::Nfm, 12500},
+        {"70cm 433", 433.5e6, AppState::ListenMode::Nfm, 12500},
+        {"40m 7.1", 7.1e6, AppState::ListenMode::Lsb, 2700},
+        {"20m 14.2", 14.2e6, AppState::ListenMode::Usb, 2700},
+        {"OM 1000", 1.0e6, AppState::ListenMode::Am, 9000},
+    };
+    int n = int(sizeof(kBands) / sizeof(kBands[0]));
+    float bw3 = (ImGui::GetContentRegionAvail().x -
+                 2.0f * ImGui::GetStyle().ItemSpacing.x) / 3.0f;
+    for (int i = 0; i < n; i++) {
+        if (i % 3) ImGui::SameLine();
+        if (ImGui::Button(kBands[i].name, ImVec2(bw3, 0)))
+            goToBand(app, kBands[i].freqHz, kBands[i].mode, kBands[i].bwHz);
+    }
+}
+
+// Barra di stato in fondo: sorgente, rate, VFO/modo, moduli attivi e
+// riempimento dell'anello IQ (spia della salute: se sale, il DSP e'
+// indietro e conviene spegnere qualche modulo).
+void drawStatusBar(AppState& app)
+{
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(
+        ImVec2(10, vp->WorkSize.y - kStatusBarH - 4), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - 20, kStatusBarH),
+                             ImGuiCond_Always);
+    ImGui::Begin("##statusbar", nullptr,
+                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove |
+                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoSavedSettings);
+
+    const ImU32 sep = ImGui::GetColorU32(ImVec4(0.4f, 0.46f, 0.54f, 1));
+    auto bar = [&]() {
+        ImGui::SameLine();
+        ImGui::TextColored(ImGui::ColorConvertU32ToFloat4(sep), "|");
+        ImGui::SameLine();
+    };
+
+    ImGui::Text("%s", app.source ? app.source->name().c_str()
+                                  : "nessuna sorgente");
+    bar();
+    ImGui::Text("%.3f MS/s", app.sampleRate / 1e6);
+    bar();
+    if (app.listenMode != AppState::ListenMode::Off)
+        ImGui::Text("VFO %.4f MHz %s  %.1f kHz",
+                    (app.freqMHz * 1e6 + app.listenOffsetHz) / 1e6,
+                    kListenModeNames[int(app.listenMode)],
+                    app.listenBwHz / 1e3);
+    else
+        ImGui::TextUnformatted("VFO spento");
+    bar();
+    int nOn = 0;
+    for (char e : app.moduleEnabled) nOn += e ? 1 : 0;
+    ImGui::Text("moduli attivi: %d", nOn);
+    bar();
+    // Riempimento dell'anello IQ: verde ok, giallo/rosso = DSP indietro.
+    double fill = double(app.iqRing.available()) / double(1 << 20) * 100.0;
+    ImVec4 fillCol = fill < 30 ? ImVec4(0.4f, 0.85f, 0.5f, 1)
+                    : fill < 70 ? ImVec4(1.0f, 0.8f, 0.3f, 1)
+                                : ImVec4(1.0f, 0.4f, 0.4f, 1);
+    ImGui::TextColored(fillCol, "buffer IQ %.0f%%", fill);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Riempimento dell'anello IQ. Se resta alto, il "
+                          "PC fatica: spegni qualche modulo o abbassa il "
+                          "sample rate.");
+    if (app.muted) {
+        bar();
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1), "MUTO");
+    }
+    ImGui::End();
+}
 
 // Sidebar unica: tutte le sezioni di controllo in una colonna, apribili
 // e richiudibili come menu a tendina (spettro e waterfall tengono cosi'
@@ -2087,7 +2219,7 @@ void drawSidebar(AppState& app)
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     const float sideW = std::clamp(vp->WorkSize.x * 0.24f, 300.0f, 420.0f);
     ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(sideW, vp->WorkSize.y - 20),
+    ImGui::SetNextWindowSize(ImVec2(sideW, vp->WorkSize.y - 20 - kStatusBarH),
                              ImGuiCond_Always);
     ImGui::Begin("Controlli", nullptr, ImGuiWindowFlags_NoMove);
 
@@ -2095,6 +2227,8 @@ void drawSidebar(AppState& app)
         drawDeviceSection(app);
     if (ImGui::CollapsingHeader("Ricevitore", ImGuiTreeNodeFlags_DefaultOpen))
         drawReceiverSection(app);
+    if (ImGui::CollapsingHeader("Bande rapide"))
+        drawBandsSection(app);
     if (ImGui::CollapsingHeader("Spettro audio"))
         drawAudioSpectrumSection(app);
     if (ImGui::CollapsingHeader("Decoder testi"))
@@ -2195,7 +2329,8 @@ void drawAudioSection(AppState& app)
                            app.audioDeviceIndex >= int(app.audioDevices.size()))
                               ? "Predefinita di sistema"
                               : app.audioDevices[size_t(app.audioDeviceIndex)];
-    if (ImGui::BeginCombo("Scheda", current.c_str())) {
+    fieldLabel("Scheda di uscita");
+    if (ImGui::BeginCombo("##scheda", current.c_str())) {
         if (ImGui::Selectable("Predefinita di sistema",
                               app.audioDeviceIndex < 0)) {
             app.audioDeviceIndex = -1;
@@ -2210,15 +2345,15 @@ void drawAudioSection(AppState& app)
         }
         ImGui::EndCombo();
     }
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Aggiorna"))
+    if (ImGui::SmallButton("Aggiorna schede"))
         app.audioDevices = sdrjo::AudioOutput::listDevices();
 
     // Frequenza di campionamento dell'uscita.
     static const int kAudioRates[] = {44100, 48000, 96000};
     static const char* kAudioRateNames[] = {"44100 Hz", "48000 Hz", "96000 Hz"};
     int aIdx = (app.audioRateHz == 44100) ? 0 : (app.audioRateHz == 96000 ? 2 : 1);
-    if (ImGui::Combo("Freq. audio", &aIdx, kAudioRateNames, 3)) {
+    fieldLabel("Frequenza audio");
+    if (ImGui::Combo("##arate", &aIdx, kAudioRateNames, 3)) {
         app.audioRateHz = kAudioRates[aIdx];
         app.audio.stop();
     }
@@ -2228,7 +2363,8 @@ void drawAudioSection(AppState& app)
     static bool lanEnabled = false;
     static char lanPass[64] = "";
     ImGui::Checkbox("Esponi il Cockpit in LAN", &lanEnabled);
-    ImGui::InputText("Password", lanPass, sizeof(lanPass),
+    fieldLabel("Password");
+    ImGui::InputText("##lanpass", lanPass, sizeof(lanPass),
                      ImGuiInputTextFlags_Password);
     if (lanEnabled && lanPass[0] == '\0') {
         ImGui::TextColored(ImVec4(1.0f, 0.71f, 0.33f, 1.0f),
@@ -2760,6 +2896,9 @@ int main(int argc, char** argv)
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+    // Avvio massimizzato: piu' spazio per spettro/waterfall (la finestra
+    // resta ridimensionabile e il layout segue).
+    glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
     GLFWwindow* window =
         glfwCreateWindow(1280, 800, "SdrJo", nullptr, nullptr);
     if (!window) return 1;
@@ -2904,8 +3043,18 @@ int main(int argc, char** argv)
         app.log("Replay", std::string(argv[1]));
     }
 
-    // La radio parte in AM: costruisci la catena d'ascolto all'avvio.
-    rebuildListener(app);
+    // Ripristina il modo salvato (o AM di default) e costruisci la catena
+    // d'ascolto. rebuildListener rimette la banda di default del modo,
+    // quindi ri-applichiamo dopo la larghezza salvata nella sessione.
+    {
+        double savedBw = app.listenBwHz;
+        rebuildListener(app);
+        if (savedBw > 0 && app.listenMode != AppState::ListenMode::Off &&
+            app.listenMode != AppState::ListenMode::WfmStereo) {
+            app.listenBwHz = savedBw;
+            rebuildChanFilter(app);
+        }
+    }
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -2965,6 +3114,31 @@ int main(int argc, char** argv)
         drawSidebar(app);
         drawSpectrumPanel(app);
         drawRightStrip(app);
+        drawStatusBar(app);
+
+        // Scorciatoie da tastiera (solo se non si sta scrivendo in un
+        // campo): barra spazio = mute, frecce su/giu = sintonia a passi
+        // di snap, M = ciclo modo, F = 1x zoom.
+        if (!ImGui::GetIO().WantTextInput) {
+            if (ImGui::IsKeyPressed(ImGuiKey_Space, false))
+                app.muted = !app.muted;
+            double cur = app.freqMHz * 1e6 + app.listenOffsetHz;
+            if (ImGui::IsKeyPressed(ImGuiKey_UpArrow, true))
+                applyTunedFrequency(app, std::round((cur + app.snapHz) /
+                                                    app.snapHz) * app.snapHz);
+            if (ImGui::IsKeyPressed(ImGuiKey_DownArrow, true))
+                applyTunedFrequency(app, std::round((cur - app.snapHz) /
+                                                    app.snapHz) * app.snapHz);
+            if (ImGui::IsKeyPressed(ImGuiKey_M, false)) {
+                int m = (int(app.listenMode) % 5) + 1; // cicla 1..5
+                app.listenMode = AppState::ListenMode(m);
+                rebuildListener(app);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+                app.viewSpanFrac = 1.0;
+                app.viewCenterFrac = 0.5;
+            }
+        }
 
         ImGui::Render();
         int w, h;
@@ -2975,6 +3149,9 @@ int main(int argc, char** argv)
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
     }
+
+    // Ricorda l'ultima sessione (freq/modo/banda/volume/snap + posizione).
+    saveConfig(app);
 
     app.dspRunning.store(false);
     if (app.dspThread.joinable()) app.dspThread.join();
