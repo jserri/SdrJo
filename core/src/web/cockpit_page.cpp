@@ -217,7 +217,8 @@ async function startWsAudio() {
   const info = await r.json();
   if (!info.port) throw new Error("ws spento");
   actx = new (window.AudioContext || window.webkitAudioContext)(
-      {sampleRate: 48000});
+      {sampleRate: 48000, latencyHint: "playback"});
+  if (actx.resume) actx.resume(); // alcuni browser partono sospesi
   playT = 0;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const sock = new WebSocket(
@@ -230,6 +231,11 @@ async function startWsAudio() {
     setTimeout(rej, 3000);
   });
   ws = sock;
+  // Jitter buffer: si accumulano i blocchi da 20 ms e si schedulano
+  // sempre almeno LEAD secondi avanti al "presente" dell'audio, cosi' i
+  // ritardi di rete non creano buchi. Se restiamo indietro (underrun) si
+  // riparte con un cuscinetto pieno invece di frammentare.
+  const LEAD = 0.22, RESYNC = 0.05;
   sock.onmessage = (ev) => {
     if (!actx) return;
     const pcm = adpcmDecode(new Uint8Array(ev.data));
@@ -240,7 +246,7 @@ async function startWsAudio() {
     src.buffer = buf;
     src.connect(actx.destination);
     const now = actx.currentTime;
-    if (playT < now + 0.04) playT = now + 0.08; // riaggancio dolce
+    if (playT < now + RESYNC) playT = now + LEAD; // ricostruisci il cuscinetto
     src.start(playT);
     playT += buf.duration;
   };

@@ -62,6 +62,14 @@ constexpr int kWaterfallRows = 256;
 const char* kListenModeNames[] = {"Spento", "WFM stereo", "NFM",
                                   "AM", "USB", "LSB"};
 
+// Guida concisa: mostra una riga di spiegazione quando il mouse resta
+// sull'ultimo controllo disegnato (come i tooltip di SDR#).
+void helpTip(const char* text)
+{
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", text);
+}
+
 // Font caricati all'avvio (nullptr = fallback al font di default).
 ImFont* gFontUi = nullptr;
 ImFont* gFontMonoBig = nullptr;   // frequenzimetro
@@ -752,6 +760,12 @@ void uploadWaterfallTexture(AppState& app)
     }
 }
 
+// Helper di sintonia definiti piu' avanti (usati anche dal pannello
+// Dispositivo per il campo Frequenza).
+void tuneAbsolute(AppState& app, double f);
+void requestHwCenter(AppState& app, double newCenter);
+void centerViewOnTuned(AppState& app);
+
 void drawDeviceSection(AppState& app)
 {
 
@@ -805,11 +819,15 @@ void drawDeviceSection(AppState& app)
         }
     } else {
         ImGui::Text("%s attivo", app.source->name().c_str());
-        double freq = app.freqMHz;
-        if (ImGui::InputDouble("Frequenza (MHz)", &freq, 0.1, 1.0, "%.4f")) {
-            app.freqMHz = freq;
-            app.source->setCenterFrequency(freq * 1e6);
+        double freq = app.freqMHz * 1e6 + app.listenOffsetHz;
+        double freqMHz = freq / 1e6;
+        if (ImGui::InputDouble("Frequenza (MHz)", &freqMHz, 0.1, 1.0,
+                               "%.4f")) {
+            tuneAbsolute(app, freqMHz * 1e6); // lo spettro segue subito
         }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Frequenza sintonizzata: la chiavetta si "
+                              "porta qui e lo spettro la segue.");
 
         // Sample rate: preset tipici delle RTL2832U.
         static const double kRates[] = {250000, 1024000, 1800000, 1920000,
@@ -1007,8 +1025,20 @@ void drawDeviceSection(AppState& app)
         ImGui::TextDisabled("(imposta lat/lon per vederti sulla mappa ADS-B)");
 }
 
-// Con lo zoom attivo tiene la frequenza sintonizzata al centro della
-// vista (cosi' seguendo la sintonia lo spettro "scorre" sotto il VFO).
+// Offset anti-DC: quanto tenere il segnale ascoltato lontano dalla riga
+// della DC al centro (che ogni RTL-SDR ha e che il DC blocker scava).
+// Basta poco per uscire dallo spike centrale, restando vicini al centro.
+double antiDcOffset(const AppState& app)
+{
+    if (app.listenMode == AppState::ListenMode::Off) return 0.0;
+    double maxOff = app.sampleRate * 0.45 - app.listenBwHz * 0.5;
+    return std::clamp(app.sampleRate * 0.10, 30e3,
+                      std::max(30e3, maxOff));
+}
+
+// Centra la vista zoomata sulla frequenza sintonizzata. Usata SOLO per
+// azioni esplicite (lever dello zoom, "Sintonizza" di un modulo), non a
+// ogni sintonia: quello dava il microlag/scatto lamentato.
 void centerViewOnTuned(AppState& app)
 {
     if (app.viewSpanFrac >= 0.999) return;
@@ -1019,11 +1049,47 @@ void centerViewOnTuned(AppState& app)
                                     1.0 - app.viewSpanFrac / 2.0);
 }
 
-// Applica la frequenza sintonizzata: VFO se dentro lo span, altrimenti
-// risintonizza l'hardware (mostrando cosi' le frequenze successive);
-// in entrambi i casi la vista zoomata resta centrata sulla sintonia.
-// forceHwRetune = true sposta comunque la banda hardware attorno a f
-// (doppio click: nuova "finestra" sul segnale, mai sulla riga DC).
+// Sposta la vista (zoom) SOLO se la frequenza sintonizzata sta per uscire
+// dai bordi: nessun ricentraggio continuo (niente microlag mentre si
+// sintonizza dentro la porzione visibile).
+void keepTunedInView(AppState& app)
+{
+    if (app.viewSpanFrac >= 0.999) return; // vista piena: sempre visibile
+    double f0 = app.freqMHz * 1e6 - app.sampleRate / 2.0;
+    double frac = (app.freqMHz * 1e6 + app.listenOffsetHz - f0) /
+                  app.sampleRate;
+    double half = app.viewSpanFrac / 2.0;
+    double margin = app.viewSpanFrac * 0.08;
+    if (frac < app.viewCenterFrac - half + margin)
+        app.viewCenterFrac = frac + half - margin;
+    else if (frac > app.viewCenterFrac + half - margin)
+        app.viewCenterFrac = frac - half + margin;
+    app.viewCenterFrac = std::clamp(app.viewCenterFrac, half, 1.0 - half);
+}
+
+// Richiede all'hardware una nuova frequenza centrale (con limitatore:
+// max ~20/s, il resto si accoda cosi' il drag non blocca la GUI sull'USB).
+void requestHwCenter(AppState& app, double newCenter)
+{
+    if (!app.source) {
+        app.freqMHz = newCenter / 1e6;
+        return;
+    }
+    app.freqMHz = newCenter / 1e6;
+    auto now = std::chrono::steady_clock::now();
+    if (now - app.lastHwTune > std::chrono::milliseconds(50)) {
+        app.lastHwTune = now;
+        app.source->setCenterFrequency(newCenter);
+        app.pendingHwTuneHz = -1.0;
+    } else {
+        app.pendingHwTuneHz = newCenter;
+    }
+}
+
+// Sintonia da grafico/righello/waterfall: se la frequenza cade dentro lo
+// span dell'hardware la si raggiunge col VFO (offset), senza muovere la
+// chiavetta ne' la vista; altrimenti si risintonizza l'hardware.
+// forceHwRetune = true (doppio click) ricentra comunque l'hardware.
 void applyTunedFrequency(AppState& app, double f, bool forceHwRetune = false)
 {
     std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
@@ -1033,34 +1099,26 @@ void applyTunedFrequency(AppState& app, double f, bool forceHwRetune = false)
         std::fabs(f - center) < app.sampleRate * 0.45) {
         app.listenOffsetHz = f - center;
     } else {
-        // Fuori dallo span: risintonizza l'hardware. Il segnale ascoltato
-        // NON va messo esattamente al centro: li' ogni RTL-SDR ha la riga
-        // della DC (e il DC blocker la scava). Un quarto di span piu' in
-        // la' l'ascolto resta pulito, come l'offset tuning di SDR#.
-        double offset = 0.0;
-        if (app.listenMode != AppState::ListenMode::Off) {
-            double maxOff = app.sampleRate * 0.45 - app.listenBwHz * 0.5;
-            offset = std::clamp(app.sampleRate * 0.25, 0.0,
-                                std::max(0.0, maxOff));
-        }
-        double newCenter = f - offset;
-        app.freqMHz = newCenter / 1e6;
+        double offset = antiDcOffset(app);
         app.listenOffsetHz = offset;
-        if (app.source) {
-            // Retune hardware con limitatore: max ~20/s, il resto si
-            // accoda (il drag continuo non blocca piu' la GUI sull'USB).
-            auto now = std::chrono::steady_clock::now();
-            if (now - app.lastHwTune > std::chrono::milliseconds(50)) {
-                app.lastHwTune = now;
-                app.source->setCenterFrequency(newCenter);
-                app.pendingHwTuneHz = -1.0;
-            } else {
-                app.pendingHwTuneHz = newCenter;
-            }
-        }
+        requestHwCenter(app, f - offset);
     }
     if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
-    centerViewOnTuned(app);
+    keepTunedInView(app);
+}
+
+// Sintonia assoluta "vai a" (dial e campo MHz): porta SEMPRE l'hardware a
+// centrare la frequenza scelta (con piccolo offset anti-DC), cosi' lo
+// spettro segue davvero il numero impostato invece di restare indietro.
+void tuneAbsolute(AppState& app, double f)
+{
+    std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+    f = std::clamp(f, 0.0, 1.999e9);
+    double offset = antiDcOffset(app);
+    app.listenOffsetHz = offset;
+    requestHwCenter(app, f - offset);
+    if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
+    keepTunedInView(app);
 }
 
 // Frequenzimetro a cifre stile SDR Console: rotellina su una cifra per
@@ -1110,7 +1168,7 @@ void drawFrequencyDial(AppState& app)
             if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
                 delta = (mouse.y < y + fh / 2) ? place : -place;
             if (delta != 0)
-                applyTunedFrequency(app, double(f + delta));
+                tuneAbsolute(app, double(f + delta)); // ricentra l'hardware
         }
         x += charW;
         if (i == 0 || i == 3 || i == 6) {
@@ -1518,6 +1576,32 @@ void drawSpectrumPanel(AppState& app)
         }
     }
 
+    // --- S-meter compatto nell'angolo alto-destra dello spettro ---
+    // Solo disegno (nessun costo di rilievo): barra + dBFS del canale.
+    if (app.listenMode != AppState::ListenMode::Off) {
+        const float mw = 150.0f, mh = 16.0f;
+        ImVec2 m0(s1.x - mw - 6, s0.y + 6);
+        ImVec2 m1(s1.x - 6, s0.y + 6 + mh);
+        dl->AddRectFilled(m0, m1,
+                          ImGui::GetColorU32(ImVec4(0, 0, 0, 0.55f)), 3.0f);
+        float lvl = std::clamp((app.chanLevelDb + 120.0f) / 120.0f, 0.0f,
+                               1.0f);
+        // Verde fino a S9 (~0.55), poi rosso: come il quadrante analogico.
+        for (int seg = 0; seg < 30; seg++) {
+            float t0 = seg / 30.0f;
+            if (t0 > lvl) break;
+            ImU32 c = t0 < 0.55f ? IM_COL32(60, 200, 90, 255)
+                                 : IM_COL32(220, 80, 60, 255);
+            float xa = m0.x + 3 + t0 * (mw - 6);
+            dl->AddRectFilled(ImVec2(xa, m0.y + 3),
+                              ImVec2(xa + (mw - 6) / 30.0f - 1, m1.y - 3), c);
+        }
+        char sTxt[24];
+        std::snprintf(sTxt, sizeof(sTxt), "S %.0f dB", double(app.chanLevelDb));
+        dl->AddText(ImVec2(m0.x + 6, m0.y + 1),
+                    ImGui::GetColorU32(ImVec4(0.9f, 0.95f, 1.0f, 0.9f)), sTxt);
+    }
+
     // --- Righello delle frequenze (cliccabile e trascinabile) ---
     ImGui::InvisibleButton("##freqscale", ImVec2(w, scaleH));
     bool hovScale = ImGui::IsItemHovered();
@@ -1692,20 +1776,16 @@ void drawSpectrumPanel(AppState& app)
             ImGui::SetTooltip(
                 "%.4f MHz\nclick: sintonizza (snap %.4g kHz)  "
                 "trascina: sintonia continua\n"
-                "rotellina: zoom  Ctrl+rotellina o righello: passi di snap\n"
+                "rotellina: cambia frequenza (passi di snap)\n"
+                "Ctrl+rotellina o leva Zoom: ingrandisci  "
                 "doppio click: centra qui",
                 f / 1e6, app.snapHz / 1e3);
 
         float wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.0f) {
-            if (ImGui::GetIO().KeyCtrl || hovScale) {
-                // Passi di snap (oltre il bordo l'hardware scorre da solo).
-                double cur = centerHz + app.listenOffsetHz;
-                double next = std::round((cur + double(wheel) * app.snapHz) /
-                                         app.snapHz) * app.snapHz;
-                applyTunedFrequency(app, next);
-            } else {
-                // Zoom mantenendo ferma la frequenza sotto il cursore.
+            if (ImGui::GetIO().KeyCtrl) {
+                // Zoom (avanzato) tenendo ferma la frequenza sotto il
+                // cursore; lo zoom "vero" resta la leva laterale.
                 double frac = double((mx - p0.x) / w);
                 app.viewSpanFrac =
                     std::clamp(app.viewSpanFrac * std::pow(0.8, double(wheel)),
@@ -1714,6 +1794,13 @@ void drawSpectrumPanel(AppState& app)
                 double newV0 = f - frac * newSpan;
                 app.viewCenterFrac =
                     (newV0 + newSpan / 2.0 - f0) / (f1 - f0);
+            } else {
+                // Rotellina = cambia frequenza a passi di snap (com'era
+                // richiesto): oltre il bordo l'hardware scorre da solo.
+                double cur = centerHz + app.listenOffsetHz;
+                double next = std::round((cur + double(wheel) * app.snapHz) /
+                                         app.snapHz) * app.snapHz;
+                applyTunedFrequency(app, next);
             }
         }
 
@@ -1775,6 +1862,9 @@ void drawReceiverSection(AppState& app)
         app.listenMode = AppState::ListenMode(mode);
         rebuildListener(app);
     }
+    helpTip("Tipo di demodulazione: WFM per la radio FM, NFM per apparati "
+            "e servizi, AM per aereo/onde medie, USB/LSB per SSB e "
+            "radioamatori.");
     if (app.listenMode != AppState::ListenMode::Off) {
         ImGui::Text("VFO %.4f MHz  banda %.1f kHz",
                     (app.freqMHz * 1e6 + app.listenOffsetHz) / 1e6,
@@ -1785,7 +1875,9 @@ void drawReceiverSection(AppState& app)
                                                              : "mono");
         }
     }
-    ImGui::SliderFloat("Volume", &app.volume, 0.0f, 1.0f, "%.2f");
+    ImGui::SliderFloat("Volume", &app.volume, 0.0f, 1.5f, "%.2f");
+    helpTip("Volume dell'audio in uscita (fino a 1.5x per i segnali "
+            "deboli; oltre 1.0 puo' distorcere se il segnale e' forte).");
 
     // Passo di sintonia per click e rotellina.
     static const double kSnaps[] = {1000, 5000, 9000, 10000,
@@ -1798,6 +1890,8 @@ void drawReceiverSection(AppState& app)
         if (std::fabs(kSnaps[i] - app.snapHz) < 1) snapIdx = i;
     if (ImGui::Combo("Snap", &snapIdx, kSnapNames, 8))
         app.snapHz = kSnaps[snapIdx];
+    helpTip("Passo di sintonia: click e rotellina saltano di questo valore "
+            "(9 kHz onde medie, 12.5/25 kHz apparati, 5 kHz FM).");
 
     // Zoom (equivalente a Ctrl+rotellina sullo spettro).
     float zoom = float(1.0 / app.viewSpanFrac);
@@ -1812,10 +1906,14 @@ void drawReceiverSection(AppState& app)
 
     ImGui::SeparatorText("Squelch");
     ImGui::Checkbox("Attivo##sq", &app.squelchOn);
+    helpTip("Muto automatico sotto la soglia: l'audio passa solo quando il "
+            "segnale supera il livello impostato (silenzia il fruscio).");
     ImGui::SameLine();
     ImGui::TextDisabled(app.squelchOn ? (app.squelchOpen ? "APERTO" : "chiuso")
                                       : "");
     ImGui::SliderFloat("Soglia (dB)", &app.squelchDb, -100.0f, 0.0f, "%.0f");
+    helpTip("Livello di apertura: alzalo finche' il fruscio tace ma il "
+            "segnale utile passa ancora.");
     float lvl = std::clamp((app.chanLevelDb + 120.0f) / 120.0f, 0.0f, 1.0f);
     char lvlTxt[32];
     std::snprintf(lvlTxt, sizeof(lvlTxt), "%.0f dB", double(app.chanLevelDb));
@@ -1829,6 +1927,8 @@ void drawReceiverSection(AppState& app)
     changed |= ImGui::SliderFloat("Passa-basso (Hz)", &app.audioLowPassHz,
                                   0.0f, 12000.0f, app.audioLowPassHz < 1
                                                       ? "spento" : "%.0f");
+    helpTip("Passa-alto toglie ronzio/rumble bassi; passa-basso toglie il "
+            "fruscio acuto. Per la voce prova 300 Hz / 3000 Hz.");
     if (changed) {
         std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
         app.filterL.configure(48000.0, double(app.audioHighPassHz),
@@ -2074,10 +2174,9 @@ void drawModulesSection(AppState& app)
                 // L'hardware e' uno solo: il modulo riceve davvero il suo
                 // segnale solo quando la chiavetta e' sulla sua frequenza.
                 if (ImGui::SmallButton(lbl)) {
-                    app.freqMHz = info.preferredFreqHz / 1e6;
-                    if (app.source)
-                        app.source->setCenterFrequency(info.preferredFreqHz);
-                    app.listenOffsetHz = 0.0;
+                    std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+                    app.listenOffsetHz = 0.0; // il modulo vuole la banda intera
+                    requestHwCenter(app, info.preferredFreqHz);
                     if (app.listenVfo) app.listenVfo->setOffset(0.0);
                     centerViewOnTuned(app);
                 }

@@ -117,6 +117,21 @@ Fatti (5a tornata):
   regolabile) e **RTTY** Baudot 45.45 (mark 2125 / shift 170, invertibile)
   sul canale d'ascolto, testo scorrevole nella sidebar.
 
+Fatti (6a tornata, rifiniture d'uso):
+
+- ✅ La sintonia **non ricentra piu'** la vista a ogni passo (via il
+  microlag); la vista segue solo quando il VFO sta per uscire dai bordi.
+- ✅ Il **dial** e il campo **Frequenza (MHz)** ricentrano davvero
+  l'hardware: lo spettro segue subito (prima restava sulla vecchia).
+- ✅ **Rotellina sullo spettro = cambia frequenza** (a passi di snap);
+  lo zoom resta sulla leva laterale (o Ctrl+rotellina).
+- ✅ **Volume** fino a 1.5x per i segnali deboli.
+- ✅ **Tooltip di aiuto** concisi sui controlli principali.
+- ✅ **S-meter compatto** nell'angolo alto-destra dello spettro (quello
+  analogico resta nella sidebar).
+- ✅ Audio web **meno a scatti**: jitter buffer piu' ampio (~0.22 s) con
+  recupero degli underrun.
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).
