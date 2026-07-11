@@ -25,6 +25,7 @@
 #include <sdrjo/dsp/audio_filters.hpp>
 #include <sdrjo/dsp/rtty.hpp>
 #include <sdrjo/dsp/psk31.hpp>
+#include <sdrjo/dsp/tetra_activity.hpp>
 #include <sdrjo/morse/cw_decoder.hpp>
 #include <sdrjo/sat/orbit.hpp>
 #include <sdrjo/sat/tle.hpp>
@@ -181,6 +182,7 @@ struct AppState : public sdrjo::IModuleHost {
     // Passo di sintonia (rotellina/click) e larghezza canale regolabile.
     double snapHz = 12500.0;
     double listenBwHz = 0.0;
+    bool snapToPeak = false; // click di sintonia: aggancia al picco vicino
 
     // Squelch sul canale di ascolto.
     bool squelchOn = false;
@@ -251,6 +253,7 @@ struct AppState : public sdrjo::IModuleHost {
     int rttyBaudIdx = 0;        // 0=45.45 1=50 2=75
     int rttyShiftIdx = 0;       // 0=170 1=425 2=850 Hz
     float psk31ToneHz = 1000.0f; // tono audio del segnale BPSK31
+    bool decoderAfc = false;      // centra da solo il tono CW/PSK sul picco
     float decoderSquelch = 0.15f; // soglia d'ampiezza: sotto = niente decodifica
     ToneEnvelope cwTone;
     std::unique_ptr<sdrjo::morse::CwDecoder> cwDecoder;
@@ -258,6 +261,14 @@ struct AppState : public sdrjo::IModuleHost {
     std::unique_ptr<sdrjo::dsp::Psk31Decoder> psk31Decoder;
     std::string decodedText;
     std::atomic<float> decoderLevel{0.0f}; // livello audio RMS visto dai decoder
+
+    // Rivelatore di attivita' TETRA (solo presenza, niente decodifica).
+    bool tetraDetectOn = false;
+    std::unique_ptr<sdrjo::dsp::TetraActivityDetector> tetraDet;
+    std::atomic<bool> tetraActive{false};
+    std::atomic<float> tetraSnr{0.0f};
+    std::atomic<float> tetraOcc{0.0f};
+    std::atomic<float> tetraLevel{0.0f};
 
     // Satelliti: TLE, passaggi calcolati e inseguimento Doppler.
     std::vector<sdrjo::sat::Tle> tles;
@@ -410,6 +421,8 @@ void loadConfig(AppState& app)
             app.uiScale = std::clamp(float(v), 0.7f, 2.0f);
         else if (std::sscanf(line, "decoder_squelch=%lf", &v) == 1)
             app.decoderSquelch = std::clamp(float(v), 0.0f, 0.6f);
+        else if (std::sscanf(line, "snap_to_peak=%d", &iv) == 1)
+            app.snapToPeak = iv != 0;
     }
     std::fclose(f);
 }
@@ -422,10 +435,11 @@ void saveConfig(AppState& app)
                  "station_lat=%.6f\nstation_lon=%.6f\n"
                  "freq_mhz=%.6f\nmode=%d\nbandwidth_hz=%.1f\n"
                  "volume=%.3f\nsnap_hz=%.1f\nui_scale=%.2f\n"
-                 "decoder_squelch=%.3f\n",
+                 "decoder_squelch=%.3f\nsnap_to_peak=%d\n",
                  app.stationLat, app.stationLon, app.freqMHz,
                  int(app.listenMode), app.listenBwHz, double(app.volume),
-                 app.snapHz, double(app.uiScale), double(app.decoderSquelch));
+                 app.snapHz, double(app.uiScale), double(app.decoderSquelch),
+                 app.snapToPeak ? 1 : 0);
     std::fclose(f);
 }
 
@@ -579,6 +593,21 @@ void dspLoop(AppState& app)
             lchan.clear();
             app.listenVfo->process(chunk.data(), kChunkSize, lchan);
             if (lchan.empty()) continue;
+
+            // Rivelatore di attivita' TETRA: analizza il canale largo
+            // (prima del filtro stretto), solo alla velocita' standard 48 kHz.
+            if (app.tetraDetectOn && app.tetraDet &&
+                app.listenMode != AppState::ListenMode::WfmStereo) {
+                app.tetraDet->processIq(lchan.data(), lchan.size());
+                app.tetraActive.store(app.tetraDet->active(),
+                                      std::memory_order_relaxed);
+                app.tetraSnr.store(app.tetraDet->snrDb(),
+                                   std::memory_order_relaxed);
+                app.tetraOcc.store(app.tetraDet->occupiedKHz(),
+                                   std::memory_order_relaxed);
+                app.tetraLevel.store(app.tetraDet->level(),
+                                     std::memory_order_relaxed);
+            }
 
             // Noise blanker: schiaccia i disturbi impulsivi sul canale.
             app.noiseBlanker.processInPlace(lchan.data(), lchan.size());
@@ -1385,6 +1414,71 @@ ImU32 bandColor(const char* cat, float alpha)
     return ImGui::GetColorU32(ImVec4(0.5f, 0.5f, 0.5f, alpha));
 }
 
+void setDecoderTone(AppState& app, double hz); // def. piu' sotto
+
+// Cerca il picco piu' forte dello spettro RF entro +/- halfWinHz da
+// targetHz e ne restituisce la frequenza (o targetHz se non trova niente
+// di netto). Serve al "snap al picco" del click di sintonia.
+double nearestSpectrumPeak(AppState& app, double f0, double f1,
+                           double targetHz, double halfWinHz)
+{
+    std::lock_guard<std::mutex> lk(app.spectrumMutex);
+    const size_t n = app.spectrum.size();
+    if (n == 0 || f1 <= f0) return targetHz;
+    auto binOf = [&](double f) {
+        double b = (f - f0) / (f1 - f0) * double(n);
+        return size_t(std::clamp(b, 0.0, double(n - 1)));
+    };
+    size_t b0 = binOf(targetHz - halfWinHz);
+    size_t b1 = binOf(targetHz + halfWinHz);
+    if (b1 <= b0) return targetHz;
+    size_t bBest = b0;
+    for (size_t b = b0; b <= b1 && b < n; b++)
+        if (app.spectrum[b] > app.spectrum[bBest]) bBest = b;
+    // Richiede un minimo di stacco dal fondo, altrimenti lascia il target.
+    double sum = 0;
+    for (size_t b = b0; b <= b1 && b < n; b++) sum += app.spectrum[b];
+    float avg = float(sum / double(b1 - b0 + 1));
+    if (app.spectrum[bBest] < avg + 3.0f) return targetHz; // niente picco netto
+    return f0 + (double(bBest) + 0.5) / double(n) * (f1 - f0);
+}
+
+// AFC dei decoder: sposta lentamente il tono CW/PSK sul picco piu' vicino
+// dell'audio (scan Goertzel stretto), come l'aggancio automatico di fldigi.
+void stepDecoderAfc(AppState& app)
+{
+    int mode = app.textDecoderMode;
+    if (!app.decoderAfc || (mode != 1 && mode != 3)) return;
+
+    const size_t n = app.audioTap.size();
+    static std::vector<float> buf;
+    buf.resize(n);
+    {
+        std::lock_guard<std::mutex> lk(app.audioTapMutex);
+        for (size_t i = 0; i < n; i++)
+            buf[i] = app.audioTap[(app.audioTapPos + i) % n];
+    }
+    double rate = 48000.0;
+    double tone = mode == 1 ? double(app.cwToneHz) : double(app.psk31ToneHz);
+    // Scan di potenza (Goertzel) in +/-120 Hz attorno al tono, passo 6 Hz.
+    double bestF = tone, bestP = -1.0;
+    for (double f = tone - 120.0; f <= tone + 120.0; f += 6.0) {
+        double w0 = 2.0 * 3.14159265358979323846 * f / rate;
+        double coeff = 2.0 * std::cos(w0);
+        double s0 = 0, s1 = 0, s2 = 0;
+        for (size_t i = 0; i < n; i++) {
+            s0 = buf[i] + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        double p = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+        if (p > bestP) { bestP = p; bestF = f; }
+    }
+    // Nudge lento (0.25) per non "saltare" sul rumore.
+    double nudged = tone + 0.25 * (bestF - tone);
+    if (std::fabs(nudged - tone) >= 1.0) setDecoderTone(app, nudged);
+}
+
 // Spettro interattivo: guide di banda, scala in MHz, click per spostare
 // il VFO di ascolto, doppio click per risintonizzare l'hardware.
 void drawSpectrumPanel(AppState& app)
@@ -1884,7 +1978,12 @@ void drawSpectrumPanel(AppState& app)
         }
 
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            double snapped = std::round(f / app.snapHz) * app.snapHz;
+            double t = app.snapToPeak
+                           ? nearestSpectrumPeak(app, f0, f1, f, app.snapHz)
+                           : f;
+            double snapped = app.snapToPeak
+                                 ? t
+                                 : std::round(t / app.snapHz) * app.snapHz;
             applyTunedFrequency(app, snapped, /*forceHwRetune=*/true);
         } else if (!nearEdge && anyActive) {
             // Premuto su una delle tre aree: inizia il drag/click di sintonia.
@@ -1909,9 +2008,14 @@ void drawSpectrumPanel(AppState& app)
             }
         } else {
             if (!dragMoved) {
-                // Click secco: sintonizza sul punto premuto, con lo snap.
+                // Click secco: sintonizza sul punto premuto. Con "snap al
+                // picco" attivo aggancia il segnale piu' forte li' vicino,
+                // altrimenti arrotonda al passo di sintonia.
                 double snapped =
-                    std::round(pressFreq / app.snapHz) * app.snapHz;
+                    app.snapToPeak
+                        ? nearestSpectrumPeak(app, f0, f1, pressFreq,
+                                              app.snapHz)
+                        : std::round(pressFreq / app.snapHz) * app.snapHz;
                 applyTunedFrequency(app, snapped);
             }
             draggingTune = false;
@@ -2078,6 +2182,9 @@ void drawReceiverSection(AppState& app)
         app.snapHz = kSnaps[snapIdx];
     helpTip("Passo di sintonia: click e rotellina saltano di questo valore "
             "(9 kHz onde medie, 12.5/25 kHz apparati, 5 kHz FM).");
+    ImGui::Checkbox("Aggancia al picco", &app.snapToPeak);
+    helpTip("Al click di sintonia salta sul segnale piu' forte li' vicino "
+            "(comodo su AM/FM con portante; in SSB e' solo indicativo).");
     // Lo zoom vive sulla leva 'Zoom' a destra dello spettro (niente
     // doppione qui).
 
@@ -2143,6 +2250,7 @@ void drawReceiverSection(AppState& app)
 void drawAudioSection(AppState& app);
 void drawAudioSpectrumSection(AppState& app);
 void drawTextDecoderSection(AppState& app);
+void drawTetraSection(AppState& app);
 void drawScannerSection(AppState& app);
 void drawSatellitesSection(AppState& app);
 void drawFrequenciesSection(AppState& app);
@@ -2284,6 +2392,57 @@ void drawStatusBar(AppState& app)
     ImGui::End();
 }
 
+// Rivelatore di ATTIVITA' TETRA: dice solo se c'e' un portante digitale
+// largo ~canale sopra il rumore. NIENTE decodifica ne' decifratura (la
+// voce TETRA e' quasi sempre cifrata e intercettarla e' illegale).
+void drawTetraSection(AppState& app)
+{
+    ImGui::TextWrapped("Rileva solo la PRESENZA di un portante tipo TETRA "
+                       "(25 kHz). Non decodifica ne' decifra nulla: la voce "
+                       "e' cifrata e l'intercettazione e' illegale.");
+    if (app.listenMode == AppState::ListenMode::Off ||
+        app.listenMode == AppState::ListenMode::WfmStereo) {
+        ImGui::TextDisabled("usa NFM/AM sul canale sospetto, poi attiva qui");
+    }
+
+    if (ImGui::Checkbox("Rileva attivita'", &app.tetraDetectOn)) {
+        std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+        if (app.tetraDetectOn)
+            app.tetraDet =
+                std::make_unique<sdrjo::dsp::TetraActivityDetector>(48000.0);
+        else
+            app.tetraDet.reset();
+        app.tetraActive.store(false);
+    }
+    helpTip("Sintonizza il canale sospetto (25 kHz) in NFM e osserva "
+            "l'indicatore: 'attivo' = portante digitale largo presente.");
+
+    if (!app.tetraDetectOn) return;
+
+    bool act = app.tetraActive.load(std::memory_order_relaxed);
+    float snr = app.tetraSnr.load(std::memory_order_relaxed);
+    float occ = app.tetraOcc.load(std::memory_order_relaxed);
+    float lvl = app.tetraLevel.load(std::memory_order_relaxed);
+
+    // LED + stato.
+    ImVec2 lp = ImGui::GetCursorScreenPos();
+    ImGui::GetWindowDrawList()->AddCircleFilled(
+        ImVec2(lp.x + 7, lp.y + 8), 6.0f,
+        act ? IM_COL32(60, 200, 90, 255) : IM_COL32(120, 120, 120, 255));
+    ImGui::Dummy(ImVec2(18, 16));
+    ImGui::SameLine();
+    ImGui::TextUnformatted(act ? "ATTIVO (portante rilevato)" : "nessuna attivita'");
+
+    ImGui::PushStyleColor(ImGuiCol_PlotHistogram,
+                          act ? ImVec4(0.36f, 0.82f, 0.45f, 1.0f)
+                              : ImVec4(0.55f, 0.55f, 0.55f, 1.0f));
+    ImGui::ProgressBar(std::clamp(lvl, 0.0f, 1.0f), ImVec2(-FLT_MIN, 12.0f));
+    ImGui::PopStyleColor();
+    ImGui::Text("SNR banda/rumore: %.1f dB", double(snr));
+    ImGui::Text("Larghezza occupata: ~%.1f kHz", double(occ));
+    ImGui::TextDisabled("(TETRA riempie ~18-24 kHz del canale da 25)");
+}
+
 // Sidebar unica: tutte le sezioni di controllo in una colonna, apribili
 // e richiudibili come menu a tendina (spettro e waterfall tengono cosi'
 // tutta la parte destra dello schermo).
@@ -2306,6 +2465,8 @@ void drawSidebar(AppState& app)
         drawAudioSpectrumSection(app);
     if (ImGui::CollapsingHeader("Decoder testi"))
         drawTextDecoderSection(app);
+    if (ImGui::CollapsingHeader("TETRA (attivita')"))
+        drawTetraSection(app);
     if (ImGui::CollapsingHeader("Scanner"))
         drawScannerSection(app);
     if (ImGui::CollapsingHeader("Satelliti"))
@@ -2935,6 +3096,13 @@ void drawTextDecoderSection(AppState& app)
                 "(sembra due righe vicine che pulsano). 31.25 baud.");
     }
 
+    // AFC: aggancio automatico del tono (solo CW/PSK, dove ha senso).
+    if (app.textDecoderMode == 1 || app.textDecoderMode == 3) {
+        ImGui::Checkbox("AFC (centra il tono)", &app.decoderAfc);
+        helpTip("Sposta da solo il tono sul picco piu' vicino dell'audio, "
+                "come l'aggancio automatico di fldigi.");
+    }
+
     // --- Squelch dei decoder + indicatore di taratura ---
     if (app.textDecoderMode != 0) {
         fieldLabel("Squelch decoder");
@@ -3441,6 +3609,17 @@ int main(int argc, char** argv)
                 app.source->setCenterFrequency(app.pendingHwTuneHz);
                 app.pendingHwTuneHz = -1.0;
                 resetSpectrumAfterRetune(app);
+            }
+        }
+
+        // AFC dei decoder: aggancio del tono ~5 volte al secondo (leggero).
+        {
+            static auto lastAfc = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            if (app.decoderAfc &&
+                now - lastAfc > std::chrono::milliseconds(200)) {
+                lastAfc = now;
+                stepDecoderAfc(app);
             }
         }
 

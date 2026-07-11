@@ -48,6 +48,8 @@ non serve toccare l'app principale.
 | NOAA APT: sync, righe immagine, salvataggio BMP | ✅ implementato e testato |
 | Cockpit web (dashboard moderna, senza dipendenze) | ✅ implementato e testato |
 | Morse: decoder adattivo (velocità e pitch qualsiasi) | ✅ implementato e testato |
+| CW/RTTY/PSK31: decoder testi con AFC, squelch e waterfall audio | ✅ implementati e testati |
+| TETRA: **rivelatore di sola attività** (nessuna decodifica/decifratura) | ✅ implementato e testato |
 | Meteor LRPT: Viterbi CCSDS, derandomizer, sync CADU | ✅ implementato e testato |
 | Meteor LRPT: QPSK (Costas + Gardner) | 🔧 scheletro, da tarare su registrazioni reali |
 | Meteor LRPT: Reed-Solomon + immagine JPEG | 📋 da fare (vedi roadmap) |
@@ -57,6 +59,18 @@ non serve toccare l'app principale.
 | Uscita audio (miniaudio) | ✅ implementata (backend nullo se offline) |
 | Registrazione IQ + replay | ✅ implementati e testati |
 | Installer (CPack NSIS/ZIP) | ✅ configurato |
+
+### Nota su TETRA (rilevamento, non intercettazione)
+
+SdrJo include un **rivelatore di attività TETRA**: misura soltanto se sul
+canale (25 kHz) è presente un portante digitale largo tipo TETRA sopra il
+rumore (SNR e larghezza occupata). Serve alla caccia agli impianti e alla
+mappatura dello spettro.
+
+**Non c'è — e non ci sarà — alcuna decodifica o decifratura.** La voce
+TETRA usa ACELP quasi sempre cifrato (TEA1/2/3) e intercettarne il
+contenuto è illegale in Italia/UE. Il rivelatore si ferma alla
+presenza/assenza del segnale, senza mai toccarne il contenuto.
 
 ## Compilazione su Windows (32 e 64 bit)
 

@@ -226,16 +226,26 @@ Fatti (13a tornata, SSB come SDR#/SDR++ + waterfall audio + rifiniture):
 - ✅ **LED d'aggancio PSK31** (rivelatore a portante quadrata) + etichette
   sopra gli slider del decoder (niente piu' testo tagliato).
 
+Fatti (14a tornata, AFC + snap al picco + rivelatore TETRA):
+
+- ✅ **AFC dei decoder**: opzione che centra da sola il tono CW/PSK sul
+  picco piu' vicino dell'audio (scan Goertzel stretto, nudge lento), come
+  l'aggancio automatico di fldigi.
+- ✅ **Snap al picco** sullo spettro RF: al click di sintonia (opzione
+  attivabile) aggancia il segnale piu' forte li' vicino; comodo su AM/FM
+  con portante. Preferenza salvata in configurazione.
+- ✅ **Rivelatore di attivita' TETRA**: misura *solo la presenza* di un
+  portante digitale largo ~canale (25 kHz) sopra il rumore (SNR + larghezza
+  occupata + LED). **Nessuna decodifica ne' decifratura** (la voce e'
+  cifrata e intercettarla e' illegale). Classe DSP dedicata + test sintetico
+  (portante rilevato, rumore e CW respinti).
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).
 - Scarico automatico dei TLE (serve HTTPS) e piu' protocolli 433 MHz
   (Oregon Scientific, TFA, TPMS...).
-- Altri modi digitali: FT8/FT4 (serve sincronizzazione tempo), SSTV,
-  RTTY con AFC automatico.
-- **TETRA**: fattibile solo un *rivelatore di attivita'/burst* (π/4-DQPSK,
-  18 kHz): la voce ACELP e' quasi sempre cifrata (TEA1/2/3) e decifrarla
-  non e' previsto. Vedi nota nel README.
+- Altri modi digitali: FT8/FT4 (serve sincronizzazione tempo), SSTV.
 - VFO con offset regolabile per modulo dalla GUI (oggi centrati).
 - Registratore pianificato (parte da solo al passaggio del satellite).
 - MSIX per il Microsoft Store.

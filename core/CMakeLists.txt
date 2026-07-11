@@ -9,6 +9,7 @@ add_library(sdrjo-core STATIC
     src/dsp/vfo.cpp
     src/dsp/rtty.cpp
     src/dsp/psk31.cpp
+    src/dsp/tetra_activity.cpp
     src/audio/audio_output.cpp
     src/util/iq_recorder.cpp
     src/util/band_plan.cpp
