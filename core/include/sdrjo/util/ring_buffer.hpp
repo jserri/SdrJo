@@ -48,6 +48,15 @@ public:
         return (w + cap_ - r) % cap_;
     }
 
+    // Scarta tutto il contenuto in attesa. Da chiamare SOLO dal thread
+    // consumatore (avanza la lettura fino alla scrittura corrente): usato
+    // al cambio di frequenza per non mostrare il backlog della vecchia.
+    void clear()
+    {
+        readPos_.store(writePos_.load(std::memory_order_acquire),
+                       std::memory_order_release);
+    }
+
 private:
     std::vector<T> buf_;
     size_t cap_;

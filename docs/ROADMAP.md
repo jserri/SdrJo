@@ -147,9 +147,21 @@ Fatti (7a tornata, correzioni d'uso):
 - ✅ Bottone Mute istantaneo accanto al volume; tolto "Spento" dai modi;
   la radio parte in AM.
 
+Fatti (8a tornata):
+
+- ✅ Cambio frequenza: al retune il thread DSP **svuota l'anello IQ**
+  (buttando il backlog della vecchia banda), cosi' lo spettro passa
+  subito alla nuova frequenza invece di smaltire i campioni vecchi.
+- ✅ Il waterfall **non si azzera** piu' al cambio banda: scorre
+  naturalmente mostrando la nuova frequenza dall'alto (come SDR#).
+- ✅ Waterfall piu' **nitido in zoom**: texture a 8192 colonne.
+- ✅ **Controllo larghezza di banda** (slider log + preset CW/SSB/AM/NFM)
+  con minimo 100 Hz: filtri stretti per il CW su HF (piu' tap sotto 1 kHz).
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).
+- Abilita/disabilita i moduli per non spendere CPU sui decoder inattivi.
 - Scarico automatico dei TLE (serve HTTPS) e piu' protocolli 433 MHz
   (Oregon Scientific, TFA, TPMS...).
 - Altri modi digitali: PSK31, FT8, SSTV (sulla catena del decoder testi).

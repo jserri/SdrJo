@@ -56,7 +56,10 @@
 namespace {
 
 constexpr size_t kChunkSize = 4096;   // blocco DSP per moduli/ascolto
-constexpr int kWfWidth = 4096;        // colonne della texture waterfall
+// Colonne della texture waterfall: piu' alte = zoom piu' nitido (meno
+// "sgranato"). 8192 raddoppia il dettaglio orizzontale con un costo di
+// memoria contenuto (la RAM scala col numero di righe scelto in "Memoria").
+constexpr int kWfWidth = 8192;
 constexpr int kWaterfallRows = 256;
 
 const char* kListenModeNames[] = {"Spento", "WFM stereo", "NFM",
@@ -285,9 +288,10 @@ struct AppState : public sdrjo::IModuleHost {
     double pendingHwTuneHz = -1.0;
     std::chrono::steady_clock::time_point lastHwTune{};
 
-    // Al cambio di frequenza hardware: azzera cattura/waterfall cosi' lo
-    // spettro riflette SUBITO la nuova banda (niente residui vecchi).
-    std::atomic<bool> wfClearReq{false};
+    // Al cambio di frequenza hardware: chiede al thread DSP di scartare il
+    // backlog dell'anello IQ (la vecchia banda) cosi' lo spettro passa
+    // SUBITO alla nuova frequenza invece di smaltire i campioni vecchi.
+    std::atomic<bool> iqDrainReq{false};
 
     void ensureAudio()
     {
@@ -406,13 +410,17 @@ void rebuildChanFilter(AppState& app)
     if (app.listenMode == AppState::ListenMode::Off ||
         app.listenMode == AppState::ListenMode::WfmStereo)
         return;
-    double bw = std::clamp(app.listenBwHz, 500.0, 46000.0);
+    // Minimo 100 Hz: per il CW su HF servono filtri strettissimi
+    // (200-500 Hz), 1 kHz e' gia' larghissimo.
+    double bw = std::clamp(app.listenBwHz, 100.0, 46000.0);
     if (app.ssbDemod) {
         app.ssbDemod = std::make_unique<sdrjo::dsp::SsbDemodulator>(
             48000.0, app.listenMode == AppState::ListenMode::Usb, bw);
     } else {
+        // Filtri stretti = piu' tap per bordi ripidi (250 tap sotto 1 kHz).
+        int taps = bw < 1000.0 ? 251 : (bw < 4000.0 ? 199 : 129);
         app.chanFilter = std::make_unique<sdrjo::dsp::FirFilter>(
-            sdrjo::dsp::designLowPass(48000.0, bw / 2.0, 129));
+            sdrjo::dsp::designLowPass(48000.0, bw / 2.0, taps));
     }
 }
 
@@ -465,6 +473,16 @@ void dspLoop(AppState& app)
 {
     static std::vector<sdrjo::cfloat> chunk(kChunkSize);
     while (app.dspRunning.load()) {
+        // Cambio di frequenza: butta via il backlog della vecchia banda
+        // (fatto dal thread consumatore, cioe' questo) cosi' i prossimi
+        // campioni elaborati sono gia' alla frequenza nuova.
+        if (app.iqDrainReq.exchange(false)) {
+            app.iqRing.clear();
+            std::lock_guard<std::recursive_mutex> dspLk(app.dspMutex);
+            app.captureFilled = 0;
+            app.capturePos = 0;
+            app.samplesSinceFft = 0;
+        }
         if (app.iqRing.available() < kChunkSize) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
             continue;
@@ -687,17 +705,6 @@ void resizeWaterfall(AppState& app, int rows)
 
 void uploadWaterfallTexture(AppState& app)
 {
-    // Cambio di banda: svuota la storia del waterfall (altrimenti resta
-    // in vista lo scorrimento della frequenza precedente).
-    if (app.wfClearReq.exchange(false)) {
-        std::lock_guard<std::mutex> lk(app.wfMutex);
-        std::fill(app.waterfall.begin(), app.waterfall.end(),
-                  app.rangeMinDb - 20.0f);
-        app.waterfallHead = 0;
-        app.wfNewRows.clear();
-        app.wfFullRedraw = true;
-    }
-
     // Righe nuove dal thread DSP (di norma 0 o 1 per frame video).
     static std::vector<int> newRows;
     newRows.clear();
@@ -1083,14 +1090,16 @@ void keepTunedInView(AppState& app)
     app.viewCenterFrac = std::clamp(app.viewCenterFrac, half, 1.0 - half);
 }
 
-// Azzera cattura e waterfall: chiamata quando l'hardware cambia banda,
-// cosi' lo spettro non mostra piu' i residui della frequenza precedente.
+// Chiamata quando l'hardware cambia banda: azzera la cattura per lo
+// spettro e chiede al thread DSP di scartare il backlog dell'anello IQ
+// (campioni della vecchia frequenza). Il waterfall NON viene svuotato:
+// scorre naturalmente mostrando la nuova banda dall'alto, come SDR#.
 void resetSpectrumAfterRetune(AppState& app)
 {
     app.captureFilled = 0;
     app.capturePos = 0;
     app.samplesSinceFft = 0;
-    app.wfClearReq.store(true);
+    app.iqDrainReq.store(true);
 }
 
 // Richiede all'hardware una nuova frequenza centrale.
@@ -1581,7 +1590,7 @@ void drawSpectrumPanel(AppState& app)
                     (app.listenMode == AppState::ListenMode::WfmStereo)
                         ? 220000.0 : 46000.0;
                 app.listenBwHz = std::clamp(
-                    2.0 * std::fabs(freqAt(mx) - vfoHz), 500.0, maxBw);
+                    2.0 * std::fabs(freqAt(mx) - vfoHz), 100.0, maxBw);
             } else {
                 draggingBw = false;
                 rebuildChanFilter(app); // applica la nuova larghezza
@@ -1942,6 +1951,33 @@ void drawReceiverSection(AppState& app)
     ImGui::SliderFloat("##Volume", &app.volume, 0.0f, 1.5f, "vol %.2f");
     helpTip("Volume dell'audio in uscita (fino a 1.5x per i segnali "
             "deboli; oltre 1.0 puo' distorcere se il segnale e' forte).");
+
+    // Larghezza di banda del canale: slider (log) + preset rapidi. Per
+    // HF/CW servono filtri stretti (200-500 Hz), 1 kHz e' gia' largo.
+    if (app.listenMode != AppState::ListenMode::Off &&
+        app.listenMode != AppState::ListenMode::WfmStereo) {
+        float bwHz = float(app.listenBwHz);
+        if (ImGui::SliderFloat("Larghezza", &bwHz, 100.0f, 20000.0f,
+                               "%.0f Hz", ImGuiSliderFlags_Logarithmic)) {
+            app.listenBwHz = double(bwHz);
+            rebuildChanFilter(app);
+        }
+        helpTip("Larghezza del filtro di canale. CW 250-500 Hz, SSB "
+                "2.4-2.7 kHz, AM 6-9 kHz, NFM 12.5 kHz. Puoi anche "
+                "trascinare i bordi della banda sullo spettro.");
+        // Preset rapidi tipici.
+        struct BwPreset { const char* name; double hz; };
+        static const BwPreset kBw[] = {
+            {"CW 300", 300}, {"CW 500", 500}, {"SSB 2.4k", 2400},
+            {"AM 6k", 6000}, {"AM 9k", 9000}, {"NFM 12.5k", 12500}};
+        for (int i = 0; i < 6; i++) {
+            if (i % 3) ImGui::SameLine();
+            if (ImGui::SmallButton(kBw[i].name)) {
+                app.listenBwHz = kBw[i].hz;
+                rebuildChanFilter(app);
+            }
+        }
+    }
 
     // Passo di sintonia per click e rotellina.
     static const double kSnaps[] = {1000, 5000, 9000, 10000,
