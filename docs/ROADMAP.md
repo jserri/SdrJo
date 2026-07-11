@@ -158,10 +158,18 @@ Fatti (8a tornata):
 - ✅ **Controllo larghezza di banda** (slider log + preset CW/SSB/AM/NFM)
   con minimo 100 Hz: filtri stretti per il CW su HF (piu' tap sotto 1 kHz).
 
+Fatti (9a tornata):
+
+- ✅ **Interruttore per ogni modulo**: i decoder partono spenti e si
+  accendono uno alla volta. Un modulo spento non riceve IQ (ne' il suo
+  VFO viene elaborato), quindi non spende CPU: l'app resta leggera e
+  l'anello IQ non si riempie. UI con stato colorato (verde/grigio),
+  avviso "fuori banda" e dettagli visibili solo quando il modulo e'
+  acceso.
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).
-- Abilita/disabilita i moduli per non spendere CPU sui decoder inattivi.
 - Scarico automatico dei TLE (serve HTTPS) e piu' protocolli 433 MHz
   (Oregon Scientific, TFA, TPMS...).
 - Altri modi digitali: PSK31, FT8, SSTV (sulla catena del decoder testi).

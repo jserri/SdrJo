@@ -112,6 +112,10 @@ struct AppState : public sdrjo::IModuleHost {
     float wfSplit = 0.42f;           // quota di altezza dello spettro
 
     std::vector<sdrjo::LoadedModule> modules;
+    // Interruttore per modulo: quando spento il modulo NON riceve IQ (ne'
+    // il suo VFO viene elaborato), cosi' i decoder inattivi non pesano su
+    // CPU/anello IQ. Persistente tra le ricostruzioni dei canali.
+    std::vector<char> moduleEnabled;
     std::vector<std::string> logLines;
     std::mutex logMutex;
 
@@ -509,8 +513,12 @@ void dspLoop(AppState& app)
             std::min(app.captureFilled + kChunkSize, app.captureBuf.size());
         app.samplesSinceFft += kChunkSize;
 
-        // Distribuisci a ogni modulo il SUO canale (VFO dedicato).
+        // Distribuisci a ogni modulo il SUO canale (VFO dedicato). I
+        // moduli spenti non vengono elaborati (ne' VFO ne' decoder): a
+        // riposo l'app non spende CPU sui decodificatori che non usi.
         for (size_t m = 0; m < app.modules.size(); m++) {
+            if (m < app.moduleEnabled.size() && !app.moduleEnabled[m])
+                continue;
             auto& ch = app.channels[m];
             if (ch.vfo) {
                 ch.buf.clear();
@@ -2259,20 +2267,54 @@ void drawModulesSection(AppState& app)
     if (app.modules.empty()) {
         ImGui::TextWrapped("Nessun modulo caricato. Copia i moduli (*.dll) "
                            "nella cartella 'modules' accanto all'eseguibile.");
+        return;
     }
-    for (auto& lm : app.modules) {
+
+    ImGui::TextWrapped("I moduli partono spenti: accendi solo quello che ti "
+                       "serve. Ogni decoder attivo elabora il segnale e "
+                       "consuma CPU, quindi tenerne spenti alleggerisce "
+                       "l'app.");
+    ImGui::Spacing();
+
+    const ImVec4 onCol(0.24f, 0.86f, 0.59f, 1.0f);   // verde = attivo
+    const ImVec4 offCol(0.55f, 0.60f, 0.66f, 1.0f);  // grigio = spento
+
+    if (app.moduleEnabled.size() != app.modules.size())
+        app.moduleEnabled.assign(app.modules.size(), 0);
+
+    for (size_t i = 0; i < app.modules.size(); i++) {
+        auto& lm = app.modules[i];
         auto info = lm.module()->info();
-        if (ImGui::CollapsingHeader(info.name.c_str(),
-                                    ImGuiTreeNodeFlags_DefaultOpen)) {
+        bool en = app.moduleEnabled[i] != 0;
+        ImGui::PushID(int(i));
+
+        // Riga: interruttore + nome colorato secondo lo stato.
+        if (ImGui::Checkbox("##on", &en)) {
+            std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+            app.moduleEnabled[i] = en ? 1 : 0;
+            app.log(info.name, en ? "attivato" : "spento");
+        }
+        helpTip(en ? "Modulo attivo: sta elaborando il segnale."
+                   : "Modulo spento: non consuma CPU. Accendilo per usarlo.");
+        ImGui::SameLine();
+        ImGui::TextColored(en ? onCol : offCol, "%s", info.name.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled(en ? "attivo" : "spento");
+
+        // Dettagli e comandi solo quando il modulo e' acceso.
+        if (en) {
+            ImGui::Indent(10.0f);
             ImGui::TextDisabled("%s", info.description.c_str());
             uint16_t port = lm.module()->webPort();
-            if (port) ImGui::Text("Interfaccia web: http://localhost:%u", port);
+            if (port)
+                ImGui::Text("Interfaccia web: http://localhost:%u", port);
             if (info.preferredFreqHz > 0) {
+                double cur = app.freqMHz * 1e6;
+                bool onFreq =
+                    std::fabs(cur - info.preferredFreqHz) < app.sampleRate;
                 char lbl[64];
-                std::snprintf(lbl, sizeof(lbl), "Sintonizza (%.3f MHz)##%s",
-                              info.preferredFreqHz / 1e6, info.name.c_str());
-                // L'hardware e' uno solo: il modulo riceve davvero il suo
-                // segnale solo quando la chiavetta e' sulla sua frequenza.
+                std::snprintf(lbl, sizeof(lbl), "Sintonizza (%.3f MHz)",
+                              info.preferredFreqHz / 1e6);
                 if (ImGui::SmallButton(lbl)) {
                     std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
                     app.listenOffsetHz = 0.0; // il modulo vuole la banda intera
@@ -2281,11 +2323,20 @@ void drawModulesSection(AppState& app)
                     if (app.listenVfo) app.listenVfo->setOffset(0.0);
                     centerViewOnTuned(app);
                 }
+                if (!onFreq) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(1.0f, 0.71f, 0.33f, 1.0f),
+                                       "(fuori banda)");
+                    helpTip("La chiavetta non e' sulla frequenza del modulo: "
+                            "premi Sintonizza per riceverlo davvero.");
+                }
             }
             lm.module()->drawUi();
+            ImGui::Unindent(10.0f);
         }
+        ImGui::Separator();
+        ImGui::PopID();
     }
-    ImGui::Separator();
     ImGui::TextDisabled("Cockpit completo: http://localhost:%u",
                         app.cockpit.port());
 }
@@ -2752,6 +2803,9 @@ int main(int argc, char** argv)
     for (auto& e : loadErrors) app.log("Loader", e);
     for (auto& lm : app.modules) lm.module()->start(app);
     rebuildChannels(app);
+    // Moduli spenti all'avvio: l'app parte leggera, l'utente accende solo
+    // il decoder che gli serve (ognuno costa CPU quando riceve).
+    app.moduleEnabled.assign(app.modules.size(), 0);
 
     // Frequency manager: memorie accanto all'eseguibile.
     app.freqStorePath =
