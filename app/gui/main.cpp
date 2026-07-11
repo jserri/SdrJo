@@ -131,8 +131,9 @@ struct AppState : public sdrjo::IModuleHost {
     // Ricevitore d'ascolto: VFO spostabile con un click sullo spettro
     // + demodulatore selezionabile (indipendente dai moduli decoder).
     enum class ListenMode { Off, WfmStereo, Nfm, Am, Usb, Lsb };
-    ListenMode listenMode = ListenMode::Off;
+    ListenMode listenMode = ListenMode::Am; // all'avvio la radio parte in AM
     double listenOffsetHz = 0.0;
+    bool muted = false; // mute istantaneo (bottone accanto al volume)
     float volume = 0.8f;
     std::unique_ptr<sdrjo::dsp::Vfo> listenVfo;
     std::unique_ptr<sdrjo::dsp::WfmStereoDemodulator> wfmDemod;
@@ -283,6 +284,10 @@ struct AppState : public sdrjo::IModuleHost {
     // bloccante: durante il drag ne basterebbero 60/s per inchiodare).
     double pendingHwTuneHz = -1.0;
     std::chrono::steady_clock::time_point lastHwTune{};
+
+    // Al cambio di frequenza hardware: azzera cattura/waterfall cosi' lo
+    // spettro riflette SUBITO la nuova banda (niente residui vecchi).
+    std::atomic<bool> wfClearReq{false};
 
     void ensureAudio()
     {
@@ -567,7 +572,7 @@ void dspLoop(AppState& app)
                 app.filterR.process(app.audioR.data(), app.audioR.size());
                 tapAudio(app.audioL.data(), app.audioL.size());
                 feedTextDecoders(app.audioL.data(), app.audioL.size());
-                float g = app.squelchOpen ? app.volume : 0.0f;
+                float g = (app.squelchOpen && !app.muted) ? app.volume : 0.0f;
                 app.audioInterleaved.resize(app.audioL.size() * 2);
                 for (size_t i = 0; i < app.audioL.size(); i++) {
                     app.audioInterleaved[2 * i] = g * app.audioL[i];
@@ -608,7 +613,7 @@ void dspLoop(AppState& app)
                 tapAudio(app.audioMono.data(), app.audioMono.size());
                 feedTextDecoders(app.audioMono.data(),
                                  app.audioMono.size());
-                float g = app.squelchOpen ? app.volume : 0.0f;
+                float g = (app.squelchOpen && !app.muted) ? app.volume : 0.0f;
                 for (auto& v : app.audioMono) v *= g;
                 app.audio.writeMono(app.audioMono.data(),
                                     app.audioMono.size());
@@ -682,6 +687,17 @@ void resizeWaterfall(AppState& app, int rows)
 
 void uploadWaterfallTexture(AppState& app)
 {
+    // Cambio di banda: svuota la storia del waterfall (altrimenti resta
+    // in vista lo scorrimento della frequenza precedente).
+    if (app.wfClearReq.exchange(false)) {
+        std::lock_guard<std::mutex> lk(app.wfMutex);
+        std::fill(app.waterfall.begin(), app.waterfall.end(),
+                  app.rangeMinDb - 20.0f);
+        app.waterfallHead = 0;
+        app.wfNewRows.clear();
+        app.wfFullRedraw = true;
+    }
+
     // Righe nuove dal thread DSP (di norma 0 o 1 per frame video).
     static std::vector<int> newRows;
     newRows.clear();
@@ -763,7 +779,7 @@ void uploadWaterfallTexture(AppState& app)
 // Helper di sintonia definiti piu' avanti (usati anche dal pannello
 // Dispositivo per il campo Frequenza).
 void tuneAbsolute(AppState& app, double f);
-void requestHwCenter(AppState& app, double newCenter);
+void requestHwCenter(AppState& app, double newCenter, bool immediate);
 void centerViewOnTuned(AppState& app);
 
 void drawDeviceSection(AppState& app)
@@ -1067,20 +1083,32 @@ void keepTunedInView(AppState& app)
     app.viewCenterFrac = std::clamp(app.viewCenterFrac, half, 1.0 - half);
 }
 
-// Richiede all'hardware una nuova frequenza centrale (con limitatore:
-// max ~20/s, il resto si accoda cosi' il drag non blocca la GUI sull'USB).
-void requestHwCenter(AppState& app, double newCenter)
+// Azzera cattura e waterfall: chiamata quando l'hardware cambia banda,
+// cosi' lo spettro non mostra piu' i residui della frequenza precedente.
+void resetSpectrumAfterRetune(AppState& app)
 {
-    if (!app.source) {
-        app.freqMHz = newCenter / 1e6;
-        return;
-    }
+    app.captureFilled = 0;
+    app.capturePos = 0;
+    app.samplesSinceFft = 0;
+    app.wfClearReq.store(true);
+}
+
+// Richiede all'hardware una nuova frequenza centrale.
+// immediate = true (dial, campo MHz, modulo, click) risintonizza SUBITO,
+// senza limitatore: la sintonia deve rispondere all'istante.
+// immediate = false (drag/rotellina continui) usa il limitatore ~20/s
+// cosi' il flusso di comandi USB non inchioda la GUI.
+void requestHwCenter(AppState& app, double newCenter, bool immediate = false)
+{
+    bool moved = std::fabs(newCenter - app.freqMHz * 1e6) > 1.0;
     app.freqMHz = newCenter / 1e6;
+    if (!app.source) return;
     auto now = std::chrono::steady_clock::now();
-    if (now - app.lastHwTune > std::chrono::milliseconds(50)) {
+    if (immediate || now - app.lastHwTune > std::chrono::milliseconds(50)) {
         app.lastHwTune = now;
         app.source->setCenterFrequency(newCenter);
         app.pendingHwTuneHz = -1.0;
+        if (moved) resetSpectrumAfterRetune(app);
     } else {
         app.pendingHwTuneHz = newCenter;
     }
@@ -1116,7 +1144,7 @@ void tuneAbsolute(AppState& app, double f)
     f = std::clamp(f, 0.0, 1.999e9);
     double offset = antiDcOffset(app);
     app.listenOffsetHz = offset;
-    requestHwCenter(app, f - offset);
+    requestHwCenter(app, f - offset, /*immediate=*/true);
     if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
     keepTunedInView(app);
 }
@@ -1291,9 +1319,10 @@ void drawSpectrumPanel(AppState& app)
     // occupano tutta la parte destra (il resto vive nella sidebar).
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     const float sideW = std::clamp(vp->WorkSize.x * 0.24f, 300.0f, 420.0f);
+    const float stripW = 70.0f; // colonna leve/S-meter (finestra a parte)
     ImGui::SetNextWindowPos(ImVec2(sideW + 20, 10), ImGuiCond_Always);
     ImGui::SetNextWindowSize(
-        ImVec2(vp->WorkSize.x - sideW - 30, vp->WorkSize.y - 20),
+        ImVec2(vp->WorkSize.x - sideW - 40 - stripW, vp->WorkSize.y - 20),
         ImGuiCond_Always);
     ImGui::Begin("Spettro", nullptr,
                  ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
@@ -1365,9 +1394,10 @@ void drawSpectrumPanel(AppState& app)
     const float usableH = std::max(180.0f, avail.y - bandH - scaleH - splitH);
     float specH = std::clamp(usableH * app.wfSplit, 90.0f, usableH - 90.0f);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
-    // Colonna delle levette (Zoom/Contrasto/Range/Offset) a destra.
-    const float ctlW = 52.0f;
-    const float w = std::max(120.0f, avail.x - ctlW);
+    // Le levette Zoom/Contrasto/Range/Offset e l'S-meter verticale sono
+    // in una finestra dedicata a destra (drawRightStrip): qui lo spettro
+    // usa tutta la larghezza, senza sovrapposizioni col waterfall.
+    const float w = avail.x;
 
     const double centerHz = app.freqMHz * 1e6;
     const double f0 = centerHz - app.sampleRate / 2.0;
@@ -1409,6 +1439,7 @@ void drawSpectrumPanel(AppState& app)
 
     ImGui::InvisibleButton("##specarea", ImVec2(w, bandH + specH));
     bool hovSpec = ImGui::IsItemHovered();
+    bool activeSpec = ImGui::IsItemActive();
 
     const float dbMin = app.rangeMinDb, dbMax = app.rangeMaxDb;
     auto yOf = [&](float db) {
@@ -1576,35 +1607,10 @@ void drawSpectrumPanel(AppState& app)
         }
     }
 
-    // --- S-meter compatto nell'angolo alto-destra dello spettro ---
-    // Solo disegno (nessun costo di rilievo): barra + dBFS del canale.
-    if (app.listenMode != AppState::ListenMode::Off) {
-        const float mw = 150.0f, mh = 16.0f;
-        ImVec2 m0(s1.x - mw - 6, s0.y + 6);
-        ImVec2 m1(s1.x - 6, s0.y + 6 + mh);
-        dl->AddRectFilled(m0, m1,
-                          ImGui::GetColorU32(ImVec4(0, 0, 0, 0.55f)), 3.0f);
-        float lvl = std::clamp((app.chanLevelDb + 120.0f) / 120.0f, 0.0f,
-                               1.0f);
-        // Verde fino a S9 (~0.55), poi rosso: come il quadrante analogico.
-        for (int seg = 0; seg < 30; seg++) {
-            float t0 = seg / 30.0f;
-            if (t0 > lvl) break;
-            ImU32 c = t0 < 0.55f ? IM_COL32(60, 200, 90, 255)
-                                 : IM_COL32(220, 80, 60, 255);
-            float xa = m0.x + 3 + t0 * (mw - 6);
-            dl->AddRectFilled(ImVec2(xa, m0.y + 3),
-                              ImVec2(xa + (mw - 6) / 30.0f - 1, m1.y - 3), c);
-        }
-        char sTxt[24];
-        std::snprintf(sTxt, sizeof(sTxt), "S %.0f dB", double(app.chanLevelDb));
-        dl->AddText(ImVec2(m0.x + 6, m0.y + 1),
-                    ImGui::GetColorU32(ImVec4(0.9f, 0.95f, 1.0f, 0.9f)), sTxt);
-    }
-
     // --- Righello delle frequenze (cliccabile e trascinabile) ---
     ImGui::InvisibleButton("##freqscale", ImVec2(w, scaleH));
     bool hovScale = ImGui::IsItemHovered();
+    bool activeScale = ImGui::IsItemActive();
     {
         ImVec2 r0 = ImGui::GetItemRectMin();
         ImVec2 r1 = ImGui::GetItemRectMax();
@@ -1658,9 +1664,11 @@ void drawSpectrumPanel(AppState& app)
     ImVec2 wfAvail = ImGui::GetContentRegionAvail();
     ImVec2 wp = ImGui::GetCursorScreenPos();
     bool hovWf = false;
+    bool activeWf = false;
     if (wfAvail.y > 4.0f) {
         ImGui::InvisibleButton("##wfarea", wfAvail);
         hovWf = ImGui::IsItemHovered();
+        activeWf = ImGui::IsItemActive();
     }
     if (app.waterfallTex && wfAvail.y > 4.0f) {
         int rows, head;
@@ -1697,67 +1705,12 @@ void drawSpectrumPanel(AppState& app)
         }
     }
 
-    // --- Levette verticali stile SDR#: Zoom / Contrasto / Range / Offset ---
-    {
-        const float colX = p0.x + w + 8;
-        const float colH = avail.y - 4;
-        const float each = colH / 4.0f;
-        const float sliderH = std::max(30.0f, each - 20.0f);
-        ImU32 lblCol = ImGui::GetColorU32(ImVec4(0.55f, 0.65f, 0.75f, 0.9f));
-        auto place = [&](int i, const char* lbl) {
-            dl->AddText(ImVec2(colX - 2, p0.y + each * float(i)), lblCol,
-                        lbl);
-            ImGui::SetCursorScreenPos(
-                ImVec2(colX + 6, p0.y + each * float(i) + 16));
-        };
-
-        place(0, "Zoom");
-        float zoomV =
-            float(std::log(1.0 / app.viewSpanFrac) / std::log(200.0));
-        if (ImGui::VSliderFloat("##lvZoom", ImVec2(20, sliderH), &zoomV,
-                                0.0f, 1.0f, "")) {
-            app.viewSpanFrac = 1.0 / std::pow(200.0, double(zoomV));
-            centerViewOnTuned(app);
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Zoom %.1fx", 1.0 / app.viewSpanFrac);
-
-        place(1, "Contr");
-        if (ImGui::VSliderFloat("##lvContr", ImVec2(20, sliderH),
-                                &app.wfContrast, 0.3f, 3.0f, ""))
-            app.wfFullRedraw = true;
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Contrasto waterfall %.2f", app.wfContrast);
-
-        place(2, "Range");
-        float span = app.rangeMaxDb - app.rangeMinDb;
-        if (ImGui::VSliderFloat("##lvRange", ImVec2(20, sliderH), &span,
-                                20.0f, 140.0f, "")) {
-            app.rangeMinDb = app.rangeMaxDb - span;
-            app.wfFullRedraw = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Range %.0f dB", span);
-
-        place(3, "Offset");
-        float off = app.rangeMaxDb;
-        if (ImGui::VSliderFloat("##lvOffset", ImVec2(20, sliderH), &off,
-                                -60.0f, 10.0f, "")) {
-            float keepSpan = app.rangeMaxDb - app.rangeMinDb;
-            app.rangeMaxDb = off;
-            app.rangeMinDb = off - keepSpan;
-            app.wfFullRedraw = true;
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Tetto scala %.0f dB", app.rangeMaxDb);
-    }
-
     // --- Interazione di sintonia, comune a spettro/righello/waterfall ---
     // click  = sintonizza (snap) alla frequenza PREMUTA (non a quella al
     //          rilascio: cosi' un tremolio del mouse non sposta il tiro);
     // trascina             = sintonia continua ("afferri" lo spettro);
-    // rotellina            = zoom ancorato al cursore;
-    // Ctrl+rotellina (o rotellina sul righello) = passi di snap;
+    // rotellina            = cambia frequenza (passi di snap);
+    // Ctrl+rotellina o leva Zoom = ingrandisci;
     // doppio click         = centra l'hardware qui.
     static bool draggingTune = false;
     static bool dragMoved = false;
@@ -1765,21 +1718,27 @@ void drawSpectrumPanel(AppState& app)
     static double dragStartFreq = 0.0;
     static double pressFreq = 0.0;
 
+    // Le tre aree (spettro, righello, waterfall) sono unificate qui: il
+    // drag e' pilotato dallo stato "active" del pulsante ImGui su cui hai
+    // premuto (robusto: continua finche' tieni premuto, ovunque vada il
+    // mouse). Cosi' il trascinamento dal righello non "salta" piu'.
+    const bool anyActive = activeSpec || activeScale || activeWf;
     const bool tuneHover = (hovSpec || hovScale || hovWf) && !draggingBw;
-    if (tuneHover) {
+
+    if (tuneHover && !draggingTune) {
         double f = freqAt(mx);
-        // Guida verticale su tutta l'altezza: aiuta ad allineare spettro,
-        // righello e waterfall sulla stessa frequenza.
-        dl->AddLine(ImVec2(mx, s0.y), ImVec2(mx, wp.y + wfAvail.y),
-                    ImGui::GetColorU32(ImVec4(1, 1, 1, 0.25f)));
-        if (!draggingTune)
-            ImGui::SetTooltip(
-                "%.4f MHz\nclick: sintonizza (snap %.4g kHz)  "
-                "trascina: sintonia continua\n"
-                "rotellina: cambia frequenza (passi di snap)\n"
-                "Ctrl+rotellina o leva Zoom: ingrandisci  "
-                "doppio click: centra qui",
-                f / 1e6, app.snapHz / 1e3);
+        // Guida verticale di puntamento: solo al passaggio del mouse (non
+        // durante il click/drag), cosi' non resta "impressa" sullo spettro.
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+            dl->AddLine(ImVec2(mx, s0.y), ImVec2(mx, wp.y + wfAvail.y),
+                        ImGui::GetColorU32(ImVec4(1, 1, 1, 0.22f)));
+        ImGui::SetTooltip(
+            "%.4f MHz\nclick: sintonizza (snap %.4g kHz)  "
+            "trascina: sintonia continua\n"
+            "rotellina: cambia frequenza (passi di snap)\n"
+            "Ctrl+rotellina o leva Zoom: ingrandisci  "
+            "doppio click: centra qui",
+            f / 1e6, app.snapHz / 1e3);
 
         float wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.0f) {
@@ -1795,8 +1754,7 @@ void drawSpectrumPanel(AppState& app)
                 app.viewCenterFrac =
                     (newV0 + newSpan / 2.0 - f0) / (f1 - f0);
             } else {
-                // Rotellina = cambia frequenza a passi di snap (com'era
-                // richiesto): oltre il bordo l'hardware scorre da solo.
+                // Rotellina = cambia frequenza a passi di snap.
                 double cur = centerHz + app.listenOffsetHz;
                 double next = std::round((cur + double(wheel) * app.snapHz) /
                                          app.snapHz) * app.snapHz;
@@ -1805,26 +1763,26 @@ void drawSpectrumPanel(AppState& app)
         }
 
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-            draggingTune = false;
             double snapped = std::round(f / app.snapHz) * app.snapHz;
             applyTunedFrequency(app, snapped, /*forceHwRetune=*/true);
-        } else if (!nearEdge && !draggingTune &&
-                   ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        } else if (!nearEdge && anyActive) {
+            // Premuto su una delle tre aree: inizia il drag/click di sintonia.
             draggingTune = true;
             dragMoved = false;
             dragStartX = mx;
             dragStartFreq = centerHz + app.listenOffsetHz;
-            pressFreq = f; // frequenza sotto il mouse ADESSO
+            pressFreq = f;
         }
     }
 
-    // Trascinamento attivo: continua anche se il cursore esce dall'area.
+    // Drag attivo: prosegue finche' il tasto resta premuto, anche se il
+    // cursore esce dall'area di partenza.
     if (draggingTune) {
         if (ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
             float dx = mx - dragStartX;
             if (std::fabs(dx) > 5.0f) dragMoved = true;
             if (dragMoved) {
-                // Trascini lo spettro: mouse a destra = frequenze piu' basse.
+                // "Afferri" lo spettro: mouse a destra = frequenze piu' basse.
                 double hzPerPx = (v1 - v0) / double(w);
                 applyTunedFrequency(app, dragStartFreq - double(dx) * hzPerPx);
             }
@@ -1838,6 +1796,108 @@ void drawSpectrumPanel(AppState& app)
             draggingTune = false;
         }
     }
+    ImGui::End();
+}
+
+// Colonna a destra dello spettro (finestra a parte, cosi' i controlli
+// NON finiscono sopra il waterfall e restano sempre cliccabili): levette
+// verticali Zoom/Contrasto/Range/Offset + S-meter verticale in fondo.
+void drawRightStrip(AppState& app)
+{
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float stripW = 70.0f;
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkSize.x - stripW - 10, 10),
+                            ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(stripW, vp->WorkSize.y - 20),
+                             ImGuiCond_Always);
+    ImGui::Begin("Vista", nullptr,
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                     ImGuiWindowFlags_NoScrollWithMouse);
+
+    const float availH = ImGui::GetContentRegionAvail().y;
+    // 4 levette in alto, S-meter in basso: ognuna con etichetta + slider.
+    const float sliderH = std::max(40.0f, (availH - 130.0f) / 4.0f - 18.0f);
+    auto label = [](const char* t) {
+        float wv = ImGui::GetContentRegionAvail().x;
+        float tw = ImGui::CalcTextSize(t).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             std::max(0.0f, (wv - tw) * 0.5f));
+        ImGui::TextUnformatted(t);
+    };
+    auto centerSlider = [](float wide) {
+        float wv = ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                             std::max(0.0f, (wv - wide) * 0.5f));
+    };
+
+    label("Zoom");
+    centerSlider(24);
+    float zoomV = float(std::log(1.0 / app.viewSpanFrac) / std::log(200.0));
+    if (ImGui::VSliderFloat("##lvZoom", ImVec2(24, sliderH), &zoomV, 0.0f,
+                            1.0f, "")) {
+        app.viewSpanFrac = 1.0 / std::pow(200.0, double(zoomV));
+        centerViewOnTuned(app);
+    }
+    helpTip("Ingrandimento dello spettro attorno alla frequenza "
+            "sintonizzata.");
+
+    label("Contr");
+    centerSlider(24);
+    if (ImGui::VSliderFloat("##lvContr", ImVec2(24, sliderH), &app.wfContrast,
+                            0.3f, 3.0f, ""))
+        app.wfFullRedraw = true;
+    helpTip("Contrasto del waterfall (curva dei colori).");
+
+    label("Range");
+    centerSlider(24);
+    float span = app.rangeMaxDb - app.rangeMinDb;
+    if (ImGui::VSliderFloat("##lvRange", ImVec2(24, sliderH), &span, 20.0f,
+                            140.0f, "")) {
+        app.rangeMinDb = app.rangeMaxDb - span;
+        app.wfFullRedraw = true;
+    }
+    helpTip("Ampiezza della scala dB mostrata (dinamica).");
+
+    label("Offset");
+    centerSlider(24);
+    float off = app.rangeMaxDb;
+    if (ImGui::VSliderFloat("##lvOffset", ImVec2(24, sliderH), &off, -60.0f,
+                            10.0f, "")) {
+        float keepSpan = app.rangeMaxDb - app.rangeMinDb;
+        app.rangeMaxDb = off;
+        app.rangeMinDb = off - keepSpan;
+        app.wfFullRedraw = true;
+    }
+    helpTip("Sposta in alto/basso la scala dB (tetto del fondoscala).");
+
+    // S-meter verticale in fondo: barra a colori + valore, non tocca lo
+    // spettro (e' in questa finestra separata).
+    ImGui::Spacing();
+    label("S-meter");
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float wv = ImGui::GetContentRegionAvail().x;
+    float barW = 26.0f, barH = std::max(60.0f, availH - ImGui::GetCursorPosY());
+    if (barH > 120.0f) barH = 120.0f;
+    float bx = p.x + std::max(0.0f, (wv - barW) * 0.5f);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(bx, p.y), ImVec2(bx + barW, p.y + barH),
+                      IM_COL32(20, 22, 28, 255), 3.0f);
+    float lvl = std::clamp((app.chanLevelDb + 120.0f) / 120.0f, 0.0f, 1.0f);
+    for (int seg = 0; seg < 24; seg++) {
+        float t0 = seg / 24.0f;
+        if (t0 > lvl) break;
+        ImU32 c = t0 < 0.55f ? IM_COL32(60, 200, 90, 255)
+                             : IM_COL32(220, 80, 60, 255);
+        float ya = p.y + barH - 2 - (t0 + 1.0f / 24.0f) * (barH - 4);
+        dl->AddRectFilled(ImVec2(bx + 2, ya),
+                          ImVec2(bx + barW - 2, ya + (barH - 4) / 24.0f - 1),
+                          c);
+    }
+    ImGui::Dummy(ImVec2(barW, barH + 2));
+    char sTxt[16];
+    std::snprintf(sTxt, sizeof(sTxt), "%.0f", double(app.chanLevelDb));
+    label(sTxt);
+
     ImGui::End();
 }
 
@@ -1856,15 +1916,13 @@ void drawReceiverSection(AppState& app)
     modeChanged |= ImGui::RadioButton("WFM", &mode, 1);
     ImGui::SameLine(78);
     modeChanged |= ImGui::RadioButton("LSB", &mode, 5);
-    ImGui::SameLine(156);
-    modeChanged |= ImGui::RadioButton("Spento", &mode, 0);
     if (modeChanged) {
         app.listenMode = AppState::ListenMode(mode);
         rebuildListener(app);
     }
     helpTip("Tipo di demodulazione: WFM per la radio FM, NFM per apparati "
             "e servizi, AM per aereo/onde medie, USB/LSB per SSB e "
-            "radioamatori.");
+            "radioamatori. Per silenziare usa Mute (accanto al volume).");
     if (app.listenMode != AppState::ListenMode::Off) {
         ImGui::Text("VFO %.4f MHz  banda %.1f kHz",
                     (app.freqMHz * 1e6 + app.listenOffsetHz) / 1e6,
@@ -1875,7 +1933,13 @@ void drawReceiverSection(AppState& app)
                                                              : "mono");
         }
     }
-    ImGui::SliderFloat("Volume", &app.volume, 0.0f, 1.5f, "%.2f");
+
+    // Mute istantaneo accanto al volume.
+    if (ImGui::Button(app.muted ? "Muto" : "Audio")) app.muted = !app.muted;
+    helpTip("Mute istantaneo dell'audio (non tocca il volume impostato).");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(-1);
+    ImGui::SliderFloat("##Volume", &app.volume, 0.0f, 1.5f, "vol %.2f");
     helpTip("Volume dell'audio in uscita (fino a 1.5x per i segnali "
             "deboli; oltre 1.0 puo' distorcere se il segnale e' forte).");
 
@@ -2176,7 +2240,8 @@ void drawModulesSection(AppState& app)
                 if (ImGui::SmallButton(lbl)) {
                     std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
                     app.listenOffsetHz = 0.0; // il modulo vuole la banda intera
-                    requestHwCenter(app, info.preferredFreqHz);
+                    requestHwCenter(app, info.preferredFreqHz,
+                                    /*immediate=*/true);
                     if (app.listenVfo) app.listenVfo->setOffset(0.0);
                     centerViewOnTuned(app);
                 }
@@ -2749,6 +2814,9 @@ int main(int argc, char** argv)
         app.log("Replay", std::string(argv[1]));
     }
 
+    // La radio parte in AM: costruisci la catena d'ascolto all'avvio.
+    rebuildListener(app);
+
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
@@ -2789,6 +2857,7 @@ int main(int argc, char** argv)
                 app.lastHwTune = std::chrono::steady_clock::now();
                 app.source->setCenterFrequency(app.pendingHwTuneHz);
                 app.pendingHwTuneHz = -1.0;
+                resetSpectrumAfterRetune(app);
             }
         }
 
@@ -2805,6 +2874,7 @@ int main(int argc, char** argv)
 
         drawSidebar(app);
         drawSpectrumPanel(app);
+        drawRightStrip(app);
 
         ImGui::Render();
         int w, h;

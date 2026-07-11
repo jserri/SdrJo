@@ -132,6 +132,21 @@ Fatti (6a tornata, rifiniture d'uso):
 - ✅ Audio web **meno a scatti**: jitter buffer piu' ampio (~0.22 s) con
   recupero degli underrun.
 
+Fatti (7a tornata, correzioni d'uso):
+
+- ✅ Cambio frequenza (dial/campo/modulo) ora risintonizza l'hardware
+  SUBITO (senza limitatore) e azzera cattura+waterfall: lo spettro segue
+  all'istante, niente piu' "resta sulla vecchia frequenza".
+- ✅ Levette Zoom/Contrasto/Range/Offset e S-meter verticale in una
+  finestra dedicata a destra: non stanno piu' sopra il waterfall, quindi
+  Range/Offset tornano cliccabili (era un bug).
+- ✅ Drag dal righello reso solido (pilotato dallo stato del pulsante,
+  non solo dall'hover): non "salta" piu' sullo spettro.
+- ✅ La riga sottile di puntamento sparisce al click/drag (niente piu'
+  sovraimpressione).
+- ✅ Bottone Mute istantaneo accanto al volume; tolto "Spento" dai modi;
+  la radio parte in AM.
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).
