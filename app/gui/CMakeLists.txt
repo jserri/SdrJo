@@ -35,6 +35,7 @@ add_executable(sdrjo WIN32 main.cpp)
 target_link_libraries(sdrjo PRIVATE
     sdrjo-core
     adsb-decoder
+    morse-decoder
     imgui-backend
     OpenGL::GL
 )

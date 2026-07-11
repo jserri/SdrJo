@@ -60,6 +60,15 @@ public:
         server_.setAuth("sdrjo", password);
     }
 
+    // Coordinate dello streaming WebSocket a bassa latenza: la pagina le
+    // legge da /api/wsinfo (che passa dalla stessa autenticazione).
+    void setWsInfo(uint16_t wsPort, const std::string& wsToken)
+    {
+        std::lock_guard<std::mutex> lk(devMutex_);
+        wsPort_ = wsPort;
+        wsToken_ = wsToken;
+    }
+
     bool start(uint16_t port = kDefaultPort, bool bindAll = false);
     void stop();
     uint16_t port() const { return server_.port(); }
@@ -83,6 +92,8 @@ private:
     double rateHz_ = 0.0;
     double vfoHz_ = 0.0;
     std::string vfoMode_ = "Spento";
+    uint16_t wsPort_ = 0;
+    std::string wsToken_;
 
     // Code audio per-client (16 bit, 48 kHz mono).
     std::mutex audioMutex_;

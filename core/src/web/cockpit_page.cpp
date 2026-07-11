@@ -167,22 +167,99 @@ function renderChips() {
     c.onclick = () => control("mode=" + encodeURIComponent(c.dataset.mode));
 }
 
-// Ascolto nel browser: stream WAV senza fine da /api/audio.wav.
-let player = null;
+// Ascolto nel browser: prima si prova il WebSocket a bassa latenza
+// (blocchi ADPCM da 20 ms, 4:1 di banda), altrimenti WAV classico.
+let player = null, ws = null, actx = null, playT = 0;
 const playBtn = document.getElementById("playBtn");
-playBtn.onclick = () => {
-  if (player) {
-    player.pause();
-    player.src = "";
-    player = null;
-    playBtn.classList.remove("playing");
-    playBtn.innerHTML = "&#9654; Ascolta";
-  } else {
-    player = new Audio("api/audio.wav?t=" + Date.now());
-    player.play().catch(() => {});
-    playBtn.classList.add("playing");
-    playBtn.innerHTML = "&#9632; Stop";
+
+const ADPCM_STEP = [7,8,9,10,11,12,13,14,16,17,19,21,23,25,28,31,34,37,41,
+  45,50,55,60,66,73,80,88,97,107,118,130,143,157,173,190,209,230,253,279,
+  307,337,371,408,449,494,544,598,658,724,796,876,963,1060,1166,1282,1411,
+  1552,1707,1878,2066,2272,2499,2749,3024,3327,3660,4026,4428,4871,5358,
+  5894,6484,7132,7845,8630,9493,10442,11487,12635,13899,15289,16818,18500,
+  20350,22385,24623,27086,29794,32767];
+const ADPCM_IDX = [-1,-1,-1,-1,2,4,6,8,-1,-1,-1,-1,2,4,6,8];
+
+function adpcmDecode(u8) {
+  if (u8.length < 5) return new Float32Array(0);
+  let pred = u8[0] | (u8[1] << 8);
+  if (pred & 0x8000) pred -= 0x10000;
+  let idx = Math.min(88, u8[2]);
+  const out = new Float32Array((u8.length - 4) * 2);
+  let o = 0;
+  for (let i = 4; i < u8.length; i++) {
+    for (const code of [u8[i] & 15, u8[i] >> 4]) {
+      const step = ADPCM_STEP[idx];
+      let delta = step >> 3;
+      if (code & 4) delta += step;
+      if (code & 2) delta += step >> 1;
+      if (code & 1) delta += step >> 2;
+      pred += (code & 8) ? -delta : delta;
+      pred = Math.max(-32768, Math.min(32767, pred));
+      idx = Math.max(0, Math.min(88, idx + ADPCM_IDX[code]));
+      out[o++] = pred / 32767;
+    }
   }
+  return out;
+}
+
+function stopAudio() {
+  if (ws) { const w = ws; ws = null; w.close(); }
+  if (actx) { actx.close(); actx = null; }
+  if (player) { player.pause(); player.src = ""; player = null; }
+  playBtn.classList.remove("playing");
+  playBtn.innerHTML = "&#9654; Ascolta";
+}
+
+async function startWsAudio() {
+  const r = await fetch("api/wsinfo");
+  if (!r.ok) throw new Error("no wsinfo");
+  const info = await r.json();
+  if (!info.port) throw new Error("ws spento");
+  actx = new (window.AudioContext || window.webkitAudioContext)(
+      {sampleRate: 48000});
+  playT = 0;
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const sock = new WebSocket(
+      proto + "://" + location.hostname + ":" + info.port +
+      "/?token=" + encodeURIComponent(info.token));
+  sock.binaryType = "arraybuffer";
+  await new Promise((res, rej) => {
+    sock.onopen = res;
+    sock.onerror = rej;
+    setTimeout(rej, 3000);
+  });
+  ws = sock;
+  sock.onmessage = (ev) => {
+    if (!actx) return;
+    const pcm = adpcmDecode(new Uint8Array(ev.data));
+    if (!pcm.length) return;
+    const buf = actx.createBuffer(1, pcm.length, 48000);
+    buf.getChannelData(0).set(pcm);
+    const src = actx.createBufferSource();
+    src.buffer = buf;
+    src.connect(actx.destination);
+    const now = actx.currentTime;
+    if (playT < now + 0.04) playT = now + 0.08; // riaggancio dolce
+    src.start(playT);
+    playT += buf.duration;
+  };
+  sock.onclose = () => { if (ws === sock) stopAudio(); };
+  playBtn.classList.add("playing");
+  playBtn.innerHTML = "&#9632; Stop (bassa latenza)";
+}
+
+function startWavAudio() {
+  player = new Audio("api/audio.wav?t=" + Date.now());
+  player.play().catch(() => {});
+  playBtn.classList.add("playing");
+  playBtn.innerHTML = "&#9632; Stop";
+}
+
+playBtn.onclick = async () => {
+  if (player || ws) { stopAudio(); return; }
+  try { await startWsAudio(); }
+  catch (e) { if (actx) { actx.close(); actx = null; } startWavAudio(); }
 };
 const bandColors = { ham: "#3ddc97", bc: "#38b6ff", aero: "#ffb454",
   sat: "#c792ea", marine: "#4dd0e1", ism: "#f47067", cb: "#ffd166",

@@ -85,3 +85,11 @@ add_test(NAME sensors433 COMMAND test_sensors433)
 add_executable(test_fft_window test_fft_window.cpp)
 target_link_libraries(test_fft_window PRIVATE sdrjo-core)
 add_test(NAME fft_window COMMAND test_fft_window)
+
+add_executable(test_ws_audio test_ws_audio.cpp)
+target_link_libraries(test_ws_audio PRIVATE sdrjo-core)
+add_test(NAME ws_audio COMMAND test_ws_audio)
+
+add_executable(test_rtty test_rtty.cpp)
+target_link_libraries(test_rtty PRIVATE sdrjo-core)
+add_test(NAME rtty COMMAND test_rtty)

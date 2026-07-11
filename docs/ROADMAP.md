@@ -101,12 +101,28 @@ Fatti (4a tornata):
   temperatura/umidita' stile rtl_433).
 - ✅ Replay dei file IQ **in loop** (prima si fermava a fine file).
 
+Fatti (5a tornata):
+
+- ✅ **Audio a bassa latenza nel Cockpit**: WebSocket + IMA ADPCM (4:1,
+  blocchi da 20 ms), token nuovo a ogni avvio consegnato da `/api/wsinfo`;
+  fallback automatico al WAV se il browser/rete non regge. ~100 ms contro
+  i ~2 s del WAV.
+- ✅ Controlli **stile SDR#** a fianco dello spettro: levette verticali
+  **Zoom / Contrasto / Range / Offset** (il contrasto e' una gamma sulla
+  palette del waterfall).
+- ✅ Demodulatore a **radio button** (un click, niente tendina).
+- ✅ **Larghezza in kHz mostrata** mentre trascini i bordi della banda
+  (e passando il mouse sopra la banda), come SDR#.
+- ✅ **Decoder di testi** integrati (stile fldigi): **CW/Morse** (con tono
+  regolabile) e **RTTY** Baudot 45.45 (mark 2125 / shift 170, invertibile)
+  sul canale d'ascolto, testo scorrevole nella sidebar.
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).
 - Scarico automatico dei TLE (serve HTTPS) e piu' protocolli 433 MHz
   (Oregon Scientific, TFA, TPMS...).
-- Cockpit: audio Opus/WebSocket per latenza e banda migliori (oggi WAV).
+- Altri modi digitali: PSK31, FT8, SSTV (sulla catena del decoder testi).
 - VFO con offset regolabile per modulo dalla GUI (oggi centrati).
 - Registratore pianificato (parte da solo al passaggio del satellite).
 - MSIX per il Microsoft Store.

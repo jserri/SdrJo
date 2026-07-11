@@ -22,6 +22,12 @@ CockpitServer::CockpitServer()
                   [this](const std::string& q) { return controlJson(q); });
     server_.streamRoute("/api/audio.wav", "audio/wav",
                         [this](HttpServer::StreamWriter& w) { audioStream(w); });
+    server_.route("/api/wsinfo", "application/json",
+                  [this](const std::string&) {
+                      std::lock_guard<std::mutex> lk(devMutex_);
+                      return "{\"port\":" + std::to_string(wsPort_) +
+                             ",\"token\":\"" + wsToken_ + "\"}";
+                  });
 }
 
 void CockpitServer::setVfoInfo(double freqHz, const std::string& mode)

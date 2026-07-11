@@ -23,8 +23,11 @@
 #include <sdrjo/dsp/wfm_stereo.hpp>
 #include <sdrjo/module/module_loader.hpp>
 #include <sdrjo/dsp/audio_filters.hpp>
+#include <sdrjo/dsp/rtty.hpp>
+#include <sdrjo/morse/cw_decoder.hpp>
 #include <sdrjo/sat/orbit.hpp>
 #include <sdrjo/sat/tle.hpp>
+#include <sdrjo/web/ws_audio_server.hpp>
 #include <sdrjo/util/frequency_store.hpp>
 #include <sdrjo/util/geolocate.hpp>
 #include <sdrjo/util/iq_recorder.hpp>
@@ -45,6 +48,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -88,6 +92,7 @@ struct AppState : public sdrjo::IModuleHost {
     // Regolazioni di spettro e waterfall.
     float rangeMinDb = -110.0f;      // fondo scala (luminosita')
     float rangeMaxDb = -10.0f;       // tetto scala (contrasto)
+    float wfContrast = 1.0f;         // gamma della palette (slider laterale)
     int fftWindow = 0;               // 0 = Hann, 1 = Blackman-Harris
     int wfRows = kWaterfallRows;     // memoria del waterfall (righe)
     int wfSpeedDiv = 4;              // 1 riga ogni N FFT (velocita')
@@ -100,6 +105,7 @@ struct AppState : public sdrjo::IModuleHost {
     std::mutex logMutex;
 
     sdrjo::CockpitServer cockpit;
+    sdrjo::WsAudioServer wsAudio; // streaming a bassa latenza (ADPCM)
     std::mutex spectrumMutex; // lo spettro e' letto anche dal thread HTTP
 
     // Canalizzazione: un VFO per ogni modulo che chiede un rate diverso
@@ -184,6 +190,37 @@ struct AppState : public sdrjo::IModuleHost {
     bool scanPaused = false;
     std::chrono::steady_clock::time_point scanLastHop{}, scanSigLost{};
     sdrjo::WavWriter scanWav;
+
+    // Decoder di testi (CW/RTTY) sull'audio del canale d'ascolto,
+    // stile fldigi. Stato protetto da dspMutex.
+    // Passa-banda stretto per il CW: risonatore complesso sul tono.
+    struct ToneEnvelope {
+        float cRe = 1, cIm = 0, re = 0, im = 0, alpha = 0.01f;
+        void configure(double freqHz, double rate)
+        {
+            double w = 2.0 * 3.14159265358979323846 * freqHz / rate;
+            cRe = float(std::cos(w));
+            cIm = float(-std::sin(w));
+            alpha = float(1.0 - std::exp(-2.0 * 3.14159265358979323846 *
+                                         120.0 / rate));
+            re = im = 0;
+        }
+        float step(float x)
+        {
+            float nre = re * cRe - im * cIm;
+            float nim = re * cIm + im * cRe;
+            re = nre + alpha * (x - nre);
+            im = nim - alpha * nim;
+            return std::sqrt(re * re + im * im);
+        }
+    };
+    int textDecoderMode = 0; // 0 spento, 1 CW, 2 RTTY
+    float cwToneHz = 700.0f;
+    bool rttyReverse = false;
+    ToneEnvelope cwTone;
+    std::unique_ptr<sdrjo::morse::CwDecoder> cwDecoder;
+    std::unique_ptr<sdrjo::dsp::RttyDecoder> rttyDecoder;
+    std::string decodedText;
 
     // Satelliti: TLE, passaggi calcolati e inseguimento Doppler.
     std::vector<sdrjo::sat::Tle> tles;
@@ -290,6 +327,19 @@ void rebuildChannels(AppState& app)
         }
         app.channels.push_back(std::move(ch));
     }
+}
+
+// Token casuale per lo streaming WebSocket (nuovo a ogni avvio).
+std::string randomToken()
+{
+    std::random_device rd;
+    static const char* kHex = "0123456789abcdef";
+    std::string t;
+    for (int i = 0; i < 8; i++) {
+        uint32_t v = rd();
+        for (int k = 0; k < 4; k++) t += kHex[(v >> (k * 4)) & 15];
+    }
+    return t;
 }
 
 // Config minimale (chiave=valore) accanto all'eseguibile.
@@ -486,6 +536,19 @@ void dspLoop(AppState& app)
                 }
             };
 
+            // Decoder di testi (CW/RTTY) sull'audio demodulato.
+            auto feedTextDecoders = [&app](const float* s, size_t n) {
+                if (app.textDecoderMode == 1 && app.cwDecoder) {
+                    static std::vector<float> env;
+                    env.resize(n);
+                    for (size_t i = 0; i < n; i++)
+                        env[i] = app.cwTone.step(s[i]);
+                    app.cwDecoder->processAudio(env.data(), n);
+                } else if (app.textDecoderMode == 2 && app.rttyDecoder) {
+                    app.rttyDecoder->processAudio(s, n);
+                }
+            };
+
             app.ensureAudio();
             if (app.wfmDemod) {
                 app.audioL.clear();
@@ -495,6 +558,7 @@ void dspLoop(AppState& app)
                 app.filterL.process(app.audioL.data(), app.audioL.size());
                 app.filterR.process(app.audioR.data(), app.audioR.size());
                 tapAudio(app.audioL.data(), app.audioL.size());
+                feedTextDecoders(app.audioL.data(), app.audioL.size());
                 float g = app.squelchOpen ? app.volume : 0.0f;
                 app.audioInterleaved.resize(app.audioL.size() * 2);
                 for (size_t i = 0; i < app.audioL.size(); i++) {
@@ -510,6 +574,7 @@ void dspLoop(AppState& app)
                     mix[i] = 0.5f * (app.audioInterleaved[2 * i] +
                                      app.audioInterleaved[2 * i + 1]);
                 app.cockpit.pushAudio(mix.data(), mix.size());
+                app.wsAudio.pushAudio(mix.data(), mix.size());
                 if (app.scanWav.isOpen())
                     app.scanWav.write(mix.data(), mix.size());
             } else {
@@ -533,11 +598,15 @@ void dspLoop(AppState& app)
                 app.filterL.process(app.audioMono.data(),
                                     app.audioMono.size());
                 tapAudio(app.audioMono.data(), app.audioMono.size());
+                feedTextDecoders(app.audioMono.data(),
+                                 app.audioMono.size());
                 float g = app.squelchOpen ? app.volume : 0.0f;
                 for (auto& v : app.audioMono) v *= g;
                 app.audio.writeMono(app.audioMono.data(),
                                     app.audioMono.size());
                 app.cockpit.pushAudio(app.audioMono.data(),
+                                      app.audioMono.size());
+                app.wsAudio.pushAudio(app.audioMono.data(),
                                       app.audioMono.size());
                 if (app.scanWav.isOpen())
                     app.scanWav.write(app.audioMono.data(),
@@ -619,8 +688,11 @@ void uploadWaterfallTexture(AppState& app)
     const float lo = app.rangeMinDb;
     const float span = std::max(1.0f, app.rangeMaxDb - app.rangeMinDb);
     const int palette = app.wfPalette;
+    // Contrasto (levetta laterale): curva gamma sulla mappa dei colori.
+    const float gamma = 1.0f / std::max(0.25f, app.wfContrast);
     auto colorize = [&](float db) -> uint32_t {
         float t = std::clamp((db - lo) / span, 0.0f, 1.0f);
+        t = std::pow(t, gamma);
         uint8_t r, g, b;
         switch (palette) {
         case 1: // grigi
@@ -1235,7 +1307,9 @@ void drawSpectrumPanel(AppState& app)
     const float usableH = std::max(180.0f, avail.y - bandH - scaleH - splitH);
     float specH = std::clamp(usableH * app.wfSplit, 90.0f, usableH - 90.0f);
     ImVec2 p0 = ImGui::GetCursorScreenPos();
-    const float w = avail.x;
+    // Colonna delle levette (Zoom/Contrasto/Range/Offset) a destra.
+    const float ctlW = 52.0f;
+    const float w = std::max(120.0f, avail.x - ctlW);
 
     const double centerHz = app.freqMHz * 1e6;
     const double f0 = centerHz - app.sampleRate / 2.0;
@@ -1406,8 +1480,8 @@ void drawSpectrumPanel(AppState& app)
         dl->AddLine(ImVec2(vfoX1, s0.y), ImVec2(vfoX1, s1.y), vfoColSoft);
 
         // Trascinamento dei bordi = cambia la larghezza del canale.
-        nearEdge = hovSpec && (std::fabs(mx - vfoX0) < 6.0f ||
-                               std::fabs(mx - vfoX1) < 6.0f);
+        nearEdge = hovSpec && (std::fabs(mx - vfoX0) < 8.0f ||
+                               std::fabs(mx - vfoX1) < 8.0f);
         if (nearEdge || draggingBw)
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         if (nearEdge && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -1423,6 +1497,24 @@ void drawSpectrumPanel(AppState& app)
                 draggingBw = false;
                 rebuildChanFilter(app); // applica la nuova larghezza
             }
+        }
+
+        // Larghezza in chiaro (come SDR#): appare mentre trascini un bordo
+        // o comunque quando il mouse e' sopra la banda del VFO, cosi' vedi
+        // subito quanti kHz stai per selezionare.
+        bool overBand = hovSpec && mx >= std::min(vfoX0, vfoX1) - 8.0f &&
+                        mx <= std::max(vfoX0, vfoX1) + 8.0f;
+        if (draggingBw || nearEdge || overBand) {
+            char bwLbl[32];
+            std::snprintf(bwLbl, sizeof(bwLbl), "%.1f kHz",
+                          app.listenBwHz / 1e3);
+            ImVec2 sz = ImGui::CalcTextSize(bwLbl);
+            ImVec2 tp(xOf(vfoHz) - sz.x / 2, s0.y + 4);
+            dl->AddRectFilled(ImVec2(tp.x - 4, tp.y - 2),
+                              ImVec2(tp.x + sz.x + 4, tp.y + sz.y + 2),
+                              ImGui::GetColorU32(ImVec4(0, 0, 0, 0.65f)),
+                              3.0f);
+            dl->AddText(tp, vfoCol, bwLbl);
         }
     }
 
@@ -1521,6 +1613,61 @@ void drawSpectrumPanel(AppState& app)
         }
     }
 
+    // --- Levette verticali stile SDR#: Zoom / Contrasto / Range / Offset ---
+    {
+        const float colX = p0.x + w + 8;
+        const float colH = avail.y - 4;
+        const float each = colH / 4.0f;
+        const float sliderH = std::max(30.0f, each - 20.0f);
+        ImU32 lblCol = ImGui::GetColorU32(ImVec4(0.55f, 0.65f, 0.75f, 0.9f));
+        auto place = [&](int i, const char* lbl) {
+            dl->AddText(ImVec2(colX - 2, p0.y + each * float(i)), lblCol,
+                        lbl);
+            ImGui::SetCursorScreenPos(
+                ImVec2(colX + 6, p0.y + each * float(i) + 16));
+        };
+
+        place(0, "Zoom");
+        float zoomV =
+            float(std::log(1.0 / app.viewSpanFrac) / std::log(200.0));
+        if (ImGui::VSliderFloat("##lvZoom", ImVec2(20, sliderH), &zoomV,
+                                0.0f, 1.0f, "")) {
+            app.viewSpanFrac = 1.0 / std::pow(200.0, double(zoomV));
+            centerViewOnTuned(app);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Zoom %.1fx", 1.0 / app.viewSpanFrac);
+
+        place(1, "Contr");
+        if (ImGui::VSliderFloat("##lvContr", ImVec2(20, sliderH),
+                                &app.wfContrast, 0.3f, 3.0f, ""))
+            app.wfFullRedraw = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Contrasto waterfall %.2f", app.wfContrast);
+
+        place(2, "Range");
+        float span = app.rangeMaxDb - app.rangeMinDb;
+        if (ImGui::VSliderFloat("##lvRange", ImVec2(20, sliderH), &span,
+                                20.0f, 140.0f, "")) {
+            app.rangeMinDb = app.rangeMaxDb - span;
+            app.wfFullRedraw = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Range %.0f dB", span);
+
+        place(3, "Offset");
+        float off = app.rangeMaxDb;
+        if (ImGui::VSliderFloat("##lvOffset", ImVec2(20, sliderH), &off,
+                                -60.0f, 10.0f, "")) {
+            float keepSpan = app.rangeMaxDb - app.rangeMinDb;
+            app.rangeMaxDb = off;
+            app.rangeMinDb = off - keepSpan;
+            app.wfFullRedraw = true;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Tetto scala %.0f dB", app.rangeMaxDb);
+    }
+
     // --- Interazione di sintonia, comune a spettro/righello/waterfall ---
     // click  = sintonizza (snap) alla frequenza PREMUTA (non a quella al
     //          rilascio: cosi' un tremolio del mouse non sposta il tiro);
@@ -1611,8 +1758,20 @@ void drawReceiverSection(AppState& app)
 {
     drawSMeter(app);
 
+    // Demodulatore a scelta rapida (stile SDR#): un click, niente tendina.
     int mode = int(app.listenMode);
-    if (ImGui::Combo("Demodulatore", &mode, kListenModeNames, 6)) {
+    bool modeChanged = false;
+    modeChanged |= ImGui::RadioButton("NFM", &mode, 2);
+    ImGui::SameLine(78);
+    modeChanged |= ImGui::RadioButton("AM", &mode, 3);
+    ImGui::SameLine(156);
+    modeChanged |= ImGui::RadioButton("USB", &mode, 4);
+    modeChanged |= ImGui::RadioButton("WFM", &mode, 1);
+    ImGui::SameLine(78);
+    modeChanged |= ImGui::RadioButton("LSB", &mode, 5);
+    ImGui::SameLine(156);
+    modeChanged |= ImGui::RadioButton("Spento", &mode, 0);
+    if (modeChanged) {
         app.listenMode = AppState::ListenMode(mode);
         rebuildListener(app);
     }
@@ -1705,6 +1864,7 @@ void drawReceiverSection(AppState& app)
 // Definite piu' avanti; nella sidebar compaiono come menu a tendina.
 void drawAudioSection(AppState& app);
 void drawAudioSpectrumSection(AppState& app);
+void drawTextDecoderSection(AppState& app);
 void drawScannerSection(AppState& app);
 void drawSatellitesSection(AppState& app);
 void drawFrequenciesSection(AppState& app);
@@ -1729,6 +1889,8 @@ void drawSidebar(AppState& app)
         drawReceiverSection(app);
     if (ImGui::CollapsingHeader("Spettro audio"))
         drawAudioSpectrumSection(app);
+    if (ImGui::CollapsingHeader("Decoder testi"))
+        drawTextDecoderSection(app);
     if (ImGui::CollapsingHeader("Scanner"))
         drawScannerSection(app);
     if (ImGui::CollapsingHeader("Satelliti"))
@@ -1870,6 +2032,16 @@ void drawAudioSection(AppState& app)
         } else {
             app.cockpit.stop();
             app.cockpit.setPassword(lanPass);
+            // Anche lo streaming WebSocket segue: nuovo token e stessa
+            // esposizione (solo locale o LAN) del Cockpit.
+            app.wsAudio.stop();
+            std::string tok = randomToken();
+            app.wsAudio.setToken(tok);
+            if (app.wsAudio.start(sdrjo::WsAudioServer::kDefaultPort,
+                                  lanEnabled))
+                app.cockpit.setWsInfo(app.wsAudio.port(), tok);
+            else
+                app.cockpit.setWsInfo(0, "");
             bool ok = app.cockpit.start(sdrjo::CockpitServer::kDefaultPort,
                                         lanEnabled);
             app.log("Cockpit",
@@ -2031,6 +2203,79 @@ void drawAudioSpectrumSection(AppState& app)
     }
     ImGui::SameLine();
     ImGui::TextDisabled("click sul grafico = notch sul fischio");
+}
+
+// Decoder di testi CW/RTTY sul canale di ascolto, stile fldigi: il
+// testo decodificato scorre in un riquadro della sidebar.
+void drawTextDecoderSection(AppState& app)
+{
+    if (app.listenMode == AppState::ListenMode::Off)
+        ImGui::TextDisabled("suggerito: USB sul segnale da decodificare");
+
+    int mode = app.textDecoderMode;
+    bool ch = false;
+    ch |= ImGui::RadioButton("Spento##dec", &mode, 0);
+    ImGui::SameLine();
+    ch |= ImGui::RadioButton("CW (Morse)", &mode, 1);
+    ImGui::SameLine();
+    ch |= ImGui::RadioButton("RTTY", &mode, 2);
+    if (ch) {
+        std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+        app.textDecoderMode = mode;
+        app.cwDecoder.reset();
+        app.rttyDecoder.reset();
+        if (mode == 1) {
+            app.cwTone.configure(double(app.cwToneHz), 48000.0);
+            app.cwDecoder = std::make_unique<sdrjo::morse::CwDecoder>(
+                48000.0, [&app](char c) {
+                    app.decodedText += c;
+                    if (app.decodedText.size() > 4000)
+                        app.decodedText.erase(0, 1000);
+                });
+        } else if (mode == 2) {
+            app.rttyDecoder = std::make_unique<sdrjo::dsp::RttyDecoder>(
+                48000.0, [&app](char c) {
+                    app.decodedText += c;
+                    if (app.decodedText.size() > 4000)
+                        app.decodedText.erase(0, 1000);
+                });
+            app.rttyDecoder->setReverse(app.rttyReverse);
+        }
+    }
+
+    if (app.textDecoderMode == 1) {
+        if (ImGui::SliderFloat("Tono CW (Hz)", &app.cwToneHz, 300.0f,
+                               1200.0f, "%.0f")) {
+            std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+            app.cwTone.configure(double(app.cwToneHz), 48000.0);
+        }
+        if (app.cwDecoder)
+            ImGui::TextDisabled("velocita' stimata: %.0f WPM",
+                                app.cwDecoder->wpm());
+    } else if (app.textDecoderMode == 2) {
+        ImGui::TextDisabled("Baudot 45.45 baud, mark 2125 / shift 170 Hz");
+        if (ImGui::Checkbox("Inverti mark/space", &app.rttyReverse)) {
+            std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+            if (app.rttyDecoder)
+                app.rttyDecoder->setReverse(app.rttyReverse);
+        }
+    }
+
+    // Riquadro del testo decodificato (autoscroll).
+    if (ImGui::BeginChild("##dectext", ImVec2(0, 140),
+                          ImGuiChildFlags_Borders)) {
+        std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextUnformatted(app.decodedText.c_str());
+        ImGui::PopTextWrapPos();
+        if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
+            ImGui::SetScrollHereY(1.0f);
+    }
+    ImGui::EndChild();
+    if (ImGui::SmallButton("Cancella##dec")) {
+        std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+        app.decodedText.clear();
+    }
 }
 
 // ---- Scanner delle memorie: salta di frequenza in frequenza e si ferma
@@ -2373,6 +2618,14 @@ int main(int argc, char** argv)
         app.pendingMode = mode;
         return true;
     });
+    // Streaming audio a bassa latenza (WebSocket + ADPCM) accanto al
+    // Cockpit: token nuovo a ogni avvio, consegnato da /api/wsinfo.
+    {
+        std::string tok = randomToken();
+        app.wsAudio.setToken(tok);
+        if (app.wsAudio.start(sdrjo::WsAudioServer::kDefaultPort, false))
+            app.cockpit.setWsInfo(app.wsAudio.port(), tok);
+    }
     if (app.cockpit.start())
         app.log("Cockpit", "http://localhost:" +
                                std::to_string(app.cockpit.port()));
@@ -2468,6 +2721,7 @@ int main(int argc, char** argv)
     if (app.dspThread.joinable()) app.dspThread.join();
     if (app.geoThread.joinable()) app.geoThread.join();
     app.scanWav.stop();
+    app.wsAudio.stop();
     app.cockpit.stop();
     for (auto& lm : app.modules) lm.module()->stop();
     if (app.source) app.source->stop();

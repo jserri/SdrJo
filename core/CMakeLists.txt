@@ -7,6 +7,7 @@ add_library(sdrjo-core STATIC
     src/dsp/wfm_stereo.cpp
     src/dsp/ssb.cpp
     src/dsp/vfo.cpp
+    src/dsp/rtty.cpp
     src/audio/audio_output.cpp
     src/util/iq_recorder.cpp
     src/util/band_plan.cpp
@@ -15,6 +16,8 @@ add_library(sdrjo-core STATIC
     src/util/http_server.cpp
     src/util/geolocate.cpp
     src/util/wav_writer.cpp
+    src/util/adpcm.cpp
+    src/web/ws_audio_server.cpp
     src/util/tcp_line_server.cpp
     src/sat/tle.cpp
     src/sat/orbit.cpp
