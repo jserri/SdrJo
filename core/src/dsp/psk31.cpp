@@ -89,6 +89,8 @@ void Psk31Decoder::reset()
     syncPhase_ = 0;
     prevSym_ = cfloat(1, 0);
     lastSym_ = cfloat(0, 0);
+    lockAcc_ = cfloat(0, 0);
+    lockMag_ = 0.0f;
     code_.clear();
     lastBit_ = 1;
 }
@@ -138,6 +140,19 @@ void Psk31Decoder::processAudio(const float* samples, size_t n)
 void Psk31Decoder::onSymbol(cfloat sym)
 {
     lastSym_ = sym;
+
+    // Rivelatore d'aggancio a portante quadrata: elevando al quadrato il
+    // versore del simbolo i due lobi BPSK (0 e pi) collassano su +1; la
+    // media |.| e' alta se sono ben concentrati, bassa sul rumore.
+    float m = std::sqrt(sym.real() * sym.real() + sym.imag() * sym.imag());
+    if (m > 1e-6f) {
+        float ur = sym.real() / m, ui = sym.imag() / m;
+        cfloat u2(ur * ur - ui * ui, 2.0f * ur * ui);
+        lockAcc_ = 0.97f * lockAcc_ + 0.03f * u2;
+        lockMag_ = std::sqrt(lockAcc_.real() * lockAcc_.real() +
+                             lockAcc_.imag() * lockAcc_.imag());
+    }
+
     // BPSK differenziale: fase costante = 1, inversione = 0.
     float dot = sym.real() * prevSym_.real() + sym.imag() * prevSym_.imag();
     prevSym_ = sym;

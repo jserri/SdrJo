@@ -210,6 +210,22 @@ Fatti (12a tornata, PSK31 + squelch decoder + S-meter in barra di stato):
   colonna "Vista" e' ora una **barra orizzontale in fondo all'app**, a
   destra, staccata dall'indicatore buffer IQ.
 
+Fatti (13a tornata, SSB come SDR#/SDR++ + waterfall audio + rifiniture):
+
+- ✅ **Passband SSB asimmetrico**: in USB la banda utile e' evidenziata
+  *sopra* il marker [f, f+bw], in LSB *sotto* [f-bw, f]; il marker resta
+  sulla portante soppressa (etichetta "USB"/"LSB"). Cosi', come su SDR#/
+  SDR++, si mette il marker sul bordo del segnale e non al centro. Il
+  trascinamento cambia solo il bordo della banda utile. AM/NFM/WFM
+  restano simmetrici.
+- ✅ **Waterfall audio** nel pannello Spettro audio (stile fldigi): scorre
+  nel tempo e rende evidenti i toni CW/PSK e i due binari RTTY.
+- ✅ **Click-to-tune**: con un decoder attivo, click sullo spettro/waterfall
+  audio sintonizza il tono (CW/PSK) o il mark (RTTY) agganciandosi al picco;
+  click destro piazza il notch.
+- ✅ **LED d'aggancio PSK31** (rivelatore a portante quadrata) + etichette
+  sopra gli slider del decoder (niente piu' testo tagliato).
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).

@@ -1661,19 +1661,38 @@ void drawSpectrumPanel(AppState& app)
     if (app.listenMode != AppState::ListenMode::Off) {
         double bw = app.listenBwHz;
         double vfoHz = centerHz + app.listenOffsetHz;
+        // In SSB la banda utile sta tutta da un lato della portante: USB
+        // sopra [f, f+bw], LSB sotto [f-bw, f]. Il marker resta sulla
+        // portante soppressa, cosi' (come su SDR#/SDR++) lo si mette sul
+        // bordo del segnale e non al centro. Gli altri modi sono simmetrici.
+        bool usb = app.listenMode == AppState::ListenMode::Usb;
+        bool lsb = app.listenMode == AppState::ListenMode::Lsb;
+        double loHz, hiHz;
+        if (usb) { loHz = vfoHz; hiHz = vfoHz + bw; }
+        else if (lsb) { loHz = vfoHz - bw; hiHz = vfoHz; }
+        else { loHz = vfoHz - bw / 2; hiHz = vfoHz + bw / 2; }
         hasVfo = true;
         vfoX = xOf(vfoHz);
-        vfoX0 = xOf(vfoHz - bw / 2);
-        vfoX1 = xOf(vfoHz + bw / 2);
+        vfoX0 = xOf(loHz);
+        vfoX1 = xOf(hiHz);
         dl->AddRectFilled(ImVec2(vfoX0, s0.y), ImVec2(vfoX1, s1.y),
                           ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.15f)));
         dl->AddLine(ImVec2(vfoX, s0.y), ImVec2(vfoX, s1.y), vfoCol, 1.5f);
         dl->AddLine(ImVec2(vfoX0, s0.y), ImVec2(vfoX0, s1.y), vfoColSoft);
         dl->AddLine(ImVec2(vfoX1, s0.y), ImVec2(vfoX1, s1.y), vfoColSoft);
+        // Etichetta del lato attivo accanto al marker, per non confondersi.
+        if (usb || lsb)
+            dl->AddText(ImVec2(vfoX + (usb ? 4 : -22), s1.y - 16), vfoCol,
+                        usb ? "USB" : "LSB");
 
-        // Trascinamento dei bordi = cambia la larghezza del canale.
-        nearEdge = hovSpec && (std::fabs(mx - vfoX0) < 8.0f ||
-                               std::fabs(mx - vfoX1) < 8.0f);
+        // Il bordo trascinabile e' quello esterno del canale: in SSB solo il
+        // lato della banda utile, negli altri modi entrambi (larghezza
+        // simmetrica). Trascinandolo cambia la larghezza del canale.
+        float dragEdgeX = usb ? vfoX1 : (lsb ? vfoX0 : mx); // mx = sempre "vicino"
+        nearEdge = hovSpec && ((usb || lsb)
+                       ? std::fabs(mx - dragEdgeX) < 8.0f
+                       : (std::fabs(mx - vfoX0) < 8.0f ||
+                          std::fabs(mx - vfoX1) < 8.0f));
         if (nearEdge || draggingBw)
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
         if (nearEdge && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
@@ -1683,8 +1702,11 @@ void drawSpectrumPanel(AppState& app)
                 double maxBw =
                     (app.listenMode == AppState::ListenMode::WfmStereo)
                         ? 220000.0 : 46000.0;
-                app.listenBwHz = std::clamp(
-                    2.0 * std::fabs(freqAt(mx) - vfoHz), 100.0, maxBw);
+                // In SSB la larghezza e' la distanza dalla portante (un lato),
+                // negli altri modi il doppio (banda simmetrica).
+                double d = std::fabs(freqAt(mx) - vfoHz);
+                app.listenBwHz =
+                    std::clamp((usb || lsb) ? d : 2.0 * d, 100.0, maxBw);
             } else {
                 draggingBw = false;
                 rebuildChanFilter(app); // applica la nuova larghezza
@@ -2549,6 +2571,63 @@ void drawLogSection(AppState& app)
     ImGui::EndChild();
 }
 
+// Parametri RTTY condivisi (usati sia dal pannello decoder sia dal
+// click-to-tune sullo Spettro audio).
+const double kRttyBaud[] = {45.45, 50.0, 75.0};
+const double kRttyShift[] = {170.0, 425.0, 850.0};
+
+// Aggiunge un carattere decodificato al buffer di testo (tetto ~4000).
+void emitDecoded(AppState& app, char c)
+{
+    app.decodedText += c;
+    if (app.decodedText.size() > 4000) app.decodedText.erase(0, 1000);
+}
+
+// (Ri)costruisce il decoder RTTY coi parametri correnti.
+void rebuildRttyDecoder(AppState& app)
+{
+    double baud = kRttyBaud[std::clamp(app.rttyBaudIdx, 0, 2)];
+    double shift = kRttyShift[std::clamp(app.rttyShiftIdx, 0, 2)];
+    app.rttyDecoder = std::make_unique<sdrjo::dsp::RttyDecoder>(
+        48000.0, [&app](char c) { emitDecoded(app, c); },
+        double(app.rttyMarkHz), double(app.rttyMarkHz) + shift, baud);
+    app.rttyDecoder->setReverse(app.rttyReverse);
+}
+
+// Sintonizza il decoder attivo su un tono audio (click-to-tune fldigi):
+// CW/PSK spostano il tono, RTTY sposta il mark (lo space segue lo shift).
+void setDecoderTone(AppState& app, double hz)
+{
+    std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+    switch (app.textDecoderMode) {
+    case 1:
+        app.cwToneHz = float(std::clamp(hz, 300.0, 1200.0));
+        app.cwTone.configure(double(app.cwToneHz), 48000.0);
+        break;
+    case 2:
+        app.rttyMarkHz = float(std::clamp(hz, 800.0, 2500.0));
+        rebuildRttyDecoder(app);
+        break;
+    case 3:
+        app.psk31ToneHz = float(std::clamp(hz, 300.0, 2500.0));
+        if (app.psk31Decoder)
+            app.psk31Decoder->setTone(double(app.psk31ToneHz));
+        break;
+    default:
+        break;
+    }
+}
+
+// Colore "waterfall" da un livello 0..1 (blu scuro -> ciano -> giallo).
+ImU32 waterfallColor(float t)
+{
+    t = std::clamp(t, 0.0f, 1.0f);
+    float r, g, b;
+    if (t < 0.5f) { float u = t / 0.5f; r = 0.0f; g = 0.35f * u; b = 0.25f + 0.6f * u; }
+    else { float u = (t - 0.5f) / 0.5f; r = u; g = 0.35f + 0.55f * u; b = 0.85f * (1.0f - u); }
+    return IM_COL32(int(r * 255), int(g * 255), int(b * 255), 255);
+}
+
 // Spettro dell'audio demodulato (0-6 kHz): utile per CW/SSB/RTTY e per
 // mirare il notch: un click sul grafico lo piazza sul fischio.
 void drawAudioSpectrumSection(AppState& app)
@@ -2632,8 +2711,7 @@ void drawAudioSpectrumSection(AppState& app)
         marker(double(app.cwToneHz),
                ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.95f)), "CW");
     } else if (app.textDecoderMode == 2) {
-        static const double kShift[] = {170, 425, 850};
-        double shift = kShift[std::clamp(app.rttyShiftIdx, 0, 2)];
+        double shift = kRttyShift[std::clamp(app.rttyShiftIdx, 0, 2)];
         ImU32 c = ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.95f));
         marker(double(app.rttyMarkHz), c, "M");
         marker(double(app.rttyMarkHz) + shift, c, "S");
@@ -2642,12 +2720,19 @@ void drawAudioSpectrumSection(AppState& app)
                ImGui::GetColorU32(ImVec4(0.55f, 0.85f, 1.0f, 0.95f)), "PSK");
     }
 
+    bool decActive = app.textDecoderMode != 0;
     if (hov) {
         float mxs = ImGui::GetIO().MousePos.x;
         double f = std::clamp(double(mxs - p.x) / double(w), 0.0, 1.0) *
                    maxHz;
-        ImGui::SetTooltip("%.0f Hz - click: notch qui", f);
-        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        if (decActive)
+            ImGui::SetTooltip("%.0f Hz - click: sintonizza il decoder, "
+                              "click destro: notch", f);
+        else
+            ImGui::SetTooltip("%.0f Hz - click: notch qui", f);
+        bool left = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+        bool right = ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+        if (left || right) {
             // Si aggancia al picco piu' forte entro +/-120 Hz dal click:
             // il fischio viene centrato anche con un click impreciso.
             double lo = std::max(0.0, f - 120.0), hi = f + 120.0;
@@ -2657,12 +2742,81 @@ void drawAudioSpectrumSection(AppState& app)
             for (size_t b = b0; b <= b1 && b < n; b++)
                 if (spec[b] > spec[bBest]) bBest = b;
             f = double(bBest - n / 2) * rate / double(n);
+            if (left && decActive) {
+                // Click sinistro con decoder attivo = sintonizza il tono.
+                setDecoderTone(app, f);
+            } else {
+                // Altrimenti piazza il notch sul fischio.
+                app.notchHz = float(f);
+                std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+                app.filterL.configureNotch(48000.0, double(app.notchHz), 15.0);
+                app.filterR.configureNotch(48000.0, double(app.notchHz), 15.0);
+            }
+        }
+    }
+
+    // --- Waterfall audio (fldigi-like): scorre verso il basso, aiuta a
+    // vedere i toni CW/PSK e i due binari RTTY nel tempo. ---
+    constexpr int kAwfCols = 128;
+    constexpr int kAwfRows = 40;
+    static std::vector<float> awf(kAwfCols * kAwfRows, -120.0f);
+    static int awfHead = 0;
+    // Nuova riga: massimo dB per colonna nel bucket di frequenza.
+    for (int cx = 0; cx < kAwfCols; cx++) {
+        size_t ba = n / 2 + size_t(double(cx) / kAwfCols * double(bins));
+        size_t bb = n / 2 + size_t(double(cx + 1) / kAwfCols * double(bins));
+        float mxdb = -120.0f;
+        for (size_t b = ba; b <= bb && b < n; b++) mxdb = std::max(mxdb, spec[b]);
+        awf[awfHead * kAwfCols + cx] = mxdb;
+    }
+    awfHead = (awfHead + 1) % kAwfRows;
+
+    const float wfH = 70.0f;
+    ImVec2 wp = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("##audiowf", ImVec2(std::max(60.0f, w), wfH));
+    bool hovWf = ImGui::IsItemHovered();
+    float cellW = w / float(kAwfCols);
+    float cellH = wfH / float(kAwfRows);
+    for (int r = 0; r < kAwfRows; r++) {
+        int row = (awfHead - 1 - r + kAwfRows) % kAwfRows; // 0 = riga piu' nuova in alto
+        float yy = wp.y + r * cellH;
+        for (int cx = 0; cx < kAwfCols; cx++) {
+            float t = (awf[row * kAwfCols + cx] - dbLo) / (dbHi - dbLo);
+            dl->AddRectFilled(ImVec2(wp.x + cx * cellW, yy),
+                              ImVec2(wp.x + (cx + 1) * cellW + 1, yy + cellH + 1),
+                              waterfallColor(t));
+        }
+    }
+    // Righe dei toni del decoder anche sul waterfall (stesse posizioni).
+    auto wfMarker = [&](double hz, ImU32 col) {
+        if (hz <= 0 || hz >= maxHz) return;
+        float x = wp.x + float(hz / maxHz) * w;
+        dl->AddLine(ImVec2(x, wp.y), ImVec2(x, wp.y + wfH), col, 1.0f);
+    };
+    ImU32 mkCol = ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.9f));
+    if (app.textDecoderMode == 1) wfMarker(double(app.cwToneHz), mkCol);
+    else if (app.textDecoderMode == 2) {
+        double shift = kRttyShift[std::clamp(app.rttyShiftIdx, 0, 2)];
+        wfMarker(double(app.rttyMarkHz), mkCol);
+        wfMarker(double(app.rttyMarkHz) + shift, mkCol);
+    } else if (app.textDecoderMode == 3)
+        wfMarker(double(app.psk31ToneHz),
+                 ImGui::GetColorU32(ImVec4(0.55f, 0.85f, 1.0f, 0.9f)));
+    // Click sul waterfall = come sullo spettro (sintonizza o notch).
+    if (hovWf && (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+                  ImGui::IsMouseClicked(ImGuiMouseButton_Right))) {
+        double f = std::clamp(double(ImGui::GetIO().MousePos.x - wp.x) /
+                              double(w), 0.0, 1.0) * maxHz;
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Left) && decActive) {
+            setDecoderTone(app, f);
+        } else {
             app.notchHz = float(f);
             std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
             app.filterL.configureNotch(48000.0, double(app.notchHz), 15.0);
             app.filterR.configureNotch(48000.0, double(app.notchHz), 15.0);
         }
     }
+
     if (ImGui::SmallButton("Notch spento")) {
         app.notchHz = 0.0f;
         std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
@@ -2670,7 +2824,10 @@ void drawAudioSpectrumSection(AppState& app)
         app.filterR.configureNotch(48000.0, 0.0);
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("click sul grafico = notch sul fischio");
+    if (decActive)
+        ImGui::TextDisabled("click = sintonizza, click destro = notch");
+    else
+        ImGui::TextDisabled("click sul grafico = notch sul fischio");
 }
 
 // Decoder di testi CW/RTTY sul canale di ascolto, stile fldigi: il
@@ -2680,24 +2837,10 @@ void drawTextDecoderSection(AppState& app)
     if (app.listenMode == AppState::ListenMode::Off)
         ImGui::TextDisabled("suggerito: USB sul segnale da decodificare");
 
-    static const double kBaud[] = {45.45, 50.0, 75.0};
     static const char* kBaudNames[] = {"45.45 (ama)", "50", "75"};
-    static const double kShift[] = {170.0, 425.0, 850.0};
     static const char* kShiftNames[] = {"170 (ama)", "425", "850"};
 
-    auto textCb = [&app](char c) {
-        app.decodedText += c;
-        if (app.decodedText.size() > 4000) app.decodedText.erase(0, 1000);
-    };
-    // (Ri)costruisce il decoder RTTY coi parametri correnti.
-    auto rebuildRtty = [&app, textCb]() {
-        double baud = kBaud[std::clamp(app.rttyBaudIdx, 0, 2)];
-        double shift = kShift[std::clamp(app.rttyShiftIdx, 0, 2)];
-        app.rttyDecoder = std::make_unique<sdrjo::dsp::RttyDecoder>(
-            48000.0, textCb, double(app.rttyMarkHz),
-            double(app.rttyMarkHz) + shift, baud);
-        app.rttyDecoder->setReverse(app.rttyReverse);
-    };
+    auto textCb = [&app](char c) { emitDecoded(app, c); };
 
     int mode = app.textDecoderMode;
     bool ch = false;
@@ -2720,7 +2863,7 @@ void drawTextDecoderSection(AppState& app)
             app.cwDecoder->setAutoSpeed(app.cwAutoSpeed);
             if (!app.cwAutoSpeed) app.cwDecoder->setWpm(double(app.cwWpm));
         } else if (mode == 2) {
-            rebuildRtty();
+            rebuildRttyDecoder(app);
         } else if (mode == 3) {
             app.psk31Decoder = std::make_unique<sdrjo::dsp::Psk31Decoder>(
                 48000.0, textCb, double(app.psk31ToneHz));
@@ -2729,7 +2872,8 @@ void drawTextDecoderSection(AppState& app)
 
     if (app.textDecoderMode == 1) {
         // --- Taratura CW (fldigi-style) ---
-        if (ImGui::SliderFloat("Tono (Hz)", &app.cwToneHz, 300.0f, 1200.0f,
+        fieldLabel("Tono (Hz)");
+        if (ImGui::SliderFloat("##cwtono", &app.cwToneHz, 300.0f, 1200.0f,
                                "%.0f")) {
             std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
             app.cwTone.configure(double(app.cwToneHz), 48000.0);
@@ -2747,7 +2891,8 @@ void drawTextDecoderSection(AppState& app)
         helpTip("Auto: aggancia da sola la velocita'. Manuale: fissa i WPM "
                 "(meglio sui segnali deboli/disturbati).");
         if (!app.cwAutoSpeed) {
-            if (ImGui::SliderFloat("WPM", &app.cwWpm, 5.0f, 40.0f, "%.0f")) {
+            fieldLabel("WPM (parole al minuto)");
+            if (ImGui::SliderFloat("##cwwpm", &app.cwWpm, 5.0f, 40.0f, "%.0f")) {
                 std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
                 if (app.cwDecoder) app.cwDecoder->setWpm(double(app.cwWpm));
             }
@@ -2762,7 +2907,8 @@ void drawTextDecoderSection(AppState& app)
         rc |= ImGui::Combo("##rbaud", &app.rttyBaudIdx, kBaudNames, 3);
         fieldLabel("Shift (Hz)");
         rc |= ImGui::Combo("##rshift", &app.rttyShiftIdx, kShiftNames, 3);
-        if (ImGui::SliderFloat("Mark (Hz)", &app.rttyMarkHz, 800.0f, 2500.0f,
+        fieldLabel("Mark (Hz)");
+        if (ImGui::SliderFloat("##rmark", &app.rttyMarkHz, 800.0f, 2500.0f,
                                "%.0f"))
             rc = true;
         helpTip("Allinea le righe 'M' (mark) e 'S' (space) sullo Spettro "
@@ -2774,11 +2920,12 @@ void drawTextDecoderSection(AppState& app)
         }
         if (rc) {
             std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
-            rebuildRtty();
+            rebuildRttyDecoder(app);
         }
     } else if (app.textDecoderMode == 3) {
         // --- Taratura PSK31: solo il tono audio del segnale ---
-        if (ImGui::SliderFloat("Tono (Hz)", &app.psk31ToneHz, 300.0f, 2500.0f,
+        fieldLabel("Tono (Hz)");
+        if (ImGui::SliderFloat("##psktono", &app.psk31ToneHz, 300.0f, 2500.0f,
                                "%.0f")) {
             std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
             if (app.psk31Decoder)
@@ -2790,8 +2937,8 @@ void drawTextDecoderSection(AppState& app)
 
     // --- Squelch dei decoder + indicatore di taratura ---
     if (app.textDecoderMode != 0) {
-        ImGui::SliderFloat("Squelch decoder", &app.decoderSquelch, 0.0f, 0.6f,
-                           "%.2f");
+        fieldLabel("Squelch decoder");
+        ImGui::SliderFloat("##decsq", &app.decoderSquelch, 0.0f, 0.6f, "%.2f");
         helpTip("Sotto questa soglia d'ampiezza il decoder si ferma: alza il "
                 "valore se compare testo casuale sul rumore.");
         float lvl = app.decoderLevel.load(std::memory_order_relaxed);
@@ -2814,8 +2961,17 @@ void drawTextDecoderSection(AppState& app)
             ImGui::ProgressBar(m / mx, ImVec2(-FLT_MIN, 10.0f), "M");
             ImGui::ProgressBar(s / mx, ImVec2(-FLT_MIN, 10.0f), "S");
         } else if (app.textDecoderMode == 3 && app.psk31Decoder) {
-            // Piccola costellazione: BPSK agganciato = due lobi opposti.
-            ImGui::TextDisabled("Costellazione (2 lobi = agganciato):");
+            // LED d'aggancio + piccola costellazione (2 lobi = agganciato).
+            float lk = app.psk31Decoder->lock();
+            ImU32 led = lk > 0.5f ? IM_COL32(60, 200, 90, 255)
+                      : lk > 0.25f ? IM_COL32(220, 180, 60, 255)
+                                   : IM_COL32(120, 120, 120, 255);
+            ImVec2 lp = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddCircleFilled(
+                ImVec2(lp.x + 7, lp.y + 8), 5.0f, led);
+            ImGui::Dummy(ImVec2(16, 16));
+            ImGui::SameLine();
+            ImGui::TextDisabled(lk > 0.5f ? "agganciato" : "cerco aggancio...");
             ImVec2 o = ImGui::GetCursorScreenPos();
             float side = 90.0f, r = side * 0.5f;
             ImVec2 c(o.x + r, o.y + r);

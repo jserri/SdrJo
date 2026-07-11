@@ -32,6 +32,10 @@ public:
     // costellazione BPSK ben agganciata mostra due lobi opposti.
     cfloat lastSymbol() const { return lastSym_; }
 
+    // Qualita' d'aggancio 0..1 (rivelatore a portante quadrata): con i
+    // simboli concentrati sui due lobi reali tende a 1, sul rumore a 0.
+    float lock() const { return lockMag_; }
+
 private:
     void onSymbol(cfloat sym);
 
@@ -59,6 +63,10 @@ private:
     // Decisione differenziale.
     cfloat prevSym_{1, 0};
     cfloat lastSym_{0, 0};
+
+    // Rivelatore d'aggancio: media di (versore del simbolo)^2.
+    cfloat lockAcc_{0, 0};
+    float lockMag_ = 0.0f;
 
     // Varicode: i caratteri sono separati da due "0" consecutivi.
     std::string code_;    // bit del carattere corrente
