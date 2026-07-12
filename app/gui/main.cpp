@@ -1375,12 +1375,40 @@ void drawFrequencyDial(AppState& app)
     ImGui::Dummy(ImVec2(totalW, fh + 6.0f));
 }
 
+// --- Calibrazione S-meter --------------------------------------------------
+// Il livello del canale e' in dBFS (0 = fondo scala). Convenzione radio:
+// 6 dB per punto S, S9 fissato a un livello forte; sopra S9 si contano i dB.
+// Lancetta E numero usano QUESTA scala, cosi' concordano (prima la lancetta
+// mappava -120..0 dBFS su S1..+60 e finiva sempre altissima).
+constexpr float kS9Db = -20.0f;         // dBFS ~ S9
+constexpr float kSPerUnitDb = 6.0f;     // 6 dB per punto S
+// Posizione 0..1 sull'arco (0=S1, 0.55=S9, 1.0=+60 dB) da un valore dBFS.
+float sMeterPos(float dbfs)
+{
+    if (dbfs <= kS9Db) {
+        float s1Db = kS9Db - 8.0f * kSPerUnitDb; // S1 = S9 - 48 dB
+        float u = (dbfs - s1Db) / (kS9Db - s1Db); // 0..1 su S1..S9
+        return std::clamp(u, 0.0f, 1.0f) * 0.55f;
+    }
+    return std::clamp(0.55f + 0.45f * (dbfs - kS9Db) / 60.0f, 0.55f, 1.0f);
+}
+// Etichetta tipo "S5" o "S9+18".
+void sMeterLabel(float dbfs, char* out, size_t n)
+{
+    if (dbfs >= kS9Db)
+        std::snprintf(out, n, "S9+%.0f", double(dbfs - kS9Db));
+    else {
+        float s = 9.0f - (kS9Db - dbfs) / kSPerUnitDb;
+        std::snprintf(out, n, "S%.0f", double(std::clamp(s, 1.0f, 9.0f)));
+    }
+}
+
 // S-meter analogico "d'epoca": quadrante crema, zona rossa oltre S9,
 // lancetta smorzata pilotata dal livello del canale di ascolto.
 void drawSMeter(AppState& app)
 {
     static float needle = 0.0f;
-    float target = std::clamp((app.chanLevelDb + 120.0f) / 120.0f, 0.0f, 1.0f);
+    float target = sMeterPos(app.chanLevelDb);
     needle += 0.12f * (target - needle);
 
     const float w = ImGui::GetContentRegionAvail().x;
@@ -1437,9 +1465,13 @@ void drawSMeter(AppState& app)
     // Scritte del quadrante e lancetta.
     dl->AddText(small, smallSize, ImVec2(p.x + 14, p.y + h - 24),
                 IM_COL32(30, 26, 22, 200), "S-METER");
-    char dbLbl[24];
-    std::snprintf(dbLbl, sizeof(dbLbl), "%.0f dB", double(app.chanLevelDb));
-    dl->AddText(small, smallSize, ImVec2(p.x + w - 60, p.y + h - 24),
+    char sLbl[16];
+    sMeterLabel(app.chanLevelDb, sLbl, sizeof(sLbl));
+    char dbLbl[32];
+    std::snprintf(dbLbl, sizeof(dbLbl), "%s  %.0f dBFS", sLbl,
+                  double(app.chanLevelDb));
+    ImVec2 tsz = ImGui::CalcTextSize(dbLbl);
+    dl->AddText(small, smallSize, ImVec2(p.x + w - tsz.x - 12, p.y + h - 24),
                 IM_COL32(30, 26, 22, 200), dbLbl);
 
     dl->AddLine(pivot, tip(needle, radius - 4), IM_COL32(150, 20, 20, 255),
@@ -2437,16 +2469,17 @@ void drawStatusBar(AppState& app)
         const float mw = 180.0f, mh = 12.0f;
         float mx0 = wpos.x + wsz.x - mw - 10.0f;
         float my0 = wpos.y + (wsz.y - mh) * 0.5f;
-        // Etichetta "S" e valore in dB a sinistra della barra.
-        char sTxt[24];
-        std::snprintf(sTxt, sizeof(sTxt), "S %.0f dB", double(app.chanLevelDb));
+        // Etichetta S-reading + dBFS, coerente con la lancetta analogica.
+        char sTxt[32], sName[16];
+        sMeterLabel(app.chanLevelDb, sName, sizeof(sName));
+        std::snprintf(sTxt, sizeof(sTxt), "%s  %.0f dBFS", sName,
+                      double(app.chanLevelDb));
         ImVec2 tsz = ImGui::CalcTextSize(sTxt);
         dl->AddText(ImVec2(mx0 - tsz.x - 8, wpos.y + (wsz.y - tsz.y) * 0.5f),
                     ImGui::GetColorU32(ImVec4(0.8f, 0.86f, 0.94f, 1)), sTxt);
         dl->AddRectFilled(ImVec2(mx0, my0), ImVec2(mx0 + mw, my0 + mh),
                           IM_COL32(20, 22, 28, 255), 2.0f);
-        float lvl = std::clamp((app.chanLevelDb + 120.0f) / 120.0f, 0.0f,
-                               1.0f);
+        float lvl = sMeterPos(app.chanLevelDb);
         for (int seg = 0; seg < 30; seg++) {
             float t0 = seg / 30.0f;
             if (t0 > lvl) break;
@@ -2737,7 +2770,9 @@ void drawModulesSection(AppState& app)
         bool en = app.moduleEnabled[i] != 0;
         ImGui::PushID(int(i));
 
-        // Riga: interruttore + nome colorato secondo lo stato.
+        // Interruttore attiva/disattiva DIRETTAMENTE sul titolo del modulo:
+        // lo accendi/spegni senza dover aprire il sottomenu. Il titolo e'
+        // un'intestazione richiudibile: aprila per i dettagli e i comandi.
         if (ImGui::Checkbox("##on", &en)) {
             std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
             app.moduleEnabled[i] = en ? 1 : 0;
@@ -2746,14 +2781,20 @@ void drawModulesSection(AppState& app)
         helpTip(en ? "Modulo attivo: sta elaborando il segnale."
                    : "Modulo spento: non consuma CPU. Accendilo per usarlo.");
         ImGui::SameLine();
-        ImGui::TextColored(en ? onCol : offCol, "%s", info.name.c_str());
-        ImGui::SameLine();
-        ImGui::TextDisabled(en ? "attivo" : "spento");
+        char hdr[96];
+        std::snprintf(hdr, sizeof(hdr), "%s  (%s)###mod%zu", info.name.c_str(),
+                      en ? "attivo" : "spento", i);
+        ImGui::PushStyleColor(ImGuiCol_Text, en ? onCol : offCol);
+        bool open = ImGui::CollapsingHeader(hdr);
+        ImGui::PopStyleColor();
 
-        // Dettagli e comandi solo quando il modulo e' acceso.
-        if (en) {
+        // Dettagli e comandi quando apri il sottomenu del modulo.
+        if (open) {
             ImGui::Indent(10.0f);
             ImGui::TextDisabled("%s", info.description.c_str());
+            if (!en)
+                ImGui::TextColored(ImVec4(1.0f, 0.71f, 0.33f, 1.0f),
+                                   "spento: attiva la casella per usarlo");
             uint16_t port = lm.module()->webPort();
             if (port)
                 ImGui::Text("Interfaccia web: http://localhost:%u", port);

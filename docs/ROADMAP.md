@@ -273,6 +273,16 @@ Fatti (17a tornata, sintonia col frequenzimetro come SDR#):
   grezzo, quindi basta poco: cosi' il segnale sintonizzato resta al centro
   dello spettro invece che fisso a ~60%.
 
+Fatti (20a tornata, S-meter calibrato + toggle sui moduli):
+
+- ✅ **Fix S-meter**: la lancetta mappava -120..0 dBFS su S1..+60 e finiva
+  sempre altissima (segnava ~+10 con -46 dBFS). Ora usa una scala S reale
+  (6 dB/punto, S9 = -20 dBFS) e la lancetta + il numero mostrano la STESSA
+  lettura (es. "S3 -59 dBFS"). Aggiornata anche la barra in fondo.
+- ✅ **Toggle sul titolo dei moduli**: nella sezione Moduli ogni modulo e'
+  un sottomenu richiudibile con la casella attiva/disattiva direttamente
+  sul titolo: lo accendi/spegni senza aprirlo.
+
 Fatti (19a tornata, frequenzimetro "vai a" + diagnostica risolutiva):
 
 - ✅ Il log di sintonia ha PROVATO che la chiavetta risintonizza davvero
