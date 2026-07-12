@@ -49,6 +49,7 @@ struct RtlLib {
     int (*set_sample_rate)(rtlsdr_dev*, uint32_t) = nullptr;
     uint32_t (*get_sample_rate)(rtlsdr_dev*) = nullptr;
     int (*set_center_freq)(rtlsdr_dev*, uint32_t) = nullptr;
+    uint32_t (*get_center_freq)(rtlsdr_dev*) = nullptr;
     int (*set_tuner_gain_mode)(rtlsdr_dev*, int) = nullptr;
     int (*set_tuner_gain)(rtlsdr_dev*, int) = nullptr;
     int (*set_freq_correction)(rtlsdr_dev*, int) = nullptr;
@@ -119,6 +120,7 @@ static RtlLib loadRtlLib()
     lib.set_sample_rate = (decltype(lib.set_sample_rate))sym("rtlsdr_set_sample_rate");
     lib.get_sample_rate = (decltype(lib.get_sample_rate))sym("rtlsdr_get_sample_rate");
     lib.set_center_freq = (decltype(lib.set_center_freq))sym("rtlsdr_set_center_freq");
+    lib.get_center_freq = (decltype(lib.get_center_freq))sym("rtlsdr_get_center_freq");
     lib.set_tuner_gain_mode = (decltype(lib.set_tuner_gain_mode))sym("rtlsdr_set_tuner_gain_mode");
     lib.set_tuner_gain = (decltype(lib.set_tuner_gain))sym("rtlsdr_set_tuner_gain");
     lib.set_freq_correction = (decltype(lib.set_freq_correction))sym("rtlsdr_set_freq_correction");
@@ -197,9 +199,16 @@ bool RtlSdrSource::setCenterFrequency(double hz)
 {
     // Il driver rtl-sdr-blog gestisce internamente l'upconverter della V4
     // per le frequenze sotto ~28 MHz: basta chiedere la frequenza voluta.
-    if (lib().set_center_freq(dev_, uint32_t(hz)) != 0) return false;
+    lastTuneRc_ = lib().set_center_freq(dev_, uint32_t(hz));
+    if (lastTuneRc_ != 0) return false;
     freqHz_ = hz;
     return true;
+}
+
+double RtlSdrSource::actualCenterFrequency() const
+{
+    if (dev_ && lib().get_center_freq) return double(lib().get_center_freq(dev_));
+    return freqHz_;
 }
 
 bool RtlSdrSource::setSampleRate(double hz)

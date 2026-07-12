@@ -1207,6 +1207,29 @@ void resetSpectrumAfterRetune(AppState& app)
     app.iqDrainReq.store(true);
 }
 
+// Diagnostica sintonia: registra cosa e' stato chiesto alla chiavetta e
+// cosa la chiavetta rilegge davvero (rtlsdr_get_center_freq). Se "chiesto"
+// e "legge" divergono, il comando di sintonia non va a segno.
+void logHwTune(AppState& app, double requestedHz)
+{
+    char buf[200];
+    if (app.rtl) {
+        double actual = app.rtl->actualCenterFrequency();
+        int rc = app.rtl->lastTuneResult();
+        std::snprintf(buf, sizeof(buf),
+                      "HW: chiesto %.4f MHz | rc=%d %s | chiavetta legge "
+                      "%.4f MHz | VFO off %.1f kHz",
+                      requestedHz / 1e6, rc, rc == 0 ? "OK" : "ERRORE",
+                      actual / 1e6, app.listenOffsetHz / 1e3);
+    } else {
+        std::snprintf(buf, sizeof(buf),
+                      "HW: chiesto %.4f MHz (replay/nessuna chiavetta) "
+                      "| VFO off %.1f kHz",
+                      requestedHz / 1e6, app.listenOffsetHz / 1e3);
+    }
+    app.log("Sintonia", buf);
+}
+
 // Richiede all'hardware una nuova frequenza centrale.
 // immediate = true (dial, campo MHz, modulo, click) risintonizza SUBITO,
 // senza limitatore: la sintonia deve rispondere all'istante.
@@ -1214,15 +1237,33 @@ void resetSpectrumAfterRetune(AppState& app)
 // cosi' il flusso di comandi USB non inchioda la GUI.
 void requestHwCenter(AppState& app, double newCenter, bool immediate = false)
 {
-    bool moved = std::fabs(newCenter - app.freqMHz * 1e6) > 1.0;
-    app.freqMHz = newCenter / 1e6;
-    if (!app.source) return;
+    double oldCenter = app.freqMHz * 1e6;
+    bool bigChange = std::fabs(newCenter - oldCenter) > 1.0;
+    if (!app.source) {
+        app.freqMHz = newCenter / 1e6; // niente hardware (replay/nessuna sorgente)
+        return;
+    }
     auto now = std::chrono::steady_clock::now();
     if (immediate || now - app.lastHwTune > std::chrono::milliseconds(50)) {
         app.lastHwTune = now;
-        app.source->setCenterFrequency(newCenter);
+        bool ok = app.source->setCenterFrequency(newCenter);
+        // Il righello segue la frequenza REALMENTE riletta dalla chiavetta,
+        // non quella chiesta: se la sintonia non va a segno il numero non
+        // mente (prima il righello si spostava anche quando l'hardware no).
+        double effective =
+            app.rtl ? app.rtl->actualCenterFrequency() : newCenter;
+        // Ritenta una volta se la chiavetta non ha accettato o non si e'
+        // mossa (a volte il primo comando USB va perso durante lo streaming).
+        if (app.rtl && (!ok || std::fabs(effective - newCenter) > 1000.0)) {
+            app.source->setCenterFrequency(newCenter);
+            effective = app.rtl->actualCenterFrequency();
+        }
+        app.freqMHz = effective / 1e6;
         app.pendingHwTuneHz = -1.0;
-        if (moved) resetSpectrumAfterRetune(app);
+        if (bigChange) {
+            resetSpectrumAfterRetune(app);
+            logHwTune(app, newCenter); // diagnostica: chiesto vs riletto
+        }
     } else {
         app.pendingHwTuneHz = newCenter;
     }
@@ -1272,6 +1313,12 @@ void tuneAbsolute(AppState& app, double f)
         app.listenOffsetHz = f - center;               // solo VFO
         if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
         keepTunedInView(app);
+        char b[160];
+        std::snprintf(b, sizeof(b),
+                      "VFO: sintonia %.4f MHz dentro span (HW resta a "
+                      "%.4f MHz, off %.1f kHz)",
+                      f / 1e6, center / 1e6, app.listenOffsetHz / 1e3);
+        app.log("Sintonia", b);
     } else {
         double offset = antiDcOffset(app);
         app.listenOffsetHz = offset;
@@ -2760,16 +2807,28 @@ void drawModulesSection(AppState& app)
 
 void drawLogSection(AppState& app)
 {
-    // Riquadro scorrevole: il log non deve allungare tutta la sidebar.
-    if (ImGui::BeginChild("##logscroll", ImVec2(0, 180),
+    // Riquadro scorrevole: il log non deve allungare tutta la sidebar. Le
+    // righe vanno a capo (wrap) cosi' i messaggi lunghi (es. diagnostica di
+    // sintonia) si leggono per intero senza tagli a destra.
+    if (ImGui::BeginChild("##logscroll", ImVec2(0, 200),
                           ImGuiChildFlags_Borders)) {
         std::lock_guard<std::mutex> lk(app.logMutex);
+        ImGui::PushTextWrapPos(0.0f);
         for (auto& line : app.logLines)
             ImGui::TextUnformatted(line.c_str());
+        ImGui::PopTextWrapPos();
         if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
             ImGui::SetScrollHereY(1.0f);
     }
     ImGui::EndChild();
+    if (ImGui::SmallButton("Copia log negli appunti")) {
+        std::lock_guard<std::mutex> lk(app.logMutex);
+        std::string all;
+        for (auto& line : app.logLines) { all += line; all += '\n'; }
+        ImGui::SetClipboardText(all.c_str());
+    }
+    helpTip("Copia tutte le righe di log: utile per incollarle e farsele "
+            "analizzare (es. la diagnostica di sintonia).");
 }
 
 // Parametri RTTY condivisi (usati sia dal pannello decoder sia dal

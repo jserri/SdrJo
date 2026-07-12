@@ -48,6 +48,13 @@ public:
     bool setCenterFrequency(double hz) override;
     double centerFrequency() const override { return freqHz_; }
 
+    // Frequenza CENTRALE riletta dalla chiavetta (rtlsdr_get_center_freq):
+    // serve alla diagnostica per capire se la sintonia va davvero a segno.
+    // Se la DLL non espone la funzione ritorna l'ultima chiesta.
+    double actualCenterFrequency() const;
+    // Esito grezzo dell'ultimo set_center_freq (0 = OK).
+    int lastTuneResult() const { return lastTuneRc_; }
+
     bool setSampleRate(double hz) override;
     double sampleRate() const override { return rateHz_; }
 
@@ -74,6 +81,7 @@ private:
     rtlsdr_dev* dev_ = nullptr;
     double freqHz_ = 100e6;
     double rateHz_ = 2.4e6;
+    int lastTuneRc_ = 0;
     IqCallback callback_;
     std::thread worker_;
     std::atomic<bool> running_{false};

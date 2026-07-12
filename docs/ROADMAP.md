@@ -273,6 +273,20 @@ Fatti (17a tornata, sintonia col frequenzimetro come SDR#):
   grezzo, quindi basta poco: cosi' il segnale sintonizzato resta al centro
   dello spettro invece che fisso a ~60%.
 
+Fatti (18a tornata, diagnostica sintonia hardware):
+
+- ✅ **Righello onesto**: `freqMHz` (che pilota il righello) ora segue la
+  frequenza REALMENTE riletta dalla chiavetta (`rtlsdr_get_center_freq`),
+  non quella chiesta. Prima si aggiornava comunque: se la sintonia non
+  andava a segno il righello si spostava mentre lo spettro no.
+- ✅ **Ritenta la sintonia**: se `set_center_freq` fallisce o la chiavetta
+  non si e' mossa, il comando viene ripetuto una volta.
+- ✅ **Log di sintonia**: ogni cambio registra "chiesto X | rc | chiavetta
+  legge Y | offset VFO" (o "VFO dentro span, HW fermo"). Il pannello Log
+  ora manda a capo le righe e ha un pulsante "Copia negli appunti" per
+  passare i dati. Serve a capire se, su hardware reale, il comando di
+  sintonia raggiunge davvero la V4.
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).
