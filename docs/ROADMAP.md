@@ -273,6 +273,19 @@ Fatti (17a tornata, sintonia col frequenzimetro come SDR#):
   grezzo, quindi basta poco: cosi' il segnale sintonizzato resta al centro
   dello spettro invece che fisso a ~60%.
 
+Fatti (22a tornata, restyling grafico + rifiniture):
+
+- ✅ **Tema rifinito**: palette condivisa (azzurro + secondo accento viola),
+  header delle sezioni con tinta d'accento (spiccano e si "sentono"
+  cliccabili), stati hover/attivo piu' netti, scrollbar/grip arrotondati.
+- ✅ **S-meter unificato**: tolta la barretta segmentata dalla barra di
+  stato (era un doppione della lancetta analogica); resta il numero
+  "S3 -58 dBFS" sempre visibile. La lancetta d'epoca resta in Ricevitore.
+- ✅ **Spia OVL**: la barra di stato mostra "OVL" in rosso quando il canale
+  e' vicino al fondo scala (front-end in saturazione: abbassa il guadagno).
+- ✅ **Interruttore sul titolo per TETRA e Scanner**: si accendono/spengono
+  dal titolo della sezione senza doverla aprire (come i moduli).
+
 Fatti (21a tornata, cockpit web: zoom + sample rate):
 
 - ✅ **Zoom dello spettro sul web** come nell'app: rotellina per ingrandire

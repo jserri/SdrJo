@@ -2461,36 +2461,26 @@ void drawStatusBar(AppState& app)
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1), "MUTO");
     }
 
-    // S-meter orizzontale a DESTRA della barra, staccato dal resto: piu'
-    // leggibile della vecchia barretta verticale nella colonna Vista.
+    // S-meter TESTUALE a DESTRA della barra (la barretta segmentata era un
+    // doppione della lancetta analogica in Ricevitore: qui basta il numero,
+    // sempre visibile anche a pannello chiuso). Spia OVL se il canale e'
+    // vicino al fondo scala (front-end in saturazione).
     if (app.listenMode != AppState::ListenMode::Off) {
         ImDrawList* dl = ImGui::GetWindowDrawList();
         ImVec2 wpos = ImGui::GetWindowPos();
         ImVec2 wsz = ImGui::GetWindowSize();
-        const float mw = 180.0f, mh = 12.0f;
-        float mx0 = wpos.x + wsz.x - mw - 10.0f;
-        float my0 = wpos.y + (wsz.y - mh) * 0.5f;
-        // Etichetta S-reading + dBFS, coerente con la lancetta analogica.
-        char sTxt[32], sName[16];
+        char sName[16];
         sMeterLabel(app.chanLevelDb, sName, sizeof(sName));
-        std::snprintf(sTxt, sizeof(sTxt), "%s  %.0f dBFS", sName,
-                      double(app.chanLevelDb));
+        bool ovl = app.chanLevelDb > -3.0f; // vicino a 0 dBFS = saturazione
+        char sTxt[48];
+        std::snprintf(sTxt, sizeof(sTxt), "%s  %.0f dBFS%s", sName,
+                      double(app.chanLevelDb), ovl ? "  OVL" : "");
         ImVec2 tsz = ImGui::CalcTextSize(sTxt);
-        dl->AddText(ImVec2(mx0 - tsz.x - 8, wpos.y + (wsz.y - tsz.y) * 0.5f),
-                    ImGui::GetColorU32(ImVec4(0.8f, 0.86f, 0.94f, 1)), sTxt);
-        dl->AddRectFilled(ImVec2(mx0, my0), ImVec2(mx0 + mw, my0 + mh),
-                          IM_COL32(20, 22, 28, 255), 2.0f);
-        float lvl = sMeterPos(app.chanLevelDb);
-        for (int seg = 0; seg < 30; seg++) {
-            float t0 = seg / 30.0f;
-            if (t0 > lvl) break;
-            ImU32 c = t0 < 0.55f ? IM_COL32(60, 200, 90, 255)
-                                 : IM_COL32(220, 80, 60, 255);
-            float xa = mx0 + 2 + t0 * (mw - 4);
-            dl->AddRectFilled(ImVec2(xa, my0 + 2),
-                              ImVec2(xa + (mw - 4) / 30.0f - 1, my0 + mh - 2),
-                              c);
-        }
+        const auto& pal = sdrjo::gui::palette();
+        ImU32 col = ImGui::GetColorU32(ovl ? pal.bad : pal.text);
+        dl->AddText(ImVec2(wpos.x + wsz.x - tsz.x - 12,
+                           wpos.y + (wsz.y - tsz.y) * 0.5f),
+                    col, sTxt);
     }
     ImGui::End();
     ImGui::PopStyleVar(); // WindowPadding
@@ -2509,17 +2499,8 @@ void drawTetraSection(AppState& app)
         ImGui::TextDisabled("usa NFM/AM sul canale sospetto, poi attiva qui");
     }
 
-    if (ImGui::Checkbox("Rileva attivita'", &app.tetraDetectOn)) {
-        std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
-        if (app.tetraDetectOn)
-            app.tetraDet =
-                std::make_unique<sdrjo::dsp::TetraActivityDetector>(48000.0);
-        else
-            app.tetraDet.reset();
-        app.tetraActive.store(false);
-    }
-    helpTip("Sintonizza il canale sospetto (25 kHz) in NFM e osserva "
-            "l'indicatore: 'attivo' = portante digitale largo presente.");
+    ImGui::TextDisabled("Interruttore sul titolo per attivare. Sintonizza il "
+                        "canale sospetto (25 kHz) in NFM e osserva la spia.");
 
     if (!app.tetraDetectOn) return;
 
@@ -2547,6 +2528,24 @@ void drawTetraSection(AppState& app)
     ImGui::TextDisabled("(TETRA riempie ~18-24 kHz del canale da 25)");
 }
 
+// Header di sezione con interruttore ON/OFF sul titolo (per le funzioni
+// attivabili). Ritorna se la sezione e' aperta; 'changed' = casella premuta.
+bool sectionHeaderToggle(const char* id, const char* label, bool& en,
+                         bool& changed)
+{
+    ImGui::PushID(id);
+    changed = ImGui::Checkbox("##en", &en);
+    ImGui::SameLine();
+    const auto& pal = sdrjo::gui::palette();
+    if (en) ImGui::PushStyleColor(ImGuiCol_Text, pal.acc);
+    char hdr[96];
+    std::snprintf(hdr, sizeof(hdr), "%s###hdr", label);
+    bool open = ImGui::CollapsingHeader(hdr);
+    if (en) ImGui::PopStyleColor();
+    ImGui::PopID();
+    return open;
+}
+
 // Sidebar unica: tutte le sezioni di controllo in una colonna, apribili
 // e richiudibili come menu a tendina (spettro e waterfall tengono cosi'
 // tutta la parte destra dello schermo).
@@ -2571,10 +2570,27 @@ void drawSidebar(AppState& app)
         drawAudioSpectrumSection(app);
     if (ImGui::CollapsingHeader("Decoder testi"))
         drawTextDecoderSection(app);
-    if (ImGui::CollapsingHeader("TETRA (attivita')"))
-        drawTetraSection(app);
-    if (ImGui::CollapsingHeader("Scanner"))
-        drawScannerSection(app);
+    {
+        bool ch = false, en = app.tetraDetectOn;
+        bool open = sectionHeaderToggle("tetra", "TETRA (attivita')", en, ch);
+        if (ch) {
+            std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+            app.tetraDetectOn = en;
+            if (en)
+                app.tetraDet = std::make_unique<sdrjo::dsp::TetraActivityDetector>(
+                    48000.0);
+            else
+                app.tetraDet.reset();
+            app.tetraActive.store(false);
+        }
+        if (open) drawTetraSection(app);
+    }
+    {
+        bool ch = false, en = app.scanOn;
+        bool open = sectionHeaderToggle("scan", "Scanner", en, ch);
+        if (ch) app.scanOn = en;
+        if (open) drawScannerSection(app);
+    }
     if (ImGui::CollapsingHeader("Satelliti"))
         drawSatellitesSection(app);
     if (ImGui::CollapsingHeader("Frequenze"))
@@ -3391,8 +3407,8 @@ void drawScannerSection(AppState& app)
     if (!ready)
         ImGui::TextWrapped("Servono: memorie salvate in Frequenze, un "
                            "demodulatore acceso e lo squelch attivo (lo "
-                           "scanner si ferma dove lo squelch apre).");
-    ImGui::Checkbox("Attivo##scan", &app.scanOn);
+                           "scanner si ferma dove lo squelch apre). "
+                           "Avvia/ferma con l'interruttore sul titolo.");
     ImGui::SliderInt("Attesa (ms)", &app.scanDwellMs, 200, 3000);
     ImGui::SliderFloat("Riprendi dopo (s)", &app.scanResumeSec, 0.5f, 10.0f,
                        "%.1f");
