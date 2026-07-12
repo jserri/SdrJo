@@ -116,6 +116,7 @@ struct AppState : public sdrjo::IModuleHost {
     float rangeMinDb = -110.0f;      // fondo scala (luminosita')
     float rangeMaxDb = -10.0f;       // tetto scala (contrasto)
     float wfContrast = 1.0f;         // gamma della palette (slider laterale)
+    float wfBrightness = 1.0f;       // luminosita' globale del waterfall
     float uiScale = 1.0f;            // scala dei font dell'interfaccia
     int fftWindow = 0;               // 0 = Hann, 1 = Blackman-Harris
     int wfRows = kWaterfallRows;     // memoria del waterfall (righe)
@@ -803,6 +804,44 @@ inline RGBf lerpAnchors(const RGBf* a, const float* pos, int n, float t)
     return a[n - 1];
 }
 
+// Colore base della palette del waterfall (t 0..1), senza gamma/luminosita'.
+// Usata sia dalla texture sia dall'anteprima nel selettore.
+inline RGBf paletteRGB(int palette, float t)
+{
+    t = std::clamp(t, 0.0f, 1.0f);
+    switch (palette) {
+    case 1: // grigi
+        return {t, t, t};
+    case 2: // fuoco
+        return {std::clamp(t * 3.0f, 0.0f, 1.0f),
+                std::clamp(t * 3.0f - 1.0f, 0.0f, 1.0f),
+                std::clamp(t * 3.0f - 2.0f, 0.0f, 1.0f)};
+    case 3: { // Viridis
+        static const RGBf a[] = {
+            {0.267f, 0.005f, 0.329f}, {0.229f, 0.322f, 0.545f},
+            {0.128f, 0.567f, 0.551f}, {0.369f, 0.789f, 0.383f},
+            {0.993f, 0.906f, 0.144f}};
+        static const float p[] = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f};
+        return lerpAnchors(a, p, 5, t);
+    }
+    case 4: { // Turbo
+        static const RGBf a[] = {
+            {0.190f, 0.072f, 0.232f}, {0.275f, 0.408f, 0.859f},
+            {0.180f, 0.720f, 0.884f}, {0.157f, 0.925f, 0.596f},
+            {0.478f, 0.999f, 0.235f}, {0.827f, 0.910f, 0.157f},
+            {0.988f, 0.652f, 0.211f}, {0.914f, 0.310f, 0.055f},
+            {0.480f, 0.016f, 0.011f}};
+        static const float p[] = {0.0f, 0.13f, 0.25f, 0.38f, 0.5f,
+                                  0.63f, 0.75f, 0.88f, 1.0f};
+        return lerpAnchors(a, p, 9, t);
+    }
+    default: // classica
+        return {std::clamp(t * 2.5f - 1.2f, 0.0f, 1.0f),
+                std::clamp(t * 2.0f - 0.5f, 0.0f, 1.0f),
+                std::clamp(t * 3.0f, 0.0f, 1.0f) * (1.0f - 0.5f * t)};
+    }
+}
+
 // Cambia il numero di righe di storia del waterfall.
 void resizeWaterfall(AppState& app, int rows)
 {
@@ -832,51 +871,14 @@ void uploadWaterfallTexture(AppState& app)
     const int palette = app.wfPalette;
     // Contrasto (levetta laterale): curva gamma sulla mappa dei colori.
     const float gamma = 1.0f / std::max(0.25f, app.wfContrast);
+    const float bright = std::clamp(app.wfBrightness, 0.3f, 3.0f);
     auto colorize = [&](float db) -> uint32_t {
         float t = std::clamp((db - lo) / span, 0.0f, 1.0f);
         t = std::pow(t, gamma);
-        uint8_t r, g, b;
-        switch (palette) {
-        case 1: // grigi
-            r = g = b = uint8_t(255.0f * t);
-            break;
-        case 2: // fuoco: nero -> rosso -> giallo -> bianco
-            r = uint8_t(255.0f * std::clamp(t * 3.0f, 0.0f, 1.0f));
-            g = uint8_t(255.0f * std::clamp(t * 3.0f - 1.0f, 0.0f, 1.0f));
-            b = uint8_t(255.0f * std::clamp(t * 3.0f - 2.0f, 0.0f, 1.0f));
-            break;
-        case 3: { // Viridis (percettivamente uniforme, standard moderno)
-            static const RGBf a[] = {
-                {0.267f, 0.005f, 0.329f}, {0.229f, 0.322f, 0.545f},
-                {0.128f, 0.567f, 0.551f}, {0.369f, 0.789f, 0.383f},
-                {0.993f, 0.906f, 0.144f}};
-            static const float p[] = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f};
-            RGBf c = lerpAnchors(a, p, 5, t);
-            r = uint8_t(255.0f * c.r); g = uint8_t(255.0f * c.g);
-            b = uint8_t(255.0f * c.b);
-            break;
-        }
-        case 4: { // Turbo (jet migliorato di Google: molto "SDR pro")
-            static const RGBf a[] = {
-                {0.190f, 0.072f, 0.232f}, {0.275f, 0.408f, 0.859f},
-                {0.180f, 0.720f, 0.884f}, {0.157f, 0.925f, 0.596f},
-                {0.478f, 0.999f, 0.235f}, {0.827f, 0.910f, 0.157f},
-                {0.988f, 0.652f, 0.211f}, {0.914f, 0.310f, 0.055f},
-                {0.480f, 0.016f, 0.011f}};
-            static const float p[] = {0.0f, 0.13f, 0.25f, 0.38f, 0.5f,
-                                      0.63f, 0.75f, 0.88f, 1.0f};
-            RGBf c = lerpAnchors(a, p, 9, t);
-            r = uint8_t(255.0f * c.r); g = uint8_t(255.0f * c.g);
-            b = uint8_t(255.0f * c.b);
-            break;
-        }
-        default: // classica: blu -> ciano -> giallo
-            r = uint8_t(255.0f * std::clamp(t * 2.5f - 1.2f, 0.0f, 1.0f));
-            g = uint8_t(255.0f * std::clamp(t * 2.0f - 0.5f, 0.0f, 1.0f));
-            b = uint8_t(255.0f * std::clamp(t * 3.0f, 0.0f, 1.0f) *
-                        (1.0f - 0.5f * t));
-            break;
-        }
+        RGBf c = paletteRGB(palette, t);
+        uint8_t r = uint8_t(255.0f * std::clamp(c.r * bright, 0.0f, 1.0f));
+        uint8_t g = uint8_t(255.0f * std::clamp(c.g * bright, 0.0f, 1.0f));
+        uint8_t b = uint8_t(255.0f * std::clamp(c.b * bright, 0.0f, 1.0f));
         return 0xFF000000u | (uint32_t(b) << 16) | (uint32_t(g) << 8) | r;
     };
 
@@ -1673,7 +1675,36 @@ void drawSpectrumPanel(AppState& app)
                                           "Viridis", "Turbo"};
         if (ImGui::Combo("Palette", &app.wfPalette, kPalNames, 5))
             app.wfFullRedraw = true;
+        // Anteprima della palette: barretta a gradiente accanto al selettore.
         ImGui::SameLine();
+        {
+            ImDrawList* pdl = ImGui::GetWindowDrawList();
+            ImVec2 pp = ImGui::GetCursorScreenPos();
+            const float pw = 90.0f, ph = ImGui::GetFrameHeight();
+            const int steps = 32;
+            for (int i = 0; i < steps; i++) {
+                RGBf a = paletteRGB(app.wfPalette, float(i) / steps);
+                RGBf b = paletteRGB(app.wfPalette, float(i + 1) / steps);
+                ImU32 ca = IM_COL32(int(a.r * 255), int(a.g * 255),
+                                    int(a.b * 255), 255);
+                ImU32 cb = IM_COL32(int(b.r * 255), int(b.g * 255),
+                                    int(b.b * 255), 255);
+                float x0 = pp.x + pw * i / steps, x1 = pp.x + pw * (i + 1) / steps;
+                pdl->AddRectFilledMultiColor(ImVec2(x0, pp.y),
+                                             ImVec2(x1, pp.y + ph), ca, cb, cb, ca);
+            }
+            pdl->AddRect(pp, ImVec2(pp.x + pw, pp.y + ph),
+                         ImGui::GetColorU32(ImGuiCol_Border), 3.0f);
+            ImGui::Dummy(ImVec2(pw, ph));
+        }
+        // Luminosita' globale del waterfall (moltiplicatore rapido).
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(130);
+        if (ImGui::SliderFloat("Luminosita'", &app.wfBrightness, 0.3f, 3.0f,
+                               "%.1fx"))
+            app.wfFullRedraw = true;
+        helpTip("Schiarisce/scurisce il waterfall senza toccare Range e "
+                "Contrasto (comodo di sera).");
         ImGui::SetNextItemWidth(90);
         static const char* kFftNames[] = {"4096", "8192", "16384", "32768",
                                           "65536"};
@@ -2603,6 +2634,23 @@ bool sectionHeaderToggle(const char* id, const char* label, bool& en,
     return open;
 }
 
+// Titolo di sezione con un pallino colore-categoria a sinistra: aiuta a
+// orientarsi a colpo d'occhio tra le tante sezioni. Il pallino sta nello
+// spazio lasciato dai due spazi iniziali del titolo.
+bool iconHeader(const char* label, ImVec4 dot, ImGuiTreeNodeFlags flags = 0)
+{
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "   %s", label);
+    bool open = ImGui::CollapsingHeader(buf, flags);
+    ImVec2 mn = ImGui::GetItemRectMin();
+    float h = ImGui::GetItemRectSize().y;
+    float fs = ImGui::GetFontSize();
+    ImGui::GetWindowDrawList()->AddCircleFilled(
+        ImVec2(mn.x + fs * 1.55f, mn.y + h * 0.5f), fs * 0.26f,
+        ImGui::GetColorU32(dot));
+    return open;
+}
+
 // Sidebar unica: tutte le sezioni di controllo in una colonna, apribili
 // e richiudibili come menu a tendina (spettro e waterfall tengono cosi'
 // tutta la parte destra dello schermo).
@@ -2615,17 +2663,18 @@ void drawSidebar(AppState& app)
                              ImGuiCond_Always);
     ImGui::Begin("Controlli", nullptr, ImGuiWindowFlags_NoMove);
 
-    if (ImGui::CollapsingHeader("Dispositivo", ImGuiTreeNodeFlags_DefaultOpen))
+    const auto& pal = sdrjo::gui::palette();
+    if (iconHeader("Dispositivo", pal.acc, ImGuiTreeNodeFlags_DefaultOpen))
         drawDeviceSection(app);
-    if (ImGui::CollapsingHeader("Ricevitore", ImGuiTreeNodeFlags_DefaultOpen))
+    if (iconHeader("Ricevitore", pal.acc, ImGuiTreeNodeFlags_DefaultOpen))
         drawReceiverSection(app);
-    if (ImGui::CollapsingHeader("Posizione antenna"))
+    if (iconHeader("Posizione antenna", pal.acc2))
         drawStationSection(app);
-    if (ImGui::CollapsingHeader("Bande rapide"))
+    if (iconHeader("Bande rapide", pal.ok))
         drawBandsSection(app);
-    if (ImGui::CollapsingHeader("Spettro audio"))
+    if (iconHeader("Spettro audio", pal.acc))
         drawAudioSpectrumSection(app);
-    if (ImGui::CollapsingHeader("Decoder testi"))
+    if (iconHeader("Decoder testi", pal.acc2))
         drawTextDecoderSection(app);
     {
         bool ch = false, en = app.tetraDetectOn;
@@ -2648,15 +2697,15 @@ void drawSidebar(AppState& app)
         if (ch) app.scanOn = en;
         if (open) drawScannerSection(app);
     }
-    if (ImGui::CollapsingHeader("Satelliti"))
+    if (iconHeader("Satelliti", pal.acc2))
         drawSatellitesSection(app);
-    if (ImGui::CollapsingHeader("Frequenze"))
+    if (iconHeader("Frequenze", pal.warn))
         drawFrequenciesSection(app);
-    if (ImGui::CollapsingHeader("Moduli"))
+    if (iconHeader("Moduli", pal.ok))
         drawModulesSection(app);
-    if (ImGui::CollapsingHeader("Audio"))
+    if (iconHeader("Audio", pal.ok))
         drawAudioSection(app);
-    if (ImGui::CollapsingHeader("Log"))
+    if (iconHeader("Log", pal.dim))
         drawLogSection(app);
 
     ImGui::End();

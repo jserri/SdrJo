@@ -273,6 +273,18 @@ Fatti (17a tornata, sintonia col frequenzimetro come SDR#):
   grezzo, quindi basta poco: cosi' il segnale sintonizzato resta al centro
   dello spettro invece che fisso a ~60%.
 
+Fatti (24a tornata, tocchi finali del restyling):
+
+- ✅ **Luminosita' waterfall**: slider (0.3-3x) che schiarisce/scurisce il
+  waterfall senza toccare Range/Contrasto (comodo di sera).
+- ✅ **Anteprima palette**: barretta a gradiente accanto al selettore, si
+  vede subito com'e' la mappa di colore scelta.
+- ✅ **Pallini colore-categoria sui titoli** delle sezioni: orientamento a
+  colpo d'occhio nella sidebar (azzurro=RX/spettro, viola=antenna/decoder/
+  satelliti, verde=bande/moduli/audio, arancio=frequenze, grigio=log).
+- Rifattorizzata la mappa colori in paletteRGB() condivisa (texture +
+  anteprima).
+
 Fatti (23a tornata, restyling moderno spettro/waterfall):
 
 - ✅ **Palette waterfall moderne**: aggiunte **Viridis** e **Turbo**
