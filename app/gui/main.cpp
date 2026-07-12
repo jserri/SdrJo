@@ -1152,9 +1152,16 @@ void drawStationSection(AppState& app)
 double antiDcOffset(const AppState& app)
 {
     if (app.listenMode == AppState::ListenMode::Off) return 0.0;
+    // Offset PICCOLO: basta scostare il segnale dalla riga della DC (che il
+    // DC blocker gia' scava sul flusso grezzo). Tenendolo piccolo il segnale
+    // sintonizzato resta praticamente al CENTRO dello spettro, cosi' quando
+    // cambi frequenza col frequenzimetro si vede subito il segnale ricentrarsi
+    // (con l'offset enorme di prima il marker restava fisso a ~60% e sembrava
+    // che non cambiasse nulla). Scala con la larghezza per liberare la DC
+    // anche sui segnali larghi (WFM), ma senza esagerare.
     double maxOff = app.sampleRate * 0.45 - app.listenBwHz * 0.5;
-    return std::clamp(app.sampleRate * 0.10, 30e3,
-                      std::max(30e3, maxOff));
+    double want = std::max(12000.0, app.listenBwHz * 0.55);
+    return std::clamp(want, 0.0, std::max(0.0, maxOff));
 }
 
 // Centra la vista zoomata sulla frequenza sintonizzata. Usata SOLO per
@@ -1248,20 +1255,30 @@ void applyTunedFrequency(AppState& app, double f, bool forceHwRetune = false)
     }
 }
 
-// Sintonia assoluta "vai a" (dial e campo MHz): porta SEMPRE l'hardware a
-// centrare la frequenza scelta (con piccolo offset anti-DC), cosi' lo
-// spettro segue davvero il numero impostato invece di restare indietro.
+// Sintonia "vai a" (dial e campo MHz). Si comporta come su SDR#:
+//  - se la frequenza cade nello span gia' ricevuto, muove SOLO il marker
+//    del VFO: i segnali a schermo restano fermi e il marker ci scorre
+//    sopra, cosi' si VEDE che la sintonia e' cambiata;
+//  - se cade fuori, risintonizza la chiavetta e ricentra la vista sul
+//    numero scelto (con un piccolo offset anti-DC).
+// Prima ricentrava SEMPRE l'hardware: a piena banda righello e spettro
+// scorrevano insieme e sembrava che non cambiasse nulla.
 void tuneAbsolute(AppState& app, double f)
 {
     std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
     f = std::clamp(f, 0.0, 1.999e9);
-    double offset = antiDcOffset(app);
-    app.listenOffsetHz = offset;
-    requestHwCenter(app, f - offset, /*immediate=*/true);
-    if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
-    // Ricentro la vista sulla frequenza scelta: il numero impostato finisce
-    // sempre al centro dello spettro, senza spostamenti strani del righello.
-    centerViewOnTuned(app);
+    double center = app.freqMHz * 1e6;
+    if (app.source && std::fabs(f - center) < app.sampleRate * 0.45) {
+        app.listenOffsetHz = f - center;               // solo VFO
+        if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
+        keepTunedInView(app);
+    } else {
+        double offset = antiDcOffset(app);
+        app.listenOffsetHz = offset;
+        requestHwCenter(app, f - offset, /*immediate=*/true);
+        if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
+        centerViewOnTuned(app);
+    }
 }
 
 // Frequenzimetro a cifre stile SDR Console: rotellina su una cifra per

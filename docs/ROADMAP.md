@@ -260,6 +260,19 @@ Fatti (16a tornata, rifiniture UI):
   spostati dalla sezione Dispositivo a un menu a tendina dedicato,
   richiudibile (lo si imposta una volta e si lascia chiuso).
 
+Fatti (17a tornata, sintonia col frequenzimetro come SDR#):
+
+- ✅ **Frequenzimetro/campo MHz stile SDR#**: se la frequenza scelta e' gia'
+  nello span ricevuto muove SOLO il marker del VFO (i segnali a schermo
+  restano fermi e il marker ci scorre sopra: si VEDE che hai cambiato);
+  esce dalla chiavetta solo se vai fuori span. Prima ricentrava sempre
+  l'hardware e a piena banda righello+spettro scorrevano insieme facendo
+  sembrare che non cambiasse nulla.
+- ✅ **Offset anti-DC piccolo**: ridotto da ~240 kHz a ~12-110 kHz (scala
+  con la larghezza). Il DC blocker gia' scava la riga della DC sul flusso
+  grezzo, quindi basta poco: cosi' il segnale sintonizzato resta al centro
+  dello spettro invece che fisso a ~60%.
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).
