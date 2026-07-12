@@ -1296,36 +1296,21 @@ void applyTunedFrequency(AppState& app, double f, bool forceHwRetune = false)
     }
 }
 
-// Sintonia "vai a" (dial e campo MHz). Si comporta come su SDR#:
-//  - se la frequenza cade nello span gia' ricevuto, muove SOLO il marker
-//    del VFO: i segnali a schermo restano fermi e il marker ci scorre
-//    sopra, cosi' si VEDE che la sintonia e' cambiata;
-//  - se cade fuori, risintonizza la chiavetta e ricentra la vista sul
-//    numero scelto (con un piccolo offset anti-DC).
-// Prima ricentrava SEMPRE l'hardware: a piena banda righello e spettro
-// scorrevano insieme e sembrava che non cambiasse nulla.
+// Sintonia "vai a" (frequenzimetro in alto e campo MHz): come su SDR#,
+// porta SEMPRE la frequenza scelta al CENTRO dello spettro risintonizzando
+// la chiavetta (con un piccolo offset anti-DC). Cosi' quando digiti o giri
+// una frequenza vedi SUBITO quella banda centrata, e non "a volte si muove
+// e a volte no". La sintonia fine che sposta solo il marker sui segnali
+// fermi e' invece il CLICK sullo spettro (applyTunedFrequency).
 void tuneAbsolute(AppState& app, double f)
 {
     std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
     f = std::clamp(f, 0.0, 1.999e9);
-    double center = app.freqMHz * 1e6;
-    if (app.source && std::fabs(f - center) < app.sampleRate * 0.45) {
-        app.listenOffsetHz = f - center;               // solo VFO
-        if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
-        keepTunedInView(app);
-        char b[160];
-        std::snprintf(b, sizeof(b),
-                      "VFO: sintonia %.4f MHz dentro span (HW resta a "
-                      "%.4f MHz, off %.1f kHz)",
-                      f / 1e6, center / 1e6, app.listenOffsetHz / 1e3);
-        app.log("Sintonia", b);
-    } else {
-        double offset = antiDcOffset(app);
-        app.listenOffsetHz = offset;
-        requestHwCenter(app, f - offset, /*immediate=*/true);
-        if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
-        centerViewOnTuned(app);
-    }
+    double offset = antiDcOffset(app);
+    app.listenOffsetHz = offset;
+    requestHwCenter(app, f - offset, /*immediate=*/true);
+    if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
+    centerViewOnTuned(app);
 }
 
 // Frequenzimetro a cifre stile SDR Console: rotellina su una cifra per

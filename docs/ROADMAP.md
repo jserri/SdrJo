@@ -273,6 +273,18 @@ Fatti (17a tornata, sintonia col frequenzimetro come SDR#):
   grezzo, quindi basta poco: cosi' il segnale sintonizzato resta al centro
   dello spettro invece che fisso a ~60%.
 
+Fatti (19a tornata, frequenzimetro "vai a" + diagnostica risolutiva):
+
+- ✅ Il log di sintonia ha PROVATO che la chiavetta risintonizza davvero
+  (ogni retune rc=0 e la frequenza riletta combacia). Il problema era il
+  comportamento del frequenzimetro, non il comando hardware.
+- ✅ **Frequenzimetro = "vai a"**: ora il frequenzimetro in alto e il campo
+  MHz ricentrano SEMPRE la chiavetta sulla frequenza scelta, portandola al
+  centro dello spettro. Nella tornata precedente, per le piccole variazioni,
+  muovevano solo il marker lasciando lo spettro fermo (giusto per il click
+  sullo spettro, ma sul frequenzimetro sembrava che non cambiasse nulla). Il
+  click sullo spettro resta la sintonia fine dentro lo span.
+
 Fatti (18a tornata, diagnostica sintonia hardware):
 
 - ✅ **Righello onesto**: `freqMHz` (che pilota il righello) ora segue la
