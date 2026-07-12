@@ -121,7 +121,7 @@ struct AppState : public sdrjo::IModuleHost {
     int wfRows = kWaterfallRows;     // memoria del waterfall (righe)
     int wfSpeedDiv = 4;              // 1 riga ogni N FFT (velocita')
     int wfSpeedCounter = 0;
-    int wfPalette = 0;               // 0 classica, 1 grigi, 2 fuoco
+    int wfPalette = 4;               // 0 classica 1 grigi 2 fuoco 3 viridis 4 turbo
     float wfSplit = 0.42f;           // quota di altezza dello spettro
 
     std::vector<sdrjo::LoadedModule> modules;
@@ -424,6 +424,9 @@ void loadConfig(AppState& app)
             app.decoderSquelch = std::clamp(float(v), 0.0f, 0.6f);
         else if (std::sscanf(line, "snap_to_peak=%d", &iv) == 1)
             app.snapToPeak = iv != 0;
+        else if (std::sscanf(line, "wf_palette=%d", &iv) == 1 &&
+                 iv >= 0 && iv <= 4)
+            app.wfPalette = iv;
     }
     std::fclose(f);
 }
@@ -436,11 +439,11 @@ void saveConfig(AppState& app)
                  "station_lat=%.6f\nstation_lon=%.6f\n"
                  "freq_mhz=%.6f\nmode=%d\nbandwidth_hz=%.1f\n"
                  "volume=%.3f\nsnap_hz=%.1f\nui_scale=%.2f\n"
-                 "decoder_squelch=%.3f\nsnap_to_peak=%d\n",
+                 "decoder_squelch=%.3f\nsnap_to_peak=%d\nwf_palette=%d\n",
                  app.stationLat, app.stationLon, app.freqMHz,
                  int(app.listenMode), app.listenBwHz, double(app.volume),
                  app.snapHz, double(app.uiScale), double(app.decoderSquelch),
-                 app.snapToPeak ? 1 : 0);
+                 app.snapToPeak ? 1 : 0, app.wfPalette);
     std::fclose(f);
 }
 
@@ -783,6 +786,23 @@ void dspLoop(AppState& app)
     }
 }
 
+// Interpolazione su punti d'ancoraggio per le mappe di colore moderne
+// (Viridis, Turbo): percettivamente uniformi, il look "pro" degli SDR.
+struct RGBf { float r, g, b; };
+inline RGBf lerpAnchors(const RGBf* a, const float* pos, int n, float t)
+{
+    if (t <= pos[0]) return a[0];
+    for (int i = 1; i < n; i++) {
+        if (t <= pos[i]) {
+            float u = (t - pos[i - 1]) / (pos[i] - pos[i - 1]);
+            return {a[i - 1].r + (a[i].r - a[i - 1].r) * u,
+                    a[i - 1].g + (a[i].g - a[i - 1].g) * u,
+                    a[i - 1].b + (a[i].b - a[i - 1].b) * u};
+        }
+    }
+    return a[n - 1];
+}
+
 // Cambia il numero di righe di storia del waterfall.
 void resizeWaterfall(AppState& app, int rows)
 {
@@ -825,6 +845,31 @@ void uploadWaterfallTexture(AppState& app)
             g = uint8_t(255.0f * std::clamp(t * 3.0f - 1.0f, 0.0f, 1.0f));
             b = uint8_t(255.0f * std::clamp(t * 3.0f - 2.0f, 0.0f, 1.0f));
             break;
+        case 3: { // Viridis (percettivamente uniforme, standard moderno)
+            static const RGBf a[] = {
+                {0.267f, 0.005f, 0.329f}, {0.229f, 0.322f, 0.545f},
+                {0.128f, 0.567f, 0.551f}, {0.369f, 0.789f, 0.383f},
+                {0.993f, 0.906f, 0.144f}};
+            static const float p[] = {0.0f, 0.25f, 0.5f, 0.75f, 1.0f};
+            RGBf c = lerpAnchors(a, p, 5, t);
+            r = uint8_t(255.0f * c.r); g = uint8_t(255.0f * c.g);
+            b = uint8_t(255.0f * c.b);
+            break;
+        }
+        case 4: { // Turbo (jet migliorato di Google: molto "SDR pro")
+            static const RGBf a[] = {
+                {0.190f, 0.072f, 0.232f}, {0.275f, 0.408f, 0.859f},
+                {0.180f, 0.720f, 0.884f}, {0.157f, 0.925f, 0.596f},
+                {0.478f, 0.999f, 0.235f}, {0.827f, 0.910f, 0.157f},
+                {0.988f, 0.652f, 0.211f}, {0.914f, 0.310f, 0.055f},
+                {0.480f, 0.016f, 0.011f}};
+            static const float p[] = {0.0f, 0.13f, 0.25f, 0.38f, 0.5f,
+                                      0.63f, 0.75f, 0.88f, 1.0f};
+            RGBf c = lerpAnchors(a, p, 9, t);
+            r = uint8_t(255.0f * c.r); g = uint8_t(255.0f * c.g);
+            b = uint8_t(255.0f * c.b);
+            break;
+        }
         default: // classica: blu -> ciano -> giallo
             r = uint8_t(255.0f * std::clamp(t * 2.5f - 1.2f, 0.0f, 1.0f));
             g = uint8_t(255.0f * std::clamp(t * 2.0f - 0.5f, 0.0f, 1.0f));
@@ -1624,8 +1669,9 @@ void drawSpectrumPanel(AppState& app)
             resizeWaterfall(app, kRowVals[rowIdx]);
         ImGui::SameLine();
         ImGui::SetNextItemWidth(90);
-        static const char* kPalNames[] = {"Classica", "Grigi", "Fuoco"};
-        if (ImGui::Combo("Palette", &app.wfPalette, kPalNames, 3))
+        static const char* kPalNames[] = {"Classica", "Grigi", "Fuoco",
+                                          "Viridis", "Turbo"};
+        if (ImGui::Combo("Palette", &app.wfPalette, kPalNames, 5))
             app.wfFullRedraw = true;
         ImGui::SameLine();
         ImGui::SetNextItemWidth(90);
@@ -1787,8 +1833,11 @@ void drawSpectrumPanel(AppState& app)
         // Mappa i pixel sui bin della finestra di vista (zoom incluso).
         const double startBin = (v0 - f0) / (f1 - f0) * double(n);
         const double binsPerPx = (v1 - v0) / (f1 - f0) * double(n) / w;
-        auto plotTrace = [&](const float* src, ImU32 line, ImU32 fill,
-                             bool withFill, float thickness) {
+        // Traccia moderna: riempimento a gradiente verticale (brillante
+        // sulla curva, sfuma verso il basso) + alone (glow) sotto la linea.
+        auto plotTrace = [&](const float* src, ImU32 line, ImU32 glow,
+                             ImU32 fillTop, ImU32 fillBot, bool withFill,
+                             float thickness) {
             float prevY = 0;
             for (int px = 0; px < int(w); px++) {
                 float v = -160.0f;
@@ -1815,25 +1864,30 @@ void drawSpectrumPanel(AppState& app)
                 }
                 float y = yOf(v);
                 if (withFill)
-                    dl->AddLine(ImVec2(s0.x + px, y),
-                                ImVec2(s0.x + px, s1.y), fill);
-                if (px > 0)
-                    dl->AddLine(ImVec2(s0.x + px - 1, prevY),
-                                ImVec2(s0.x + px, y), line, thickness);
+                    dl->AddRectFilledMultiColor(
+                        ImVec2(s0.x + px, y), ImVec2(s0.x + px + 1, s1.y),
+                        fillTop, fillTop, fillBot, fillBot);
+                if (px > 0) {
+                    ImVec2 a(s0.x + px - 1, prevY), c(s0.x + px, y);
+                    if (glow) dl->AddLine(a, c, glow, thickness * 3.2f);
+                    dl->AddLine(a, c, line, thickness);
+                }
                 prevY = y;
             }
         };
 
+        const auto& pal = sdrjo::gui::palette();
+        auto col = [](ImVec4 v, float a) {
+            v.w = a; return ImGui::GetColorU32(v);
+        };
         if (app.specMaxOn && app.specMax.size() == n)
-            plotTrace(app.specMax.data(),
-                      ImGui::GetColorU32(ImVec4(1.0f, 0.85f, 0.3f, 0.55f)),
-                      0, false, 1.0f);
+            plotTrace(app.specMax.data(), col(pal.warn, 0.6f), 0, 0, 0, false,
+                      1.0f);
         const float* main = (app.specAvgOn && app.specAvg.size() == n)
                                 ? app.specAvg.data()
                                 : raw;
-        plotTrace(main, ImGui::GetColorU32(ImVec4(0.22f, 0.71f, 1.0f, 1.0f)),
-                  ImGui::GetColorU32(ImVec4(0.22f, 0.71f, 1.0f, 0.18f)),
-                  true, 1.4f);
+        plotTrace(main, col(pal.acc, 1.0f), col(pal.acc, 0.15f),
+                  col(pal.acc, 0.34f), col(pal.acc, 0.0f), true, 1.5f);
     }
 
     // Marker del VFO di ascolto: banda evidenziata, bordi trascinabili.
@@ -1864,7 +1918,10 @@ void drawSpectrumPanel(AppState& app)
         vfoX0 = xOf(loHz);
         vfoX1 = xOf(hiHz);
         dl->AddRectFilled(ImVec2(vfoX0, s0.y), ImVec2(vfoX1, s1.y),
-                          ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.15f)));
+                          ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.13f)));
+        // Linea del VFO con alone (glow) per un look moderno.
+        dl->AddLine(ImVec2(vfoX, s0.y), ImVec2(vfoX, s1.y),
+                    ImGui::GetColorU32(ImVec4(1.0f, 0.71f, 0.33f, 0.25f)), 5.0f);
         dl->AddLine(ImVec2(vfoX, s0.y), ImVec2(vfoX, s1.y), vfoCol, 1.5f);
         dl->AddLine(ImVec2(vfoX0, s0.y), ImVec2(vfoX0, s1.y), vfoColSoft);
         dl->AddLine(ImVec2(vfoX1, s0.y), ImVec2(vfoX1, s1.y), vfoColSoft);

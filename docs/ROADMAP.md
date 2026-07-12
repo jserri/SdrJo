@@ -273,6 +273,16 @@ Fatti (17a tornata, sintonia col frequenzimetro come SDR#):
   grezzo, quindi basta poco: cosi' il segnale sintonizzato resta al centro
   dello spettro invece che fisso a ~60%.
 
+Fatti (23a tornata, restyling moderno spettro/waterfall):
+
+- ✅ **Palette waterfall moderne**: aggiunte **Viridis** e **Turbo**
+  (mappe percettivamente uniformi, il look degli SDR "pro"); Turbo di
+  default, scelta salvata in configurazione. Stessa palette Turbo anche
+  nel waterfall del Cockpit web, per coerenza app/web.
+- ✅ **Spettro piu' moderno**: riempimento della traccia a **gradiente
+  verticale** (brillante sulla curva, sfuma verso il basso) + **alone
+  (glow)** sotto la linea e sul marker del VFO.
+
 Fatti (22a tornata, restyling grafico + rifiniture):
 
 - ✅ **Tema rifinito**: palette condivisa (azzurro + secondo accento viola),

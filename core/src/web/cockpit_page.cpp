@@ -340,15 +340,24 @@ function sizeCanvases() {
   }
 }
 
-// Palette del waterfall (nero -> blu -> ciano -> giallo -> bianco).
+// Palette del waterfall "Turbo" (come l'app): viola -> blu -> ciano ->
+// verde -> giallo -> rosso. Interpolazione su punti d'ancoraggio.
 const wfLut = new Array(256);
-for (let i = 0; i < 256; i++) {
-  const t = i / 255;
-  const r = Math.min(255, Math.max(0, 700 * (t - 0.45)));
-  const g = Math.min(255, Math.max(0, 460 * (t - 0.25)));
-  const b = Math.min(255, t < 0.5 ? 220 * t * 2 : 480 * (1 - t) + 120);
-  wfLut[i] = [r | 0, g | 0, b | 0];
-}
+(function () {
+  const stops = [0, .13, .25, .38, .5, .63, .75, .88, 1];
+  const cols = [[48,18,59],[70,104,219],[46,184,225],[40,236,152],
+                [122,255,60],[211,232,40],[252,166,54],[233,79,14],
+                [122,4,3]];
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    let k = 0; while (k < stops.length - 2 && t > stops[k + 1]) k++;
+    const u = (t - stops[k]) / (stops[k + 1] - stops[k]);
+    const a = cols[k], b = cols[k + 1];
+    wfLut[i] = [a[0] + (b[0] - a[0]) * u | 0,
+                a[1] + (b[1] - a[1]) * u | 0,
+                a[2] + (b[2] - a[2]) * u | 0];
+  }
+})();
 
 function drawBands() {
   const ctx = bandCv.getContext("2d");
