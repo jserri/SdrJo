@@ -273,6 +273,16 @@ Fatti (17a tornata, sintonia col frequenzimetro come SDR#):
   grezzo, quindi basta poco: cosi' il segnale sintonizzato resta al centro
   dello spettro invece che fisso a ~60%.
 
+Fatti (21a tornata, cockpit web: zoom + sample rate):
+
+- ✅ **Zoom dello spettro sul web** come nell'app: rotellina per ingrandire
+  (tiene ferma la frequenza sotto il cursore), trascina per scorrere, click
+  secco per sintonizzare, doppio click per tornare a 1x. Righello, bande,
+  marker VFO e waterfall seguono lo zoom.
+- ✅ **Sample rate dal web**: selettore (0.25 / 0.96 / 1.024 / 1.8 / 2.048 /
+  2.4 / 3.2 MS/s). Un rate basso alleggerisce la banda dati verso il
+  browser. Nuovo handler /api/control?rate=... nel CockpitServer.
+
 Fatti (20a tornata, S-meter calibrato + toggle sui moduli):
 
 - ✅ **Fix S-meter**: la lancetta mappava -120..0 dBFS su S1..+60 e finiva

@@ -69,13 +69,15 @@ std::string CockpitServer::controlJson(const std::string& query)
         return {};
     };
 
-    bool okTune = true, okMode = true;
+    bool okTune = true, okMode = true, okRate = true;
     std::string f = param("freq");
     if (!f.empty() && tune_) okTune = tune_(std::atof(f.c_str()));
     std::string m = param("mode");
     if (!m.empty() && mode_) okMode = mode_(m);
+    std::string r = param("rate");
+    if (!r.empty() && rate_) okRate = rate_(std::atof(r.c_str()));
 
-    return (okTune && okMode) ? "{\"ok\":true}" : "{\"ok\":false}";
+    return (okTune && okMode && okRate) ? "{\"ok\":true}" : "{\"ok\":false}";
 }
 
 // Streaming WAV PCM 16 bit mono 48 kHz senza fine: ogni client ha la sua

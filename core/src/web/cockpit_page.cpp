@@ -128,6 +128,10 @@ const char* cockpitPageHtml()
   <div class="rxbar">
     <span class="vfo" id="vfoFreq">&ndash;</span>
     <span id="modeChips"></span>
+    <label style="font-size:12px;color:var(--dim)">rate
+      <select id="rateSel" style="background:#0d1220;color:var(--text);
+        border:1px solid rgba(120,160,200,.3);border-radius:6px;padding:2px 4px;
+        font-family:var(--mono);font-size:12px"></select></label>
     <span class="playbtn" id="playBtn">&#9654; Ascolta</span>
   </div>
   <div class="nosig" id="nosig" style="display:none">
@@ -153,6 +157,26 @@ let vfo = null;      // {freqHz, mode}
 let bands = [];
 const modes = ["Spento", "WFM stereo", "NFM", "AM", "USB", "LSB"];
 
+// --- Zoom dello spettro (come nell'app): frazioni dello span pieno.
+let viewSpan = 1, viewCenter = 0.5;
+function clampView() {
+  viewSpan = Math.min(1, Math.max(0.02, viewSpan));
+  viewCenter = Math.min(1 - viewSpan / 2, Math.max(viewSpan / 2, viewCenter));
+}
+function visLo() { return viewCenter - viewSpan / 2; }          // 0..1
+function freqAtFrac(fr) {
+  return device.freqHz - device.rateHz / 2 + fr * device.rateHz;
+}
+function freqToX(f, w) { // frequenza -> pixel nella vista zoomata
+  const fr = (f - (device.freqHz - device.rateHz / 2)) / device.rateHz;
+  return (fr - visLo()) / viewSpan * w;
+}
+function xToFreq(clientX) {
+  const r = specCv.getBoundingClientRect();
+  const fr = visLo() + ((clientX - r.left) / r.width) * viewSpan;
+  return freqAtFrac(fr);
+}
+
 async function control(params) {
   try { await fetch("api/control?" + params); } catch (e) {}
   pollStatus();
@@ -165,6 +189,33 @@ function renderChips() {
        data-mode="${m}">${m}</span>`).join(" ");
   for (const c of el.querySelectorAll(".chip"))
     c.onclick = () => control("mode=" + encodeURIComponent(c.dataset.mode));
+}
+
+// Selettore del sample rate: rate bassi (0.96/1.024 MS/s) alleggeriscono la
+// banda dati verso il browser e bastano per un singolo canale stretto.
+const rateOptions = [
+  [250000, "0.25 MS/s"], [960000, "0.96 MS/s"], [1024000, "1.024 MS/s"],
+  [1800000, "1.8 MS/s"], [2048000, "2.048 MS/s"], [2400000, "2.4 MS/s"],
+  [3200000, "3.2 MS/s"]];
+let rateSelBuilt = false;
+function buildRateSel() {
+  const sel = document.getElementById("rateSel");
+  sel.innerHTML = rateOptions.map(([hz, name]) =>
+    `<option value="${hz}">${name}</option>`).join("");
+  sel.onchange = () => control("rate=" + sel.value);
+  rateSelBuilt = true;
+}
+function syncRateSel() {
+  if (!rateSelBuilt) buildRateSel();
+  if (!device || !device.rateHz) return;
+  const sel = document.getElementById("rateSel");
+  // Scegli l'opzione piu' vicina al rate corrente.
+  let best = rateOptions[0][0], bd = 1e12;
+  for (const [hz] of rateOptions) {
+    const d = Math.abs(hz - device.rateHz);
+    if (d < bd) { bd = d; best = hz; }
+  }
+  if (document.activeElement !== sel) sel.value = String(best);
 }
 
 // Ascolto nel browser: prima si prova il WebSocket a bassa latenza
@@ -304,13 +355,12 @@ function drawBands() {
   const w = bandCv.width, h = bandCv.height;
   ctx.clearRect(0, 0, w, h);
   if (!device || !device.rateHz || !bands.length) return;
-  const f0 = device.freqHz - device.rateHz / 2;
-  const f1 = device.freqHz + device.rateHz / 2;
   ctx.font = "10px sans-serif";
   ctx.textBaseline = "middle";
   for (const b of bands) {
-    const x0 = Math.max(0, (b.low - f0) / (f1 - f0) * w);
-    const x1 = Math.min(w, (b.high - f0) / (f1 - f0) * w);
+    const x0 = Math.max(0, freqToX(b.low, w));
+    const x1 = Math.min(w, freqToX(b.high, w));
+    if (x1 <= 0 || x0 >= w) continue;
     const col = bandColors[b.cat] || "#888";
     ctx.fillStyle = col + "44";
     ctx.fillRect(x0, 2, x1 - x0, h - 4);
@@ -341,32 +391,35 @@ function drawSpectrum(db) {
   }
   ctx.stroke();
 
+  // Indice del bin da campionare al pixel x, tenendo conto dello zoom.
+  const N = db.length;
+  const binAtX = (x, ww) => {
+    let i = Math.floor((visLo() + (x / ww) * viewSpan) * N);
+    return i < 0 ? 0 : (i >= N ? N - 1 : i);
+  };
+
   // Traccia con riempimento sfumato.
   const grad = ctx.createLinearGradient(0, 0, 0, h);
   grad.addColorStop(0, "rgba(56,182,255,.55)");
   grad.addColorStop(1, "rgba(56,182,255,.03)");
   ctx.beginPath();
   ctx.moveTo(0, h);
-  for (let x = 0; x < w; x++) {
-    const v = db[Math.floor(x * db.length / w)];
-    ctx.lineTo(x, y(v));
-  }
+  for (let x = 0; x < w; x++) ctx.lineTo(x, y(db[binAtX(x, w)]));
   ctx.lineTo(w, h);
   ctx.closePath();
   ctx.fillStyle = grad;
   ctx.fill();
   ctx.beginPath();
   for (let x = 0; x < w; x++) {
-    const v = db[Math.floor(x * db.length / w)];
+    const v = db[binAtX(x, w)];
     x ? ctx.lineTo(x, y(v)) : ctx.moveTo(0, y(v));
   }
   ctx.strokeStyle = "#38b6ff";
   ctx.lineWidth = 1.4;
   ctx.stroke();
 
-  // Etichette di frequenza sulla griglia verticale.
+  // Etichette di frequenza sulla griglia verticale (nella finestra zoomata).
   if (device && device.rateHz) {
-    const f0 = device.freqHz - device.rateHz / 2;
     ctx.fillStyle = "rgba(160,190,220,.55)";
     ctx.font = "10px monospace";
     const ticks = 8;
@@ -375,16 +428,20 @@ function drawSpectrum(db) {
     for (let k = 1; k < ticks; k++) {
       const x = k * w / ticks;
       ctx.moveTo(x, 0); ctx.lineTo(x, h);
-      const f = (f0 + device.rateHz * k / ticks) / 1e6;
-      ctx.fillText(f.toFixed(3) + " MHz", x + 4, h - 6);
+      const f = freqAtFrac(visLo() + viewSpan * k / ticks) / 1e6;
+      ctx.fillText(f.toFixed(zoomLabelDigits()) + " MHz", x + 4, h - 6);
     }
     ctx.stroke();
+    if (viewSpan < 0.999) {
+      ctx.fillStyle = "rgba(255,180,84,.8)";
+      ctx.fillText("zoom " + (1 / viewSpan).toFixed(1) + "x (doppio click = 1x)",
+                   6, 12);
+    }
   }
 
   // Marker del VFO di ascolto.
   if (vfo && vfo.freqHz > 0 && device && device.rateHz) {
-    const f0v = device.freqHz - device.rateHz / 2;
-    const xv = (vfo.freqHz - f0v) / device.rateHz * w;
+    const xv = freqToX(vfo.freqHz, w);
     if (xv >= 0 && xv <= w) {
       ctx.strokeStyle = "rgba(255,180,84,.9)";
       ctx.lineWidth = 1.5;
@@ -393,7 +450,7 @@ function drawSpectrum(db) {
     }
   }
 
-  // Riga nuova del waterfall (solo su dati nuovi).
+  // Riga nuova del waterfall (solo su dati nuovi), stessa finestra zoomata.
   if (!drawSpectrum.newRow) return;
   drawSpectrum.newRow = false;
   const wctx = wfCv.getContext("2d");
@@ -401,7 +458,7 @@ function drawSpectrum(db) {
                        0, 1, wfCv.width, wfCv.height - 1);
   const line = wctx.createImageData(wfCv.width, 1);
   for (let x = 0; x < wfCv.width; x++) {
-    const v = db[Math.floor(x * db.length / wfCv.width)];
+    const v = db[binAtX(x, wfCv.width)];
     const idx = Math.min(255, Math.max(0,
       Math.round((v - dbMin) / (dbMax - dbMin) * 255)));
     const [r, g, b] = wfLut[idx];
@@ -410,6 +467,9 @@ function drawSpectrum(db) {
   }
   wctx.putImageData(line, 0, 0);
 }
+
+// Piu' cifre nelle etichette quando si e' zoomati (span piccolo).
+function zoomLabelDigits() { return viewSpan < 0.1 ? 4 : 3; }
 
 // Spettro fluido: i dati arrivano a ~5 Hz ma il disegno gira a 60 fps
 // interpolando verso l'ultimo frame ricevuto.
@@ -441,21 +501,51 @@ function animate() {
 }
 requestAnimationFrame(animate);
 
-// Frequenza sotto il cursore + click per sintonizzare.
-specCv.title = "";
-specCv.addEventListener("mousemove", e => {
+// Interazione sullo spettro: rotellina = zoom (mantiene ferma la frequenza
+// sotto il cursore), trascina = scorri la banda, click secco = sintonizza,
+// doppio click = torna a 1x. Come nell'app.
+specCv.title = "rotellina = zoom, trascina = scorri, click = sintonizza";
+let dragging = false, dragX = 0, dragMoved = false, dragCenter0 = 0.5;
+
+specCv.addEventListener("wheel", e => {
   if (!device || !device.rateHz) return;
+  e.preventDefault();
   const r = specCv.getBoundingClientRect();
-  const f = device.freqHz - device.rateHz / 2 +
-            (e.clientX - r.left) / r.width * device.rateHz;
-  specCv.title = (f / 1e6).toFixed(4) + " MHz - click per sintonizzare";
+  const px = (e.clientX - r.left) / r.width;      // 0..1 nella vista
+  const frUnder = visLo() + px * viewSpan;         // frazione assoluta
+  viewSpan *= (e.deltaY < 0 ? 0.8 : 1.25);
+  clampView();
+  // Ricentra sulla frequenza che era sotto il cursore.
+  viewCenter = (frUnder - px * viewSpan) + viewSpan / 2;
+  clampView();
+}, { passive: false });
+
+specCv.addEventListener("dblclick", () => { viewSpan = 1; viewCenter = 0.5; });
+
+specCv.addEventListener("mousedown", e => {
+  dragging = true; dragMoved = false;
+  dragX = e.clientX; dragCenter0 = viewCenter;
 });
-specCv.addEventListener("click", e => {
-  if (!device || !device.rateHz) return;
-  const r = specCv.getBoundingClientRect();
-  const f = device.freqHz - device.rateHz / 2 +
-            (e.clientX - r.left) / r.width * device.rateHz;
-  control("freq=" + Math.round(f));
+window.addEventListener("mousemove", e => {
+  if (dragging && device && device.rateHz) {
+    const r = specCv.getBoundingClientRect();
+    const dx = e.clientX - dragX;
+    if (Math.abs(dx) > 4) dragMoved = true;
+    if (dragMoved) { viewCenter = dragCenter0 - (dx / r.width) * viewSpan; clampView(); }
+  }
+  if (!dragging && device && device.rateHz) {
+    const r = specCv.getBoundingClientRect();
+    if (e.clientX >= r.left && e.clientX <= r.right &&
+        e.clientY >= r.top && e.clientY <= r.bottom)
+      specCv.title = (xToFreq(e.clientX) / 1e6).toFixed(4) +
+                     " MHz - click per sintonizzare";
+  }
+});
+window.addEventListener("mouseup", e => {
+  if (!dragging) return;
+  dragging = false;
+  if (!dragMoved && device && device.rateHz)
+    control("freq=" + Math.round(xToFreq(e.clientX)));
 });
 
 function fmtFreq(hz) { return (hz / 1e6).toFixed(4); }
@@ -477,6 +567,7 @@ async function pollStatus() {
   document.getElementById("vfoFreq").textContent =
     vfo && vfo.freqHz > 0 ? (vfo.freqHz / 1e6).toFixed(4) + " MHz" : "-";
   renderChips();
+  syncRateSel();
   drawBands();
 
   const cards = document.getElementById("cards");

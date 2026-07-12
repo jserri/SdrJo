@@ -304,6 +304,7 @@ struct AppState : public sdrjo::IModuleHost {
     // principale per non toccare lo stato da thread diversi.
     std::mutex remoteMutex;
     double pendingTuneHz = -1.0;
+    double pendingRateHz = -1.0;
     std::string pendingMode;
 
     // Thread DSP: drena l'anello IQ e fa TUTTO il calcolo (moduli, ascolto,
@@ -3648,6 +3649,11 @@ int main(int argc, char** argv)
         app.pendingMode = mode;
         return true;
     });
+    app.cockpit.setRateHandler([&app](double rateHz) {
+        std::lock_guard<std::mutex> lk(app.remoteMutex);
+        app.pendingRateHz = rateHz;
+        return true;
+    });
     // Streaming audio a bassa latenza (WebSocket + ADPCM) accanto al
     // Cockpit: token nuovo a ogni avvio, consegnato da /api/wsinfo.
     {
@@ -3707,13 +3713,24 @@ int main(int argc, char** argv)
 
         // Applica i comandi arrivati dal Cockpit web.
         {
-            double tuneHz = -1.0;
+            double tuneHz = -1.0, rateHz = -1.0;
             std::string mode;
             {
                 std::lock_guard<std::mutex> lk(app.remoteMutex);
                 tuneHz = app.pendingTuneHz;
                 app.pendingTuneHz = -1.0;
+                rateHz = app.pendingRateHz;
+                app.pendingRateHz = -1.0;
                 mode.swap(app.pendingMode);
+            }
+            if (rateHz > 0 && app.source &&
+                std::fabs(rateHz - app.sampleRate) > 1.0) {
+                std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+                app.source->setSampleRate(rateHz);
+                app.sampleRate = app.source->sampleRate();
+                app.channelsDirty = true;
+                rebuildListener(app);
+                resetSpectrumAfterRetune(app);
             }
             if (!mode.empty()) {
                 for (int m = 0; m < 6; m++)

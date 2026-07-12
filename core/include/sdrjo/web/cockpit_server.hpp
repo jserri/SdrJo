@@ -38,6 +38,8 @@ public:
     using TuneHandler = std::function<bool(double freqHz)>;
     // Cambio di demodulatore dal web ("WFM stereo", "NFM", "AM", ...).
     using ModeHandler = std::function<bool(const std::string& mode)>;
+    // Cambio del sample rate della chiavetta dal web (Hz); ritorna successo.
+    using RateHandler = std::function<bool(double rateHz)>;
 
     CockpitServer();
 
@@ -45,6 +47,7 @@ public:
     void setSpectrumProvider(SpectrumProvider p) { spectrum_ = std::move(p); }
     void setTuneHandler(TuneHandler h) { tune_ = std::move(h); }
     void setModeHandler(ModeHandler h) { mode_ = std::move(h); }
+    void setRateHandler(RateHandler h) { rate_ = std::move(h); }
     void setDeviceInfo(const std::string& name, double freqHz, double rateHz);
 
     // Stato del ricevitore d'ascolto, mostrato e comandato dal browser.
@@ -85,6 +88,7 @@ private:
     SpectrumProvider spectrum_;
     TuneHandler tune_;
     ModeHandler mode_;
+    RateHandler rate_;
 
     std::mutex devMutex_;
     std::string deviceName_ = "nessuna sorgente";
