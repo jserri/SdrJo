@@ -58,7 +58,7 @@
 namespace {
 
 constexpr size_t kChunkSize = 4096;   // blocco DSP per moduli/ascolto
-constexpr float kStatusBarH = 26.0f;  // barra di stato in fondo
+constexpr float kStatusBarH = 34.0f;  // barra di stato in fondo (font 17 + bordo)
 // Colonne della texture waterfall: piu' alte = zoom piu' nitido (meno
 // "sgranato"). 8192 raddoppia il dettaglio orizzontale con un costo di
 // memoria contenuto (la RAM scala col numero di righe scelto in "Memoria").
@@ -1084,9 +1084,13 @@ void drawDeviceSection(AppState& app)
         }
     }
 
-    // Posizione dell'antenna: serve alla mappa ADS-B (marker + cerchi di
-    // portata + distanze) e in futuro ai passaggi satellite.
-    ImGui::SeparatorText("Posizione antenna");
+}
+
+// Posizione dell'antenna: serve alla mappa ADS-B (marker + cerchi di
+// portata + distanze) e ai passaggi satellite. Sta in un sottomenu a parte
+// perche' la si imposta una volta e poi la si lascia chiusa.
+void drawStationSection(AppState& app)
+{
     bool posChanged = false;
     fieldLabel("Latitudine");
     posChanged |= ImGui::InputDouble("##lat", &app.stationLat, 0, 0, "%.5f");
@@ -2324,9 +2328,13 @@ void drawStatusBar(AppState& app)
 {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(
-        ImVec2(10, vp->WorkSize.y - kStatusBarH - 4), ImGuiCond_Always);
+        ImVec2(10, vp->WorkSize.y - kStatusBarH - 6), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x - 20, kStatusBarH),
                              ImGuiCond_Always);
+    // Padding verticale ridotto: la riga di testo (font 17) resta centrata
+    // e il bordo racchiude bene la barra su tutti e quattro i lati (prima
+    // il contenuto sfondava e il bordo sotto spariva).
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 7.0f));
     ImGui::Begin("##statusbar", nullptr,
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar |
@@ -2402,6 +2410,7 @@ void drawStatusBar(AppState& app)
         }
     }
     ImGui::End();
+    ImGui::PopStyleVar(); // WindowPadding
 }
 
 // Rivelatore di ATTIVITA' TETRA: dice solo se c'e' un portante digitale
@@ -2471,6 +2480,8 @@ void drawSidebar(AppState& app)
         drawDeviceSection(app);
     if (ImGui::CollapsingHeader("Ricevitore", ImGuiTreeNodeFlags_DefaultOpen))
         drawReceiverSection(app);
+    if (ImGui::CollapsingHeader("Posizione antenna"))
+        drawStationSection(app);
     if (ImGui::CollapsingHeader("Bande rapide"))
         drawBandsSection(app);
     if (ImGui::CollapsingHeader("Spettro audio"))

@@ -251,6 +251,15 @@ Fatti (15a tornata, fix sintonia vista + snap fini):
 - ✅ **Snap fini per onde corte**: aggiunti passi **10/50/100/500 Hz** e
   2.5 kHz (per SSB/CW in HF) oltre a quelli medi.
 
+Fatti (16a tornata, rifiniture UI):
+
+- ✅ **Barra di stato racchiusa bene**: il contenuto sfondava l'altezza e
+  il bordo inferiore spariva; ora la barra e' piu' alta col padding giusto
+  e il riquadro e' chiuso su tutti e quattro i lati.
+- ✅ **Posizione antenna in un sottomenu**: lat/lon e "Rileva dalla rete"
+  spostati dalla sezione Dispositivo a un menu a tendina dedicato,
+  richiudibile (lo si imposta una volta e si lascia chiuso).
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).
