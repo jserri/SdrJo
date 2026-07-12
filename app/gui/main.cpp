@@ -1228,14 +1228,20 @@ void applyTunedFrequency(AppState& app, double f, bool forceHwRetune = false)
     double center = app.freqMHz * 1e6;
     if (!forceHwRetune && app.source &&
         std::fabs(f - center) < app.sampleRate * 0.45) {
+        // Dentro lo span: sposto solo il VFO, l'hardware e la vista non si
+        // muovono (nessun salto: e' la sintonia fine che il click deve dare).
         app.listenOffsetHz = f - center;
+        if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
+        keepTunedInView(app);
     } else {
+        // Fuori span (o doppio click): ricentro l'hardware e RICENTRO la
+        // vista sulla frequenza sintonizzata, cosi' il righello non "salta".
         double offset = antiDcOffset(app);
         app.listenOffsetHz = offset;
         requestHwCenter(app, f - offset);
+        if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
+        centerViewOnTuned(app);
     }
-    if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
-    keepTunedInView(app);
 }
 
 // Sintonia assoluta "vai a" (dial e campo MHz): porta SEMPRE l'hardware a
@@ -1249,7 +1255,9 @@ void tuneAbsolute(AppState& app, double f)
     app.listenOffsetHz = offset;
     requestHwCenter(app, f - offset, /*immediate=*/true);
     if (app.listenVfo) app.listenVfo->setOffset(app.listenOffsetHz);
-    keepTunedInView(app);
+    // Ricentro la vista sulla frequenza scelta: il numero impostato finisce
+    // sempre al centro dello spettro, senza spostamenti strani del righello.
+    centerViewOnTuned(app);
 }
 
 // Frequenzimetro a cifre stile SDR Console: rotellina su una cifra per
@@ -2168,20 +2176,24 @@ void drawReceiverSection(AppState& app)
         }
     }
 
-    // Passo di sintonia per click e rotellina.
-    static const double kSnaps[] = {1000, 5000, 9000, 10000,
-                                    12500, 25000, 50000, 100000};
-    static const char* kSnapNames[] = {"1 kHz",    "5 kHz",  "9 kHz (OM)",
-                                       "10 kHz",   "12.5 kHz", "25 kHz",
-                                       "50 kHz",   "100 kHz"};
-    int snapIdx = 4;
-    for (int i = 0; i < 8; i++)
+    // Passo di sintonia per click e rotellina. Passi fini (10-500 Hz) per
+    // SSB/CW in onde corte, medi per broadcast/apparati.
+    static const double kSnaps[] = {10, 50, 100, 500, 1000, 2500, 5000,
+                                    9000, 10000, 12500, 25000, 50000, 100000};
+    static const char* kSnapNames[] = {
+        "10 Hz (SSB/CW)", "50 Hz",  "100 Hz",  "500 Hz",   "1 kHz",
+        "2.5 kHz",        "5 kHz",  "9 kHz (OM)", "10 kHz",  "12.5 kHz",
+        "25 kHz",         "50 kHz", "100 kHz"};
+    const int nSnaps = int(sizeof(kSnaps) / sizeof(kSnaps[0]));
+    int snapIdx = 9; // default 12.5 kHz
+    for (int i = 0; i < nSnaps; i++)
         if (std::fabs(kSnaps[i] - app.snapHz) < 1) snapIdx = i;
     fieldLabel("Snap (passo di sintonia)");
-    if (ImGui::Combo("##snap", &snapIdx, kSnapNames, 8))
+    if (ImGui::Combo("##snap", &snapIdx, kSnapNames, nSnaps))
         app.snapHz = kSnaps[snapIdx];
-    helpTip("Passo di sintonia: click e rotellina saltano di questo valore "
-            "(9 kHz onde medie, 12.5/25 kHz apparati, 5 kHz FM).");
+    helpTip("Passo di sintonia: click e rotellina saltano di questo valore. "
+            "10-500 Hz per SSB/CW in onde corte, 9 kHz onde medie, 5 kHz FM, "
+            "12.5/25 kHz apparati.");
     ImGui::Checkbox("Aggancia al picco", &app.snapToPeak);
     helpTip("Al click di sintonia salta sul segnale piu' forte li' vicino "
             "(comodo su AM/FM con portante; in SSB e' solo indicativo).");

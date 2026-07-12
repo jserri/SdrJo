@@ -240,6 +240,17 @@ Fatti (14a tornata, AFC + snap al picco + rivelatore TETRA):
   cifrata e intercettarla e' illegale). Classe DSP dedicata + test sintetico
   (portante rilevato, rumore e CW respinti).
 
+Fatti (15a tornata, fix sintonia vista + snap fini):
+
+- ✅ **Fix salto vista/righello**: mescolando la sintonia col click sullo
+  spettro (VFO) e col frequenzimetro/campo MHz (ricentro hardware) la
+  vista non "saltava" piu' sulla frequenza scelta e il righello sembrava
+  tornare indietro. Ora ogni sintonia esplicita (dial, campo MHz, banda)
+  **ricentra la vista sulla frequenza sintonizzata**; il click fine dentro
+  lo span resta senza salti (solo VFO).
+- ✅ **Snap fini per onde corte**: aggiunti passi **10/50/100/500 Hz** e
+  2.5 kHz (per SSB/CW in HF) oltre a quelli medi.
+
 Prossimi:
 
 - SGP4 completo al posto di Kepler+J2 (precisione con TLE vecchi).
