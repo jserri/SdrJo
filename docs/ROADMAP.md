@@ -273,6 +273,26 @@ Fatti (17a tornata, sintonia col frequenzimetro come SDR#):
   grezzo, quindi basta poco: cosi' il segnale sintonizzato resta al centro
   dello spettro invece che fisso a ~60%.
 
+Fatti (28a tornata, FT8 evoluto: sottrazione, log, marcatori, interazione):
+
+- ✅ **Sottrazione multi-passaggio** (il salto di sensibilita' piu' grosso):
+  dopo il primo giro, i segnali decodificati vengono tolti dai campioni
+  (ricostruzione per-simbolo dal bin del tono) e si ridecodifica, fino a 3
+  passaggi. Cosi' emergono le stazioni deboli nascoste sotto quelle forti.
+- ✅ **Log ADIF** dei decode (spot): opzione "Log ADIF" nel pannello, salva
+  sdrjo_spot.adi accanto all'eseguibile (importabile in WSJT-X/Log4OM...).
+  Estrae callsign, locatore, rapporto, banda, data/ora dalla frequenza RF.
+- ✅ **Marcatori sullo spettro**: alla frequenza RF di ogni stazione FT8/FT4
+  sentita compare una tacca col callsign e il dB (CQ in verde), per capire
+  a colpo d'occhio chi trasmette e dove spostarsi.
+- ✅ **Click per sintonizzare**: un click su un decode (nell'app e nel
+  cockpit web) sposta il VFO sulla frequenza RF di quel segnale; tasto
+  destro = copia il messaggio.
+- ✅ **Filtro "Solo CQ"**: mostra nel pannello solo chi sta chiamando.
+- Test: sottrazione verificata (un debole a un bin da uno forte esce solo
+  grazie a essa); nuovo test ADIF (parsing messaggi + formato record). 28
+  test verdi.
+
 Fatti (27a tornata, FT4 + OSD + interazione + cockpit):
 
 - ✅ **FT4**: il "fratello veloce" di FT8 (cicli da 7.5 s, 4-GFSK, 103

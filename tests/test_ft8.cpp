@@ -13,6 +13,40 @@
 
 using namespace sdrjo::dsp;
 
+// Forma d'onda GFSK "pulita" (79 simboli), senza rumore ne' collocazione.
+static std::vector<float> gfskWave(const int tones[79], double f0, double fs)
+{
+    const double bt = 2.0;
+    const double twoPi = 6.283185307179586;
+    int nsps = int(std::lround(fs * 0.16));
+    int nsym = 79;
+    std::vector<double> pulse(3 * nsps);
+    double c = M_PI * std::sqrt(2.0 / std::log(2.0));
+    for (int i = 0; i < 3 * nsps; i++) {
+        double t = (i + 1 - 1.5 * nsps) / double(nsps);
+        pulse[i] = 0.5 * (std::erf(c * bt * (t + 0.5)) - std::erf(c * bt * (t - 0.5)));
+    }
+    std::vector<double> dphi((nsym + 2) * nsps, 0.0);
+    double dphiPeak = twoPi / nsps;
+    for (int j = 0; j < nsym; j++) {
+        int ib = j * nsps;
+        for (int i = 0; i < 3 * nsps; i++)
+            dphi[ib + i] += dphiPeak * pulse[i] * tones[j];
+    }
+    for (int i = 0; i < 2 * nsps; i++) {
+        dphi[i] += dphiPeak * tones[0] * pulse[nsps + i];
+        dphi[nsym * nsps + i] += dphiPeak * tones[nsym - 1] * pulse[i];
+    }
+    for (auto& d : dphi) d += twoPi * f0 / fs;
+    std::vector<float> wave(size_t(nsym) * nsps);
+    double phi = 0.0;
+    for (size_t i = 0; i < wave.size(); i++) {
+        phi += dphi[nsps + i];
+        wave[i] = float(std::sin(phi));
+    }
+    return wave;
+}
+
 // Sintesi GFSK come in WSJT-X (impulso gaussiano, BT=2), per un test realistico.
 static std::vector<float> gfskAudio(const int tones[79], double f0, double fs,
                                     double snrDb, int seed)
@@ -152,6 +186,42 @@ int main()
         }
         CHECK(g0);
         CHECK(g1);
+    }
+
+    // 4b) Sottrazione multi-passaggio: un segnale debole a un bin di distanza
+    //     da uno molto piu' forte. Al primo passaggio esce il forte; dopo la
+    //     sottrazione emerge il debole.
+    {
+        uint8_t rS[77], rW[77];
+        for (int i = 0; i < 77; i++) rS[i] = uint8_t(kFt8Vectors[0].bits[i] - '0');
+        for (int i = 0; i < 77; i++) rW[i] = uint8_t(kFt8Vectors[3].bits[i] - '0');
+        int tS[79], tW[79];
+        ft8::tonesFromBits(rS, tS);
+        ft8::tonesFromBits(rW, tW);
+        auto wS = gfskWave(tS, 1500.0, 12000.0);          // forte
+        auto wW = gfskWave(tW, 1506.25, 12000.0);         // debole, +1 bin
+        size_t total = size_t(15.0 * 12000.0);
+        std::vector<float> audio(total, 0.0f);
+        size_t start = size_t(0.5 * 12000.0);
+        std::mt19937 rng(4242);
+        std::normal_distribution<double> nd(0.0, 0.02);
+        for (size_t i = 0; i < total; i++) {
+            double x = nd(rng);
+            if (i >= start && i - start < wS.size()) {
+                x += 1.0 * wS[i - start];       // forte
+                x += 0.28 * wW[i - start];      // debole (~11 dB sotto)
+            }
+            audio[i] = float(x);
+        }
+        auto res = ft8::decodeAudio(audio.data(), audio.size(), 12000.0,
+                                    200.0, 3000.0);
+        bool gS = false, gW = false;
+        for (const auto& d : res) {
+            if (d.message == std::string(kFt8Vectors[0].back)) gS = true;
+            if (d.message == std::string(kFt8Vectors[3].back)) gW = true;
+        }
+        CHECK(gS);
+        CHECK(gW);   // il debole esce solo grazie alla sottrazione
     }
 
     // 5) OSD: deve recuperare una codeword anche con qualche errore forte

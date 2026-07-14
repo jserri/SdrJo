@@ -615,11 +615,19 @@ async function pollFt8(){
   panel.style.display="block";
   document.getElementById("ft8mode").textContent = d.mode || "FT8";
   document.getElementById("ft8slot").textContent = d.slot || "–";
+  const vfo = d.vfo || 0;
   document.getElementById("ft8body").innerHTML = (d.decodes||[]).map(x=>{
     const cq = String(x.msg).startsWith("CQ");
-    return `<tr><td>${x.db>=0?'+':''}${x.db}</td><td>${(x.dt>=0?'+':'')}${x.dt.toFixed(1)}</td>`+
+    const rf = vfo + x.hz;
+    return `<tr class="ft8row" data-rf="${rf.toFixed(0)}" title="click per sintonizzare"`+
+      ` style="cursor:pointer"><td>${x.db>=0?'+':''}${x.db}</td>`+
+      `<td>${(x.dt>=0?'+':'')}${x.dt.toFixed(1)}</td>`+
       `<td>${x.hz.toFixed(0)}</td><td style="${cq?'color:var(--ok,#5fd48a)':''}">${esc(x.msg)}</td></tr>`;
   }).join("") || '<tr><td colspan="4" style="color:var(--dim)">nessun segnale in questa finestra</td></tr>';
+  document.querySelectorAll(".ft8row").forEach(tr=>tr.onclick=()=>{
+    const rf = tr.getAttribute("data-rf");
+    if(rf && +rf>0){ try { fetch("api/control?freq=" + rf); } catch(e){} }
+  });
 }
 pollStatus(); pollSpectrum(); pollFt8();
 setInterval(pollStatus, 1500);

@@ -28,6 +28,7 @@
 #include <sdrjo/dsp/psk31.hpp>
 #include <sdrjo/dsp/tetra_activity.hpp>
 #include <sdrjo/dsp/ft8.hpp>
+#include <sdrjo/util/adif_log.hpp>
 #include <sdrjo/morse/cw_decoder.hpp>
 #include <sdrjo/sat/orbit.hpp>
 #include <sdrjo/sat/tle.hpp>
@@ -278,6 +279,10 @@ struct AppState : public sdrjo::IModuleHost {
     std::vector<sdrjo::dsp::ft8::Decode> ft8Decodes; // ultimi risultati
     std::string ft8SlotLabel;         // orario dello slot decodificato
     int ft8DecodeCount = 0;           // totale messaggi decodificati (sessione)
+    bool ft8OnlyCq = false;           // mostra solo i messaggi CQ
+    bool ft8AdifOn = false;           // salva i decode nel log ADIF
+    sdrjo::AdifLogger adifLog;        // log ADIF (accanto all'eseguibile)
+    double ft8VfoRfHz = 0.0;          // RF del VFO al momento della cattura
 
     float cwToneHz = 700.0f;
     bool cwAutoSpeed = true;   // CW: velocita' auto o WPM fissa
@@ -1916,6 +1921,42 @@ void drawSpectrumPanel(AppState& app)
             if (x - lastLabelX > 46.0f) {
                 dl->AddText(ImVec2(x + 3, s0.y + 1), bmCol, ff.name.c_str());
                 lastLabelX = x;
+            }
+        }
+    }
+
+    // --- Marcatori dei segnali FT8/FT4 decodificati ---
+    // Sullo spettro, alla frequenza RF di ogni stazione sentita: cosi' si
+    // vede a colpo d'occhio chi trasmette e dove spostarsi col cursore.
+    if (app.ft8On) {
+        std::vector<sdrjo::dsp::ft8::Decode> fd;
+        double vfoRf;
+        {
+            std::lock_guard<std::mutex> lk(app.ft8Mutex);
+            fd = app.ft8Decodes;
+            vfoRf = app.ft8VfoRfHz;
+        }
+        const ImU32 ftCol = ImGui::GetColorU32(ImVec4(0.30f, 0.82f, 0.88f, 0.95f));
+        const ImU32 ftCq = ImGui::GetColorU32(ImVec4(0.36f, 0.85f, 0.54f, 1.0f));
+        float lastX = -1e9f;
+        for (const auto& d : fd) {
+            double rf = vfoRf + d.freqHz;
+            if (rf < v0 || rf > v1) continue;
+            float x = xOf(rf);
+            bool cq = d.message.rfind("CQ", 0) == 0;
+            ImU32 col = cq ? ftCq : ftCol;
+            // Tacca poco sotto i bookmark, dentro l'area dello spettro.
+            dl->AddLine(ImVec2(x, s0.y + 16.0f), ImVec2(x, s0.y + 40.0f),
+                        col, cq ? 2.0f : 1.3f);
+            if (x - lastX > 34.0f) {
+                sdrjo::AdifSpot sp;
+                std::string lbl = sdrjo::parseFt8Message(d.message, sp)
+                                      ? sp.call
+                                      : d.message;
+                char t[48];
+                std::snprintf(t, sizeof(t), "%s %+d", lbl.c_str(), int(d.snrDb));
+                dl->AddText(ImVec2(x + 3, s0.y + 28.0f), col, t);
+                lastX = x;
             }
         }
     }
@@ -3743,12 +3784,31 @@ void drawFt8Section(AppState& app)
     ImGui::SameLine();
     ImGui::TextDisabled("| tot messaggi: %d", app.ft8DecodeCount);
 
+    // Opzioni: solo CQ, log ADIF.
+    ImGui::Checkbox("Solo CQ", &app.ft8OnlyCq);
+    ImGui::SameLine();
+    if (ImGui::Checkbox("Log ADIF", &app.ft8AdifOn)) {
+        if (app.ft8AdifOn && !app.adifLog.isOpen()) {
+            std::string p = (std::filesystem::path(
+                                 sdrjo::ModuleLoader::defaultModulesDir())
+                                 .parent_path() /
+                             "sdrjo_spot.adi")
+                                .string();
+            if (app.adifLog.open(p))
+                app.log("FT8", ("log ADIF: " + p).c_str());
+        }
+    }
+    if (app.ft8AdifOn && app.adifLog.isOpen() && ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", app.adifLog.path().c_str());
+
     std::vector<sdrjo::dsp::ft8::Decode> decodes;
     std::string slot;
+    double vfoRf;
     {
         std::lock_guard<std::mutex> lk(app.ft8Mutex);
         decodes = app.ft8Decodes;
         slot = app.ft8SlotLabel;
+        vfoRf = app.ft8VfoRfHz;
     }
     if (!slot.empty())
         ImGui::Text("Finestra %s UTC - %d segnali", slot.c_str(),
@@ -3764,6 +3824,8 @@ void drawFt8Section(AppState& app)
         ImGui::TableSetupColumn("Messaggio", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
         for (const auto& d : decodes) {
+            bool cq = d.message.rfind("CQ", 0) == 0;
+            if (app.ft8OnlyCq && !cq) continue;
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
             ImGui::Text("%+d", int(d.snrDb));
@@ -3772,18 +3834,26 @@ void drawFt8Section(AppState& app)
             ImGui::TableNextColumn();
             ImGui::Text("%.0f", d.freqHz);
             ImGui::TableNextColumn();
-            // Riga selezionabile: click = copia il messaggio negli appunti.
-            bool cq = d.message.rfind("CQ", 0) == 0;
+            // Click = sintonizza il VFO su quel segnale. Tasto destro = copia.
+            ImGui::PushID(&d);
             if (cq)
                 ImGui::PushStyleColor(ImGuiCol_Text, sdrjo::gui::palette().ok);
             if (ImGui::Selectable(d.message.c_str(), false,
                                   ImGuiSelectableFlags_SpanAllColumns)) {
-                ImGui::SetClipboardText(d.message.c_str());
-                app.log("FT8", ("copiato: " + d.message).c_str());
+                double rf = vfoRf + d.freqHz;
+                if (rf > 0) applyTunedFrequency(app, rf);
             }
             if (cq) ImGui::PopStyleColor();
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("click per copiare negli appunti");
+                ImGui::SetTooltip("click: sintonizza  |  tasto destro: copia");
+            if (ImGui::BeginPopupContextItem("ft8ctx")) {
+                if (ImGui::MenuItem("Copia messaggio")) {
+                    ImGui::SetClipboardText(d.message.c_str());
+                    app.log("FT8", ("copiato: " + d.message).c_str());
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
         }
         ImGui::EndTable();
     }
@@ -4032,8 +4102,10 @@ void updateFt8(AppState& app)
     if (app.ft8Thread.joinable()) app.ft8Thread.join();
     app.ft8Busy.store(true);
     int mode = app.ft8Mode;
+    // RF del VFO d'ascolto: in USB l'audio a Hz corrisponde a RF = vfoRf + a.
+    double vfoRf = app.freqMHz * 1e6 + app.listenOffsetHz;
     app.ft8Thread = std::thread([&app, b = std::move(buf), doneSlot, slotLen,
-                                 mode]() {
+                                 mode, vfoRf]() {
         auto res = (mode == 1)
                        ? sdrjo::dsp::ft8::decodeAudioFt4(b.data(), b.size(),
                                                          48000.0, 200.0, 3000.0)
@@ -4058,11 +4130,15 @@ void updateFt8(AppState& app)
             }
             return o;
         };
+        char vfoBuf[32];
+        std::snprintf(vfoBuf, sizeof(vfoBuf), "%.0f", vfoRf);
         std::string json = "{\"mode\":\"";
         json += (mode == 1 ? "FT4" : "FT8");
         json += "\",\"slot\":\"";
         json += lab;
-        json += "\",\"decodes\":[";
+        json += "\",\"vfo\":";
+        json += vfoBuf;
+        json += ",\"decodes\":[";
         for (size_t i = 0; i < res.size(); i++) {
             char b[256];
             std::snprintf(b, sizeof(b),
@@ -4074,9 +4150,18 @@ void updateFt8(AppState& app)
         json += "]}";
         app.cockpit.setFt8Json(json);
 
+        // Log ADIF (spot): una riga per stazione sentita.
+        if (app.ft8AdifOn && app.adifLog.isOpen()) {
+            const char* modeName = (mode == 1) ? "FT4" : "FT8";
+            for (const auto& d : res)
+                app.adifLog.logMessage(d.message, modeName, vfoRf + d.freqHz,
+                                       std::time_t(doneSlot * slotLen));
+        }
+
         std::lock_guard<std::mutex> lk(app.ft8Mutex);
         app.ft8Decodes = std::move(res);
         app.ft8SlotLabel = lab;
+        app.ft8VfoRfHz = vfoRf;
         app.ft8DecodeCount += int(app.ft8Decodes.size());
         app.ft8Busy.store(false);
     });

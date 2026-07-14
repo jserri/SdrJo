@@ -713,165 +713,186 @@ std::vector<Decode> decodeAudio(const float* audio, size_t n, double sampleRate,
     int nframes = int((dd.size() - kNsps) / kStep) + 1;
     if (nframes < kNsym * 4) return results;
 
-    // Spettrogramma di potenza: power[frame][bin], bin 0..1024.
     const int nbin = kNsps / 2 + 1;
-    std::vector<std::vector<float>> power(nframes,
-                                          std::vector<float>(nbin, 0.0f));
     std::vector<cfloat> buf(kNsps);
-    for (int f = 0; f < nframes; f++) {
-        size_t base = size_t(f) * kStep;
-        for (int i = 0; i < kNsps; i++)
-            buf[i] = cfloat(dd[base + i], 0.0f);
-        fft(buf.data(), kNsps);
-        for (int b = 0; b < nbin; b++)
-            power[f][b] = buf[b].real() * buf[b].real() +
-                          buf[b].imag() * buf[b].imag();
-    }
-
+    int invGray[8];
+    for (int v = 0; v < 8; v++) invGray[kGray[v]] = v;
     int binLo = std::max(1, int(freqMin / binHz));
     int binHi = std::min(nbin - 8, int(freqMax / binHz));
 
-    // Ricerca candidati: per ogni bin base e offset di frame, correlazione
-    // con i 3 array Costas (21 simboli di sincronismo).
-    struct Cand { int bin; int frame0; float score; };
-    std::vector<Cand> cands;
-    int maxOff = 40;   // ~ +/- 1 s attorno all'inizio ideale
-    for (int b = binLo; b <= binHi; b++) {
-        for (int off = 0; off <= maxOff; off++) {
-            float sig = 0.0f, tot = 0.0f;
-            auto addBlock = [&](int symBase, int frameBase) {
-                for (int nsy = 0; nsy < 7; nsy++) {
-                    int fr = frameBase + 4 * nsy;
-                    if (fr >= nframes) return;
-                    sig += power[fr][b + kCostas[nsy]];
-                    for (int t = 0; t < 8; t++) tot += power[fr][b + t];
-                }
-                (void)symBase;
-            };
-            addBlock(0, off + 0);
-            addBlock(36, off + 4 * 36);
-            addBlock(72, off + 4 * 72);
-            if (tot <= 0.0f) continue;
-            float score = sig / (tot / 8.0f);   // ~1 se rumore, >1 se segnale
-            cands.push_back({b, off, score});
-        }
-    }
-    if (cands.empty()) return results;
-
-    // Ordina e tieni i migliori, sopprimendo i quasi-duplicati.
-    std::sort(cands.begin(), cands.end(),
-              [](const Cand& a, const Cand& b){ return a.score > b.score; });
-    std::vector<Cand> keep;
-    for (const auto& c : cands) {
-        if (c.score < 1.8f) break;
-        bool dup = false;
-        for (const auto& k : keep)
-            if (std::abs(k.bin - c.bin) <= 1 && std::abs(k.frame0 - c.frame0) <= 2)
-                dup = true;
-        if (!dup) keep.push_back(c);
-        if (keep.size() >= 60) break;
-    }
-
-    const LdpcModel& m = model();
-    (void)m;
-    // Mappa inversa di Gray: tono -> valore 0..7.
-    int invGray[8];
-    for (int v = 0; v < 8; v++) invGray[kGray[v]] = v;
-
-    for (const auto& c : keep) {
-        int b = c.bin;
-        int frame0 = c.frame0;
-        // Demodula i 79 simboli: FFT su ogni finestra di 2048 campioni.
-        // Ampiezze e potenze degli 8 toni.
-        std::array<std::array<float, 8>, kNsym> mag;
+    // Sottrae dai campioni un segnale gia' decodificato: per ogni simbolo,
+    // ricostruisce il tono (dal valore del bin corrispondente) e lo toglie.
+    // Cosi' i segnali deboli nascosti sotto quelli forti emergono al passaggio
+    // successivo.
+    auto subtractSignal = [&](int b, int frame0, const int tones[79]) {
+        const double twoPi = 6.283185307179586;
         for (int s = 0; s < kNsym; s++) {
-            int fr = frame0 + 4 * s;
-            size_t base = size_t(fr) * kStep;
-            if (base + kNsps > dd.size()) { mag[s].fill(0.0f); continue; }
+            size_t base = size_t(frame0 + 4 * s) * kStep;
+            if (base + kNsps > dd.size()) continue;
             for (int i = 0; i < kNsps; i++) buf[i] = cfloat(dd[base + i], 0.0f);
             fft(buf.data(), kNsps);
-            for (int t = 0; t < 8; t++) {
-                cfloat z = buf[b + t];
-                mag[s][t] = std::sqrt(z.real() * z.real() + z.imag() * z.imag());
+            int k = b + tones[s];
+            cfloat Z = buf[k];
+            cfloat w(float(std::cos(twoPi * k / kNsps)),
+                     float(std::sin(twoPi * k / kNsps)));
+            cfloat ph(1.0f, 0.0f);
+            for (int i = 0; i < kNsps; i++) {
+                float re = Z.real() * ph.real() - Z.imag() * ph.imag();
+                dd[base + i] -= float(2.0 / kNsps) * re;
+                ph *= w;
             }
         }
-        // Controllo di sincronismo forte: quanti dei 21 simboli hanno il
-        // tono massimo giusto?
-        int nsync = 0;
-        auto checkBlock = [&](int symBase) {
-            for (int nsy = 0; nsy < 7; nsy++) {
-                int s = symBase + nsy;
-                int best = 0; float bv = mag[s][0];
-                for (int t = 1; t < 8; t++) if (mag[s][t] > bv) { bv = mag[s][t]; best = t; }
-                if (best == kCostas[nsy]) nsync++;
-            }
-        };
-        checkBlock(0); checkBlock(36); checkBlock(72);
-        if (nsync <= 6) continue;
+    };
 
-        // Soft-bit: per ogni simbolo dati, 3 LLR da metrica max-log.
-        float llr[174];
-        auto symLlr = [&](int s, int j) {
-            for (int p = 0; p < 3; p++) {
-                float mx1 = -1e30f, mx0 = -1e30f;
+    std::vector<std::string> seen;  // messaggi gia' aggiunti
+    const int maxPasses = 3;
+    for (int pass = 0; pass < maxPasses; pass++) {
+        // Spettrogramma di potenza dal segnale corrente.
+        std::vector<std::vector<float>> power(
+            nframes, std::vector<float>(nbin, 0.0f));
+        for (int f = 0; f < nframes; f++) {
+            size_t base = size_t(f) * kStep;
+            for (int i = 0; i < kNsps; i++) buf[i] = cfloat(dd[base + i], 0.0f);
+            fft(buf.data(), kNsps);
+            for (int b = 0; b < nbin; b++)
+                power[f][b] = buf[b].real() * buf[b].real() +
+                              buf[b].imag() * buf[b].imag();
+        }
+
+        // Ricerca candidati (correlazione coi 3 array Costas).
+        struct Cand { int bin; int frame0; float score; };
+        std::vector<Cand> cands;
+        int maxOff = 40;
+        for (int b = binLo; b <= binHi; b++) {
+            for (int off = 0; off <= maxOff; off++) {
+                float sig = 0.0f, tot = 0.0f;
+                auto addBlock = [&](int frameBase) {
+                    for (int nsy = 0; nsy < 7; nsy++) {
+                        int fr = frameBase + 4 * nsy;
+                        if (fr >= nframes) return;
+                        sig += power[fr][b + kCostas[nsy]];
+                        for (int t = 0; t < 8; t++) tot += power[fr][b + t];
+                    }
+                };
+                addBlock(off + 0);
+                addBlock(off + 4 * 36);
+                addBlock(off + 4 * 72);
+                if (tot <= 0.0f) continue;
+                cands.push_back({b, off, sig / (tot / 8.0f)});
+            }
+        }
+        if (cands.empty()) break;
+        std::sort(cands.begin(), cands.end(),
+                  [](const Cand& a, const Cand& b){ return a.score > b.score; });
+        std::vector<Cand> keep;
+        for (const auto& c : cands) {
+            if (c.score < 1.8f) break;
+            bool dup = false;
+            for (const auto& k : keep)
+                if (std::abs(k.bin - c.bin) <= 1 &&
+                    std::abs(k.frame0 - c.frame0) <= 2)
+                    dup = true;
+            if (!dup) keep.push_back(c);
+            if (keep.size() >= 60) break;
+        }
+
+        struct Sub { int b, frame0; int tones[79]; };
+        std::vector<Sub> subs;
+        int foundThisPass = 0;
+
+        for (const auto& c : keep) {
+            int b = c.bin, frame0 = c.frame0;
+            std::array<std::array<float, 8>, kNsym> mag;
+            for (int s = 0; s < kNsym; s++) {
+                size_t base = size_t(frame0 + 4 * s) * kStep;
+                if (base + kNsps > dd.size()) { mag[s].fill(0.0f); continue; }
+                for (int i = 0; i < kNsps; i++)
+                    buf[i] = cfloat(dd[base + i], 0.0f);
+                fft(buf.data(), kNsps);
                 for (int t = 0; t < 8; t++) {
-                    int val = invGray[t];
-                    int bit = (val >> (2 - p)) & 1;
-                    if (bit) { if (mag[s][t] > mx1) mx1 = mag[s][t]; }
-                    else { if (mag[s][t] > mx0) mx0 = mag[s][t]; }
+                    cfloat z = buf[b + t];
+                    mag[s][t] = std::sqrt(z.real() * z.real() +
+                                          z.imag() * z.imag());
                 }
-                llr[3 * j + p] = mx1 - mx0;
             }
-        };
-        int j = 0;
-        for (int s = 7; s <= 35; s++) symLlr(s, j++);
-        for (int s = 43; s <= 71; s++) symLlr(s, j++);
+            int nsync = 0;
+            auto checkBlock = [&](int symBase) {
+                for (int nsy = 0; nsy < 7; nsy++) {
+                    int s = symBase + nsy;
+                    int best = 0;
+                    for (int t = 1; t < 8; t++)
+                        if (mag[s][t] > mag[s][best]) best = t;
+                    if (best == kCostas[nsy]) nsync++;
+                }
+            };
+            checkBlock(0); checkBlock(36); checkBlock(72);
+            if (nsync <= 6) continue;
 
-        // Normalizza a varianza unitaria e scala (come LLR_SCALE=2.83).
-        double mean = 0, var = 0;
-        for (int i = 0; i < 174; i++) mean += llr[i];
-        mean /= 174.0;
-        for (int i = 0; i < 174; i++) var += (llr[i] - mean) * (llr[i] - mean);
-        var /= 174.0;
-        double sigma = var > 0 ? std::sqrt(var) : 1.0;
-        for (int i = 0; i < 174; i++) llr[i] = float(2.83 * llr[i] / sigma);
+            float llr[174];
+            auto symLlr = [&](int s, int j) {
+                for (int p = 0; p < 3; p++) {
+                    float mx1 = -1e30f, mx0 = -1e30f;
+                    for (int t = 0; t < 8; t++) {
+                        int bit = (invGray[t] >> (2 - p)) & 1;
+                        if (bit) { if (mag[s][t] > mx1) mx1 = mag[s][t]; }
+                        else { if (mag[s][t] > mx0) mx0 = mag[s][t]; }
+                    }
+                    llr[3 * j + p] = mx1 - mx0;
+                }
+            };
+            int j = 0;
+            for (int s = 7; s <= 35; s++) symLlr(s, j++);
+            for (int s = 43; s <= 71; s++) symLlr(s, j++);
 
-        uint8_t bits[77];
-        bool ok = bpDecode(llr, bits, 30);
-        if (!ok) ok = osdDecode(llr, bits, 2); // fallback segnali deboli
-        if (!ok) continue;
-        std::string msg;
-        if (!unpack77(bits, msg)) continue;
-        if (msg.empty()) continue;
+            double mean = 0, var = 0;
+            for (int i = 0; i < 174; i++) mean += llr[i];
+            mean /= 174.0;
+            for (int i = 0; i < 174; i++) var += (llr[i]-mean)*(llr[i]-mean);
+            var /= 174.0;
+            double sigma = var > 0 ? std::sqrt(var) : 1.0;
+            for (int i = 0; i < 174; i++) llr[i] = float(2.83 * llr[i] / sigma);
 
-        // Stima SNR grossolana dai toni del messaggio decodificato.
-        int tones[79];
-        tonesFromBits(bits, tones);
-        double xsig = 0, xnoi = 0;
-        for (int s = 0; s < kNsym; s++) {
-            xsig += mag[s][tones[s]] * mag[s][tones[s]];
-            int noiseTone = (tones[s] + 4) % 8;
-            xnoi += mag[s][noiseTone] * mag[s][noiseTone];
+            uint8_t bits[77];
+            bool ok = bpDecode(llr, bits, 30);
+            if (!ok) ok = osdDecode(llr, bits, 2);
+            if (!ok) continue;
+            std::string msg;
+            if (!unpack77(bits, msg) || msg.empty()) continue;
+
+            int tones[79];
+            tonesFromBits(bits, tones);
+            // Registra il segnale per la sottrazione (anche se gia' visto,
+            // cosi' lo togliamo comunque dal segnale residuo).
+            Sub sub; sub.b = b; sub.frame0 = frame0;
+            std::memcpy(sub.tones, tones, sizeof(tones));
+            subs.push_back(sub);
+
+            if (std::find(seen.begin(), seen.end(), msg) != seen.end()) continue;
+            seen.push_back(msg);
+            foundThisPass++;
+
+            double xsig = 0, xnoi = 0;
+            for (int s = 0; s < kNsym; s++) {
+                xsig += mag[s][tones[s]] * mag[s][tones[s]];
+                xnoi += mag[s][(tones[s] + 4) % 8] * mag[s][(tones[s] + 4) % 8];
+            }
+            double arg = (xnoi > 0) ? (xsig / xnoi - 1.0) : 0.0;
+            float snr = float(10.0 * std::log10(std::max(arg, 0.001)) - 26.0);
+            if (snr < -25.0f) snr = -25.0f;
+
+            Decode d;
+            d.freqHz = b * binHz;
+            d.dtSec = (frame0 * kStep) / 12800.0 - 0.5;
+            d.snrDb = snr;
+            d.sync = c.score;
+            d.message = msg;
+            results.push_back(d);
         }
-        double arg = (xnoi > 0) ? (xsig / xnoi - 1.0) : 0.0;
-        float snr = float(10.0 * std::log10(std::max(arg, 0.001)) - 26.0);
-        if (snr < -25.0f) snr = -25.0f;
 
-        Decode d;
-        d.freqHz = b * binHz;
-        d.dtSec = (frame0 * kStep) / 12800.0 - 0.5;
-        d.snrDb = snr;
-        d.sync = c.score;
-        d.message = msg;
-
-        // Evita duplicati dello stesso messaggio (tieni il sync migliore).
-        bool merged = false;
-        for (auto& r : results)
-            if (r.message == msg) {
-                if (c.score > r.sync) r = d;
-                merged = true; break;
-            }
-        if (!merged) results.push_back(d);
+        if (foundThisPass == 0) break;
+        // Sottrai i segnali decodificati e ripeti (a caccia dei deboli).
+        if (pass + 1 < maxPasses)
+            for (const auto& s : subs) subtractSignal(s.b, s.frame0, s.tones);
     }
 
     std::sort(results.begin(), results.end(),
