@@ -273,6 +273,26 @@ Fatti (17a tornata, sintonia col frequenzimetro come SDR#):
   grezzo, quindi basta poco: cosi' il segnale sintonizzato resta al centro
   dello spettro invece che fisso a ~60%.
 
+Fatti (25a tornata, look&feel + funzioni: tema, screenshot, memorie, timer):
+
+- ✅ **Tema chiaro/scuro** commutabile dal pannello Ricevitore (sezione
+  "Aspetto") e salvato in sdrjo.cfg. Lo spettro e il waterfall restano
+  scuri (leggibilita'), cambia il resto dell'interfaccia.
+- ✅ **Densita' UI** (Comoda/Compatta): spaziature piu' strette per far
+  stare piu' controlli a schermo, anch'essa persistita.
+- ✅ **Screenshot** con un tasto (in "Regolazioni"): salva un BMP a colori
+  del contenuto della finestra, con nome data/ora, accanto all'eseguibile.
+- ✅ **Memorie con categoria e ricerca**: ogni memoria ha una categoria
+  (con pallino colorato) e c'e' una casella di ricerca che filtra per
+  nome/categoria/modo/MHz. Il CSV resta compatibile (categoria opzionale).
+- ✅ **Registrazione pianificata**: si imposta un orario di inizio e una
+  durata, e la registrazione (IQ o audio WAV) parte e si ferma da sola. Si
+  riarma il giorno seguente. Utile per un bollettino o un passaggio a
+  orario fisso senza stare al PC.
+- FT8/FT4 e i layout salvabili restano rimandati a una tornata dedicata
+  (FT8 richiede sincronizzazione Costas, codici LDPC e allineamento al
+  tempo: troppo per farlo bene in una tornata insieme al resto).
+
 Fatti (24a tornata, tocchi finali del restyling):
 
 - ✅ **Luminosita' waterfall**: slider (0.3-3x) che schiarisce/scurisce il

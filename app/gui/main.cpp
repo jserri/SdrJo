@@ -18,6 +18,7 @@
 #include <sdrjo/dsp/demod.hpp>
 #include <sdrjo/dsp/ssb.hpp>
 #include <sdrjo/util/band_plan.hpp>
+#include <sdrjo/util/bmp_writer.hpp>
 #include <sdrjo/dsp/fft.hpp>
 #include <sdrjo/dsp/vfo.hpp>
 #include <sdrjo/dsp/wfm_stereo.hpp>
@@ -42,6 +43,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -118,6 +120,10 @@ struct AppState : public sdrjo::IModuleHost {
     float wfContrast = 1.0f;         // gamma della palette (slider laterale)
     float wfBrightness = 1.0f;       // luminosita' globale del waterfall
     float uiScale = 1.0f;            // scala dei font dell'interfaccia
+    bool lightTheme = false;         // tema chiaro/scuro
+    int uiDensity = 0;               // 0 comoda, 1 compatta
+    bool themeDirty = false;         // richiede riapplicazione del tema
+    bool screenshotReq = false;      // salva un'immagine del framebuffer
     int fftWindow = 0;               // 0 = Hann, 1 = Blackman-Harris
     int wfRows = kWaterfallRows;     // memoria del waterfall (righe)
     int wfSpeedDiv = 4;              // 1 riga ogni N FFT (velocita')
@@ -148,6 +154,16 @@ struct AppState : public sdrjo::IModuleHost {
     sdrjo::dsp::DcBlocker dcBlocker;
     sdrjo::AudioOutput audio;
     sdrjo::IqRecorder recorder;
+
+    // Registrazione pianificata: parte a un orario e dura N minuti.
+    bool schedEnabled = false;   // pianificazione attiva
+    int schedHour = 20;          // ora di inizio (0-23)
+    int schedMin = 0;            // minuto di inizio (0-59)
+    int schedDurMin = 10;        // durata in minuti
+    bool schedWav = false;       // true = audio WAV, false = IQ grezzo
+    bool schedFired = false;     // gia' avviata per l'orario odierno
+    std::chrono::steady_clock::time_point schedStopAt{};
+    bool schedActive = false;    // registrazione pianificata in corso
 
     // Ricevitore d'ascolto: VFO spostabile con un click sullo spettro
     // + demodulatore selezionabile (indipendente dai moduli decoder).
@@ -428,6 +444,20 @@ void loadConfig(AppState& app)
         else if (std::sscanf(line, "wf_palette=%d", &iv) == 1 &&
                  iv >= 0 && iv <= 4)
             app.wfPalette = iv;
+        else if (std::sscanf(line, "light_theme=%d", &iv) == 1)
+            app.lightTheme = iv != 0;
+        else if (std::sscanf(line, "ui_density=%d", &iv) == 1)
+            app.uiDensity = std::clamp(iv, 0, 1);
+        else if (std::sscanf(line, "sched_enabled=%d", &iv) == 1)
+            app.schedEnabled = iv != 0;
+        else if (std::sscanf(line, "sched_hour=%d", &iv) == 1)
+            app.schedHour = std::clamp(iv, 0, 23);
+        else if (std::sscanf(line, "sched_min=%d", &iv) == 1)
+            app.schedMin = std::clamp(iv, 0, 59);
+        else if (std::sscanf(line, "sched_dur_min=%d", &iv) == 1)
+            app.schedDurMin = std::clamp(iv, 1, 720);
+        else if (std::sscanf(line, "sched_wav=%d", &iv) == 1)
+            app.schedWav = iv != 0;
     }
     std::fclose(f);
 }
@@ -440,11 +470,17 @@ void saveConfig(AppState& app)
                  "station_lat=%.6f\nstation_lon=%.6f\n"
                  "freq_mhz=%.6f\nmode=%d\nbandwidth_hz=%.1f\n"
                  "volume=%.3f\nsnap_hz=%.1f\nui_scale=%.2f\n"
-                 "decoder_squelch=%.3f\nsnap_to_peak=%d\nwf_palette=%d\n",
+                 "decoder_squelch=%.3f\nsnap_to_peak=%d\nwf_palette=%d\n"
+                 "light_theme=%d\nui_density=%d\n"
+                 "sched_enabled=%d\nsched_hour=%d\nsched_min=%d\n"
+                 "sched_dur_min=%d\nsched_wav=%d\n",
                  app.stationLat, app.stationLon, app.freqMHz,
                  int(app.listenMode), app.listenBwHz, double(app.volume),
                  app.snapHz, double(app.uiScale), double(app.decoderSquelch),
-                 app.snapToPeak ? 1 : 0, app.wfPalette);
+                 app.snapToPeak ? 1 : 0, app.wfPalette,
+                 app.lightTheme ? 1 : 0, app.uiDensity,
+                 app.schedEnabled ? 1 : 0, app.schedHour, app.schedMin,
+                 app.schedDurMin, app.schedWav ? 1 : 0);
     std::fclose(f);
 }
 
@@ -1112,6 +1148,52 @@ void drawDeviceSection(AppState& app)
                         app.recorder.secondsWritten(),
                         double(app.recorder.bytesWritten()) / 1e6);
         }
+
+        // Registrazione pianificata: si arma per un orario e si ferma da
+        // sola dopo la durata scelta. Comoda per registrare un passaggio
+        // satellite o un bollettino a orario fisso senza stare al PC.
+        ImGui::SeparatorText("Registrazione pianificata");
+        bool schedChanged = false;
+        schedChanged |= ImGui::Checkbox("Attiva pianificazione",
+                                        &app.schedEnabled);
+        ImGui::BeginDisabled(!app.schedEnabled);
+        fieldLabel("Orario di inizio");
+        ImGui::SetNextItemWidth(70);
+        schedChanged |= ImGui::InputInt("##sh", &app.schedHour, 0, 0);
+        ImGui::SameLine(0, 4);
+        ImGui::TextUnformatted(":");
+        ImGui::SameLine(0, 4);
+        ImGui::SetNextItemWidth(70);
+        schedChanged |= ImGui::InputInt("##sm", &app.schedMin, 0, 0);
+        app.schedHour = std::clamp(app.schedHour, 0, 23);
+        app.schedMin = std::clamp(app.schedMin, 0, 59);
+        fieldLabel("Durata (minuti)");
+        ImGui::SetNextItemWidth(110);
+        schedChanged |= ImGui::InputInt("##sd", &app.schedDurMin);
+        app.schedDurMin = std::clamp(app.schedDurMin, 1, 720);
+        schedChanged |= ImGui::Checkbox("Salva audio WAV (invece di IQ)",
+                                        &app.schedWav);
+        ImGui::EndDisabled();
+        if (schedChanged) {
+            app.schedFired = false; // nuova pianificazione: riarma
+            saveConfig(app);
+        }
+        if (app.schedEnabled) {
+            if (app.schedActive) {
+                double rem = std::chrono::duration<double>(
+                                 app.schedStopAt -
+                                 std::chrono::steady_clock::now())
+                                 .count();
+                ImGui::TextColored(sdrjo::gui::palette().ok,
+                                   "in registrazione, mancano %.0f s",
+                                   rem < 0 ? 0.0 : rem);
+            } else if (app.schedFired) {
+                ImGui::TextDisabled("gia' registrata per oggi");
+            } else {
+                ImGui::TextDisabled("in attesa delle %02d:%02d",
+                                    app.schedHour, app.schedMin);
+            }
+        }
     }
 
     // Replay di una registrazione (disponibile anche senza hardware).
@@ -1727,6 +1809,10 @@ void drawSpectrumPanel(AppState& app)
         ImGui::Checkbox("Max hold", &app.specMaxOn);
         ImGui::SameLine();
         if (ImGui::SmallButton("Azzera max")) app.specMax.clear();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Screenshot")) app.screenshotReq = true;
+        helpTip("Salva un'immagine BMP della finestra accanto "
+                "all'eseguibile (nome con data e ora).");
         ImGui::Spacing();
     }
 
@@ -2711,19 +2797,57 @@ void drawSidebar(AppState& app)
     ImGui::End();
 }
 
-// Frequency manager: memorie salvate su file, riordinate per frequenza.
+// Colore stabile derivato dalla categoria (hash -> palette): memorie della
+// stessa categoria hanno lo stesso pallino colorato.
+ImU32 categoryColor(const std::string& cat)
+{
+    const auto& p = sdrjo::gui::palette();
+    if (cat.empty()) return ImGui::GetColorU32(p.dim);
+    ImVec4 cols[6] = {p.acc, p.acc2, p.ok, p.warn, p.bad,
+                      ImVec4(0.30f, 0.82f, 0.88f, 1.0f)};
+    uint32_t h = 2166136261u;
+    for (char c : cat) h = (h ^ uint8_t(c)) * 16777619u;
+    return ImGui::GetColorU32(cols[h % 6]);
+}
+
+// Ritorna true se il testo di ricerca (case-insensitive) e' contenuto nella
+// memoria (nome/categoria/modo/frequenza).
+static bool freqMatches(const sdrjo::FavoriteFrequency& ff, const char* q)
+{
+    if (!q || !q[0]) return true;
+    auto low = [](std::string s) {
+        for (char& c : s) c = char(std::tolower((unsigned char)c));
+        return s;
+    };
+    std::string needle = low(q);
+    char mhz[24];
+    std::snprintf(mhz, sizeof(mhz), "%.4f", ff.freqHz / 1e6);
+    std::string hay = low(ff.name) + " " + low(ff.category) + " " +
+                      low(ff.mode) + " " + mhz;
+    return hay.find(needle) != std::string::npos;
+}
+
+// Frequency manager: memorie salvate su file, riordinate per frequenza,
+// con categoria/colore e ricerca.
 void drawFrequenciesSection(AppState& app)
 {
     static char nameBuf[64] = "";
-    ImGui::SetNextItemWidth(180);
+    static char catBuf[32] = "";
+    static char searchBuf[48] = "";
+
+    ImGui::SetNextItemWidth(150);
     ImGui::InputTextWithHint("##nome", "nome memoria", nameBuf,
                              sizeof(nameBuf));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(110);
+    ImGui::InputTextWithHint("##cat", "categoria", catBuf, sizeof(catBuf));
     ImGui::SameLine();
     if (ImGui::Button("Salva corrente")) {
         sdrjo::FavoriteFrequency ff;
         ff.freqHz = app.freqMHz * 1e6 + app.listenOffsetHz;
         ff.mode = kListenModeNames[int(app.listenMode)];
         ff.bandwidthHz = app.listenBwHz;
+        ff.category = catBuf;
         if (nameBuf[0]) {
             ff.name = nameBuf;
         } else {
@@ -2736,26 +2860,42 @@ void drawFrequenciesSection(AppState& app)
         nameBuf[0] = '\0';
     }
 
-    if (ImGui::BeginTable("freqs", 4,
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##cerca", "cerca (nome / categoria / MHz)...",
+                             searchBuf, sizeof(searchBuf));
+
+    if (ImGui::BeginTable("freqs", 5,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY,
                           ImVec2(0, 220))) {
         ImGui::TableSetupColumn("Nome", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("MHz", ImGuiTableColumnFlags_WidthFixed, 90);
-        ImGui::TableSetupColumn("Modo", ImGuiTableColumnFlags_WidthFixed, 60);
-        ImGui::TableSetupColumn("##az", ImGuiTableColumnFlags_WidthFixed, 70);
+        ImGui::TableSetupColumn("MHz", ImGuiTableColumnFlags_WidthFixed, 78);
+        ImGui::TableSetupColumn("Modo", ImGuiTableColumnFlags_WidthFixed, 50);
+        ImGui::TableSetupColumn("Cat.", ImGuiTableColumnFlags_WidthFixed, 70);
+        ImGui::TableSetupColumn("##az", ImGuiTableColumnFlags_WidthFixed, 66);
         ImGui::TableHeadersRow();
 
         int removeIdx = -1;
         auto& items = app.freqStore.items();
         for (int i = 0; i < int(items.size()); i++) {
             const auto& ff = items[size_t(i)];
+            if (!freqMatches(ff, searchBuf)) continue;
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
+            // Pallino colore-categoria + nome.
+            ImVec2 dp = ImGui::GetCursorScreenPos();
+            float fs = ImGui::GetFontSize();
+            ImGui::GetWindowDrawList()->AddCircleFilled(
+                ImVec2(dp.x + fs * 0.35f, dp.y + fs * 0.55f), fs * 0.28f,
+                categoryColor(ff.category));
+            ImGui::Dummy(ImVec2(fs * 0.9f, 0));
+            ImGui::SameLine();
             ImGui::TextUnformatted(ff.name.c_str());
             ImGui::TableNextColumn();
             ImGui::Text("%.4f", ff.freqHz / 1e6);
             ImGui::TableNextColumn();
             ImGui::TextUnformatted(ff.mode.c_str());
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", ff.category.c_str());
             ImGui::TableNextColumn();
             ImGui::PushID(i);
             if (ImGui::SmallButton("Vai")) {
@@ -2783,6 +2923,26 @@ void drawFrequenciesSection(AppState& app)
 
 void drawAudioSection(AppState& app)
 {
+    // --- Aspetto: tema e densita' ---
+    ImGui::SeparatorText("Aspetto");
+    if (ImGui::Checkbox("Tema chiaro", &app.lightTheme)) {
+        app.themeDirty = true;
+        saveConfig(app);
+    }
+    helpTip("Passa tra tema chiaro e scuro. Spettro e waterfall restano "
+            "scuri (sono display dati).");
+    ImGui::SameLine();
+    int dens = app.uiDensity;
+    ImGui::SetNextItemWidth(130);
+    static const char* kDensNames[] = {"Comoda", "Compatta"};
+    if (ImGui::Combo("Densita'", &dens, kDensNames, 2)) {
+        app.uiDensity = dens;
+        app.themeDirty = true;
+        saveConfig(app);
+    }
+    helpTip("Compatta: meno spazi, piu' controlli a schermo (laptop). "
+            "Comoda: piu' arieggiata.");
+
     // Scala dell'interfaccia (utile su monitor 4K): agisce su tutti i font.
     ImGui::SetNextItemWidth(160);
     ImGui::SliderFloat("Scala interfaccia", &app.uiScale, 0.7f, 2.0f,
@@ -3649,6 +3809,62 @@ void drawSatellitesSection(AppState& app)
     }
 }
 
+// Registrazione pianificata: controllata a ogni frame. Quando scocca
+// l'orario impostato avvia la registrazione (IQ o WAV) e la ferma dopo la
+// durata scelta. Si riarma automaticamente il giorno seguente.
+void updateScheduledRecording(AppState& app)
+{
+    if (!app.schedEnabled) {
+        app.schedFired = false;
+        return;
+    }
+
+    // Stop automatico allo scadere della durata.
+    if (app.schedActive &&
+        std::chrono::steady_clock::now() >= app.schedStopAt) {
+        std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+        if (app.recorder.isRecording()) app.recorder.stop();
+        if (app.scanWav.isOpen()) app.scanWav.stop();
+        app.schedActive = false;
+        app.log("Pianificata", "registrazione terminata");
+    }
+
+    // Ora locale corrente.
+    std::time_t t = std::time(nullptr);
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &t);
+#else
+    localtime_r(&t, &tm);
+#endif
+
+    // A mezzanotte riarmiamo per il giorno nuovo.
+    if (tm.tm_hour == 0 && tm.tm_min == 0) app.schedFired = false;
+
+    if (!app.schedActive && !app.schedFired &&
+        tm.tm_hour == app.schedHour && tm.tm_min == app.schedMin) {
+        app.schedFired = true;
+        app.schedActive = true;
+        app.schedStopAt = std::chrono::steady_clock::now() +
+                          std::chrono::minutes(app.schedDurMin);
+        char name[80];
+        std::lock_guard<std::recursive_mutex> lk(app.dspMutex);
+        if (app.schedWav) {
+            std::strftime(name, sizeof(name), "sdrjo_prog_%Y%m%d_%H%M.wav",
+                          &tm);
+            app.scanWav.start(name, 48000, 1);
+        } else {
+            std::strftime(name, sizeof(name), "sdrjo_prog_%Y%m%d_%H%M.bin",
+                          &tm);
+            app.recorder.start(name, app.freqMHz * 1e6, app.sampleRate);
+        }
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "avvio %s (%d min)", name,
+                      app.schedDurMin);
+        app.log("Pianificata", msg);
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -3720,6 +3936,7 @@ int main(int argc, char** argv)
             .string();
     loadConfig(app);
     applyStationToModules(app);
+    sdrjo::gui::applyTheme(app.lightTheme, app.uiDensity); // tema salvato
 
     // Elementi orbitali per la sezione Satelliti (se il file esiste).
     app.tlePath =
@@ -3900,6 +4117,12 @@ int main(int argc, char** argv)
 
         // Scala dei font dell'interfaccia (per monitor ad alta densita').
         ImGui::GetIO().FontGlobalScale = std::clamp(app.uiScale, 0.7f, 2.0f);
+        if (app.themeDirty) {
+            sdrjo::gui::applyTheme(app.lightTheme, app.uiDensity);
+            app.themeDirty = false;
+        }
+
+        updateScheduledRecording(app);
 
         drawSidebar(app);
         drawSpectrumPanel(app);
@@ -3937,6 +4160,35 @@ int main(int argc, char** argv)
         glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        // Screenshot: legge il framebuffer appena disegnato e lo salva in
+        // BMP (nome con data/ora) accanto all'eseguibile.
+        if (app.screenshotReq) {
+            app.screenshotReq = false;
+            std::vector<uint8_t> px(size_t(w) * size_t(h) * 3);
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
+            glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px.data());
+            std::time_t t = std::time(nullptr);
+            std::tm tm{};
+#if defined(_WIN32)
+            localtime_s(&tm, &t);
+#else
+            localtime_r(&t, &tm);
+#endif
+            char name[64];
+            std::strftime(name, sizeof(name), "sdrjo_%Y%m%d_%H%M%S.bmp", &tm);
+            std::string path =
+                (std::filesystem::path(
+                     sdrjo::ModuleLoader::defaultModulesDir())
+                     .parent_path() /
+                 name)
+                    .string();
+            // glReadPixels: riga 0 in basso -> bottomUp = true.
+            if (sdrjo::writeRgbBmp(path, px.data(), w, h, /*bottomUp=*/true))
+                app.log("Screenshot", path);
+            else
+                app.log("Screenshot", "salvataggio fallito");
+        }
         glfwSwapBuffers(window);
     }
 

@@ -29,7 +29,20 @@ inline const Palette& palette()
     return p;
 }
 
-inline void applyTheme()
+// Tema chiaro (chrome chiaro; lo spettro/waterfall restano scuri, come su
+// tutti gli SDR: sono display dati). Accenti identici allo scuro.
+struct LightBg {
+    ImVec4 bg0{0.92f, 0.94f, 0.97f, 1.00f};
+    ImVec4 bg1{0.97f, 0.98f, 0.99f, 1.00f};
+    ImVec4 bg2{0.88f, 0.91f, 0.95f, 1.00f};
+    ImVec4 bg3{0.80f, 0.86f, 0.94f, 1.00f};
+    ImVec4 line{0.40f, 0.50f, 0.62f, 0.35f};
+    ImVec4 text{0.10f, 0.14f, 0.20f, 1.00f};
+    ImVec4 dim{0.38f, 0.45f, 0.54f, 1.00f};
+};
+
+// density: 0 = comoda, 1 = compatta. light: tema chiaro/scuro.
+inline void applyTheme(bool light = false, int density = 0)
 {
     ImGuiStyle& s = ImGui::GetStyle();
     s.WindowRounding = 10.0f;
@@ -41,62 +54,81 @@ inline void applyTheme()
     s.ScrollbarRounding = 8.0f;
     s.WindowBorderSize = 1.0f;
     s.FrameBorderSize = 0.0f;
-    s.WindowPadding = ImVec2(14, 12);
-    s.FramePadding = ImVec2(10, 6);
-    s.ItemSpacing = ImVec2(10, 8);
-    s.ItemInnerSpacing = ImVec2(8, 6);
+    // Densita': la compatta stringe padding/spaziature per far stare piu'
+    // controlli a schermo (utile su laptop); la comoda e' piu' arieggiata.
+    if (density == 1) {
+        s.WindowPadding = ImVec2(9, 7);
+        s.FramePadding = ImVec2(7, 3);
+        s.ItemSpacing = ImVec2(7, 4);
+        s.ItemInnerSpacing = ImVec2(6, 4);
+    } else {
+        s.WindowPadding = ImVec2(14, 12);
+        s.FramePadding = ImVec2(10, 6);
+        s.ItemSpacing = ImVec2(10, 8);
+        s.ItemInnerSpacing = ImVec2(8, 6);
+    }
     s.ScrollbarSize = 12.0f;
     s.GrabMinSize = 11.0f;
     s.SeparatorTextBorderSize = 2.0f;
     s.SeparatorTextPadding = ImVec2(18, 4);
 
     const Palette& p = palette();
+    // Sfondi/testo dipendono dal tema; gli accenti no.
+    ImVec4 bg0 = p.bg0, bg1 = p.bg1, bg2 = p.bg2, bg3 = p.bg3;
+    ImVec4 line = p.line, text = p.text, dim = p.dim;
+    if (light) {
+        LightBg L;
+        bg0 = L.bg0; bg1 = L.bg1; bg2 = L.bg2; bg3 = L.bg3;
+        line = L.line; text = L.text; dim = L.dim;
+    }
+
     ImVec4* c = s.Colors;
     auto tint = [](ImVec4 col, float a) { col.w = a; return col; };
 
-    c[ImGuiCol_Text] = p.text;
-    c[ImGuiCol_TextDisabled] = p.dim;
-    c[ImGuiCol_WindowBg] = p.bg1;
+    c[ImGuiCol_Text] = text;
+    c[ImGuiCol_TextDisabled] = dim;
+    c[ImGuiCol_WindowBg] = bg1;
     c[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_PopupBg] = p.bg2;
-    c[ImGuiCol_Border] = p.line;
+    c[ImGuiCol_PopupBg] = bg2;
+    c[ImGuiCol_Border] = line;
     c[ImGuiCol_BorderShadow] = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_FrameBg] = p.bg0;
-    c[ImGuiCol_FrameBgHovered] = p.bg3;
+    c[ImGuiCol_FrameBg] = bg0;
+    c[ImGuiCol_FrameBgHovered] = bg3;
     c[ImGuiCol_FrameBgActive] = tint(p.acc, 0.22f);
-    c[ImGuiCol_TitleBg] = p.bg0;
-    c[ImGuiCol_TitleBgActive] = p.bg0;
-    c[ImGuiCol_MenuBarBg] = p.bg0;
+    c[ImGuiCol_TitleBg] = bg0;
+    c[ImGuiCol_TitleBgActive] = bg0;
+    c[ImGuiCol_MenuBarBg] = bg0;
     c[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
-    c[ImGuiCol_ScrollbarGrab] = p.bg3;
+    c[ImGuiCol_ScrollbarGrab] = bg3;
     c[ImGuiCol_ScrollbarGrabHovered] = tint(p.acc, 0.4f);
     c[ImGuiCol_ScrollbarGrabActive] = p.acc;
     c[ImGuiCol_CheckMark] = p.acc;
     c[ImGuiCol_SliderGrab] = p.acc;
     c[ImGuiCol_SliderGrabActive] = ImVec4(0.5f, 0.82f, 1.0f, 1.0f);
-    c[ImGuiCol_Button] = p.bg2;
+    c[ImGuiCol_Button] = bg2;
     c[ImGuiCol_ButtonHovered] = tint(p.acc, 0.32f);
     c[ImGuiCol_ButtonActive] = tint(p.acc, 0.55f);
     // Header (le sezioni a tendina): tinta d'accento cosi' "spiccano".
-    c[ImGuiCol_Header] = tint(p.acc, 0.14f);
-    c[ImGuiCol_HeaderHovered] = tint(p.acc, 0.28f);
-    c[ImGuiCol_HeaderActive] = tint(p.acc, 0.38f);
-    c[ImGuiCol_Separator] = p.line;
+    c[ImGuiCol_Header] = tint(p.acc, light ? 0.20f : 0.14f);
+    c[ImGuiCol_HeaderHovered] = tint(p.acc, 0.30f);
+    c[ImGuiCol_HeaderActive] = tint(p.acc, 0.40f);
+    c[ImGuiCol_Separator] = line;
     c[ImGuiCol_SeparatorHovered] = tint(p.acc, 0.5f);
     c[ImGuiCol_SeparatorActive] = p.acc;
-    c[ImGuiCol_ResizeGrip] = p.line;
+    c[ImGuiCol_ResizeGrip] = line;
     c[ImGuiCol_ResizeGripHovered] = tint(p.acc, 0.5f);
-    c[ImGuiCol_Tab] = p.bg1;
+    c[ImGuiCol_Tab] = bg1;
     c[ImGuiCol_TabHovered] = tint(p.acc, 0.35f);
     c[ImGuiCol_TabActive] = tint(p.acc, 0.22f);
     c[ImGuiCol_PlotLines] = p.acc;
     c[ImGuiCol_PlotHistogram] = p.acc;
     c[ImGuiCol_TextSelectedBg] = tint(p.acc, 0.35f);
     c[ImGuiCol_NavHighlight] = p.acc;
-    c[ImGuiCol_TableHeaderBg] = p.bg0;
-    c[ImGuiCol_TableBorderLight] = p.line;
-    c[ImGuiCol_TableBorderStrong] = p.line;
-    c[ImGuiCol_TableRowBgAlt] = ImVec4(1, 1, 1, 0.02f);
+    c[ImGuiCol_TableHeaderBg] = bg0;
+    c[ImGuiCol_TableBorderLight] = line;
+    c[ImGuiCol_TableBorderStrong] = line;
+    c[ImGuiCol_TableRowBgAlt] = light ? ImVec4(0, 0, 0, 0.03f)
+                                      : ImVec4(1, 1, 1, 0.02f);
 }
 
 } // namespace sdrjo::gui

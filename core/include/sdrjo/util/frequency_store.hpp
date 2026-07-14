@@ -13,6 +13,7 @@ struct FavoriteFrequency {
     double freqHz = 0.0;
     std::string mode;      // "WFM", "NFM", "AM", "USB", "LSB", ...
     double bandwidthHz = 0.0;
+    std::string category;  // opzionale: es. "Radio", "Aereo", "Ham"...
 };
 
 class FrequencyStore {
