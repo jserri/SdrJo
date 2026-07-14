@@ -273,6 +273,29 @@ Fatti (17a tornata, sintonia col frequenzimetro come SDR#):
   grezzo, quindi basta poco: cosi' il segnale sintonizzato resta al centro
   dello spettro invece che fisso a ~60%.
 
+Fatti (26a tornata, FT8: il modo digitale moderno):
+
+- ✅ **Decoder FT8** completo lato ricezione: sincronizzazione sugli array
+  Costas sullo spettro, demodulazione soft 8-FSK, decodifica LDPC(174,91)
+  a propagazione di credenza, verifica CRC-14 e spacchettamento dei
+  messaggi (standard con grid/rapporto, CQ, testo libero). Frontend che
+  ricampiona l'audio a 12800 Hz (simbolo = 2048 campioni, toni su bin
+  esatti) e riusa la FFT del progetto.
+- ✅ **Pannello FT8** nella sidebar: si attiva/disattiva dal titolo, cattura
+  l'audio in finestre di 15 s allineate all'orologio (:00/:15/:30/:45) e a
+  fine slot lancia la decodifica in un thread a parte (non blocca la GUI).
+  Tabella dei messaggi con dB, DT, Hz e testo (CQ evidenziati).
+- ✅ **Test rigorosi**: i bit impacchettati, i toni e lo spacchettamento
+  combaciano BIT-PER-BIT coi vettori di riferimento del protocollo (WSJT-X);
+  la catena completa decodifica audio GFSK+rumore (6/6 a +3 dB) e due
+  segnali sovrapposti nella stessa finestra.
+- Le tabelle LDPC/Costas/Gray sono costanti del protocollo FT8 (identiche in
+  ft8_lib MIT); gli algoritmi sono scritti da zero per SdrJo.
+- Rimandato: FT4 (condivide gran parte dell'infrastruttura: Costas 4x4,
+  4-GFSK, cicli da 7.5 s) e la sensibilita' ai segnali debolissimi tipo
+  WSJT-X (OSD + a-priori); qui il decoder e' "baseline" BP a simbolo
+  singolo, ottimo sui segnali normali.
+
 Fatti (25a tornata, look&feel + funzioni: tema, screenshot, memorie, timer):
 
 - ✅ **Tema chiaro/scuro** commutabile dal pannello Ricevitore (sezione

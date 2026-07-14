@@ -27,6 +27,7 @@
 #include <sdrjo/dsp/rtty.hpp>
 #include <sdrjo/dsp/psk31.hpp>
 #include <sdrjo/dsp/tetra_activity.hpp>
+#include <sdrjo/dsp/ft8.hpp>
 #include <sdrjo/morse/cw_decoder.hpp>
 #include <sdrjo/sat/orbit.hpp>
 #include <sdrjo/sat/tle.hpp>
@@ -262,6 +263,21 @@ struct AppState : public sdrjo::IModuleHost {
         }
     };
     int textDecoderMode = 0; // 0 spento, 1 CW, 2 RTTY, 3 PSK31
+
+    // FT8: cattura l'audio d'ascolto in finestre da 15 s allineate all'orologio
+    // (slot :00/:15/:30/:45) e alla fine di ogni slot lancia la decodifica in
+    // un thread a parte. L'audio arriva a 48 kHz e viene ricampionato dentro
+    // il decoder.
+    bool ft8On = false;
+    std::mutex ft8Mutex;              // protegge cattura e risultati
+    std::vector<float> ft8Capture;    // audio dello slot corrente (48 kHz)
+    long ft8CurSlot = -1;             // indice di slot in corso (epoch/15)
+    std::atomic<bool> ft8Busy{false}; // decodifica in corso
+    std::thread ft8Thread;
+    std::vector<sdrjo::dsp::ft8::Decode> ft8Decodes; // ultimi risultati
+    std::string ft8SlotLabel;         // orario dello slot decodificato
+    int ft8DecodeCount = 0;           // totale messaggi decodificati (sessione)
+
     float cwToneHz = 700.0f;
     bool cwAutoSpeed = true;   // CW: velocita' auto o WPM fissa
     float cwWpm = 20.0f;       // WPM usati in modalita' manuale
@@ -711,6 +727,19 @@ void dspLoop(AppState& app)
                 }
             };
 
+            // FT8: accumula l'audio mono nello slot corrente (a 48 kHz).
+            auto feedFt8 = [&app](const float* s, size_t n) {
+                if (!app.ft8On || n == 0) return;
+                std::lock_guard<std::mutex> lk(app.ft8Mutex);
+                app.ft8Capture.insert(app.ft8Capture.end(), s, s + n);
+                // non lasciar crescere oltre ~16 s (protezione)
+                size_t cap = size_t(16 * 48000);
+                if (app.ft8Capture.size() > cap)
+                    app.ft8Capture.erase(app.ft8Capture.begin(),
+                                         app.ft8Capture.begin() +
+                                             ptrdiff_t(app.ft8Capture.size() - cap));
+            };
+
             app.ensureAudio();
             if (app.wfmDemod) {
                 app.audioL.clear();
@@ -721,6 +750,7 @@ void dspLoop(AppState& app)
                 app.filterR.process(app.audioR.data(), app.audioR.size());
                 tapAudio(app.audioL.data(), app.audioL.size());
                 feedTextDecoders(app.audioL.data(), app.audioL.size());
+                feedFt8(app.audioL.data(), app.audioL.size());
                 float g = (app.squelchOpen && !app.muted) ? app.volume : 0.0f;
                 app.audioInterleaved.resize(app.audioL.size() * 2);
                 for (size_t i = 0; i < app.audioL.size(); i++) {
@@ -762,6 +792,7 @@ void dspLoop(AppState& app)
                 tapAudio(app.audioMono.data(), app.audioMono.size());
                 feedTextDecoders(app.audioMono.data(),
                                  app.audioMono.size());
+                feedFt8(app.audioMono.data(), app.audioMono.size());
                 float g = (app.squelchOpen && !app.muted) ? app.volume : 0.0f;
                 for (auto& v : app.audioMono) v *= g;
                 app.audio.writeMono(app.audioMono.data(),
@@ -2522,6 +2553,7 @@ void drawReceiverSection(AppState& app)
 void drawAudioSection(AppState& app);
 void drawAudioSpectrumSection(AppState& app);
 void drawTextDecoderSection(AppState& app);
+void drawFt8Section(AppState& app);
 void drawTetraSection(AppState& app);
 void drawScannerSection(AppState& app);
 void drawSatellitesSection(AppState& app);
@@ -2762,6 +2794,17 @@ void drawSidebar(AppState& app)
         drawAudioSpectrumSection(app);
     if (iconHeader("Decoder testi", pal.acc2))
         drawTextDecoderSection(app);
+    {
+        bool ch = false, en = app.ft8On;
+        bool open = sectionHeaderToggle("ft8", "FT8", en, ch);
+        if (ch) {
+            app.ft8On = en;
+            std::lock_guard<std::mutex> lk(app.ft8Mutex);
+            app.ft8Capture.clear();
+            app.ft8CurSlot = -1;
+        }
+        if (open) drawFt8Section(app);
+    }
     {
         bool ch = false, en = app.tetraDetectOn;
         bool open = sectionHeaderToggle("tetra", "TETRA (attivita')", en, ch);
@@ -3664,6 +3707,66 @@ void updateScanner(AppState& app)
         scannerHop(app);
 }
 
+void drawFt8Section(AppState& app)
+{
+    ImGui::TextWrapped(
+        "Metti la radio in USB sulla frequenza FT8 della banda (es. 14.074, "
+        "7.074, 10.136 MHz) con banda larga ~3 kHz. La decodifica parte da "
+        "sola alla fine di ogni finestra di 15 s (servono l'ora di sistema "
+        "corretta e i secondi allineati).");
+
+    // Stato dello slot corrente.
+    int sec = int(std::time(nullptr) % 15);
+    int toNext = 15 - sec;
+    if (app.ft8Busy.load())
+        ImGui::TextColored(sdrjo::gui::palette().warn, "decodifica in corso...");
+    else
+        ImGui::Text("prossima finestra tra %d s", toNext);
+    ImGui::SameLine();
+    ImGui::TextDisabled("| tot messaggi: %d", app.ft8DecodeCount);
+
+    std::vector<sdrjo::dsp::ft8::Decode> decodes;
+    std::string slot;
+    {
+        std::lock_guard<std::mutex> lk(app.ft8Mutex);
+        decodes = app.ft8Decodes;
+        slot = app.ft8SlotLabel;
+    }
+    if (!slot.empty())
+        ImGui::Text("Finestra %s UTC - %d segnali", slot.c_str(),
+                    int(decodes.size()));
+
+    if (ImGui::BeginTable("ft8tab", 4,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+                              ImGuiTableFlags_ScrollY,
+                          ImVec2(0, 180))) {
+        ImGui::TableSetupColumn("dB", ImGuiTableColumnFlags_WidthFixed, 40);
+        ImGui::TableSetupColumn("DT", ImGuiTableColumnFlags_WidthFixed, 44);
+        ImGui::TableSetupColumn("Hz", ImGuiTableColumnFlags_WidthFixed, 56);
+        ImGui::TableSetupColumn("Messaggio", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        for (const auto& d : decodes) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::Text("%+d", int(d.snrDb));
+            ImGui::TableNextColumn();
+            ImGui::Text("%+.1f", d.dtSec);
+            ImGui::TableNextColumn();
+            ImGui::Text("%.0f", d.freqHz);
+            ImGui::TableNextColumn();
+            // I messaggi CQ in evidenza.
+            if (d.message.rfind("CQ", 0) == 0)
+                ImGui::TextColored(sdrjo::gui::palette().ok, "%s",
+                                   d.message.c_str());
+            else
+                ImGui::TextUnformatted(d.message.c_str());
+        }
+        ImGui::EndTable();
+    }
+    if (decodes.empty() && slot.empty())
+        ImGui::TextDisabled("in attesa della prima finestra...");
+}
+
 void drawScannerSection(AppState& app)
 {
     auto& items = app.freqStore.items();
@@ -3863,6 +3966,59 @@ void updateScheduledRecording(AppState& app)
                       app.schedDurMin);
         app.log("Pianificata", msg);
     }
+}
+
+// FT8: gestione degli slot da 15 s allineati all'orologio. Alla fine di ogni
+// slot lancia la decodifica dell'audio catturato in un thread a parte, cosi'
+// da non bloccare l'interfaccia (la decodifica dura ~1-2 s).
+void updateFt8(AppState& app)
+{
+    if (!app.ft8On) {
+        if (app.ft8Thread.joinable() && !app.ft8Busy.load()) app.ft8Thread.join();
+        app.ft8CurSlot = -1;
+        return;
+    }
+    long slot = long(std::time(nullptr)) / 15;
+    if (app.ft8CurSlot < 0) {
+        // Primo avvio: inizia a catturare dall'inizio del prossimo slot.
+        app.ft8CurSlot = slot;
+        std::lock_guard<std::mutex> lk(app.ft8Mutex);
+        app.ft8Capture.clear();
+        return;
+    }
+    if (slot == app.ft8CurSlot) return;
+
+    // Slot terminato: preleva l'audio catturato.
+    std::vector<float> buf;
+    {
+        std::lock_guard<std::mutex> lk(app.ft8Mutex);
+        buf.swap(app.ft8Capture);
+    }
+    long doneSlot = app.ft8CurSlot;
+    app.ft8CurSlot = slot;
+
+    // Decodifica solo se c'e' abbastanza audio e non ce n'e' gia' una in corso.
+    if (app.ft8Busy.load() || buf.size() < size_t(10 * 48000)) return;
+    if (app.ft8Thread.joinable()) app.ft8Thread.join();
+    app.ft8Busy.store(true);
+    app.ft8Thread = std::thread([&app, b = std::move(buf), doneSlot]() {
+        auto res = sdrjo::dsp::ft8::decodeAudio(b.data(), b.size(), 48000.0,
+                                                200.0, 3000.0);
+        std::time_t t = doneSlot * 15;
+        std::tm tm{};
+#if defined(_WIN32)
+        gmtime_s(&tm, &t);
+#else
+        gmtime_r(&t, &tm);
+#endif
+        char lab[16];
+        std::strftime(lab, sizeof(lab), "%H:%M:%S", &tm);
+        std::lock_guard<std::mutex> lk(app.ft8Mutex);
+        app.ft8Decodes = std::move(res);
+        app.ft8SlotLabel = lab;
+        app.ft8DecodeCount += int(app.ft8Decodes.size());
+        app.ft8Busy.store(false);
+    });
 }
 
 } // namespace
@@ -4123,6 +4279,7 @@ int main(int argc, char** argv)
         }
 
         updateScheduledRecording(app);
+        updateFt8(app);
 
         drawSidebar(app);
         drawSpectrumPanel(app);
@@ -4198,6 +4355,7 @@ int main(int argc, char** argv)
     app.dspRunning.store(false);
     if (app.dspThread.joinable()) app.dspThread.join();
     if (app.geoThread.joinable()) app.geoThread.join();
+    if (app.ft8Thread.joinable()) app.ft8Thread.join();
     app.scanWav.stop();
     app.wsAudio.stop();
     app.cockpit.stop();

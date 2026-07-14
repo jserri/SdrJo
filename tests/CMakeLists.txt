@@ -101,3 +101,7 @@ add_test(NAME psk31 COMMAND test_psk31)
 add_executable(test_tetra test_tetra.cpp)
 target_link_libraries(test_tetra PRIVATE sdrjo-core)
 add_test(NAME tetra COMMAND test_tetra)
+
+add_executable(test_ft8 test_ft8.cpp)
+target_link_libraries(test_ft8 PRIVATE sdrjo-core)
+add_test(NAME ft8 COMMAND test_ft8)
