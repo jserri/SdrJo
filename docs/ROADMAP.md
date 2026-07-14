@@ -273,6 +273,29 @@ Fatti (17a tornata, sintonia col frequenzimetro come SDR#):
   grezzo, quindi basta poco: cosi' il segnale sintonizzato resta al centro
   dello spettro invece che fisso a ~60%.
 
+Fatti (27a tornata, FT4 + OSD + interazione + cockpit):
+
+- ✅ **FT4**: il "fratello veloce" di FT8 (cicli da 7.5 s, 4-GFSK, 103
+  simboli, mescolamento RVEC prima della FEC). Stesso codice LDPC. Demod
+  con DFT diretta ai 4 toni (frequenza esatta, ricorrenza di fase). Nel
+  pannello si sceglie FT8/FT4 e le finestre si riallineano da sole (15 s /
+  7.5 s).
+- ✅ **OSD** (ordered-statistics decoding, ordine 2): fallback del BP che
+  recupera i segnali piu' deboli ordinando i bit per affidabilita' e
+  ricodificando dai piu' sicuri. Attivo sia per FT8 sia per FT4.
+- ✅ **Click sul decode = copia**: un click su un messaggio nella tabella
+  lo copia negli appunti (comodo per loggare o rispondere) e lo annota nel
+  Log.
+- ✅ **Cockpit web**: i decode FT8/FT4 arrivano anche al browser
+  (endpoint /api/ft8) e appaiono in una tabella dedicata nella plancia,
+  aggiornata ogni 2 s.
+- Test: FT4 pack/unpack/toni bit-per-bit vs riferimento e decodifica di
+  audio 4-FSK+rumore (3/3); OSD verificato sul recupero da errori a bassa
+  affidabilita'. Tutti i 27 test verdi.
+- Rimandato: sensibilita' estrema tipo WSJT-X (decodifica a-priori sui
+  QSO in corso, sottrazione dei segnali gia' decodificati per scavare
+  sotto), e SSTV.
+
 Fatti (26a tornata, FT8: il modo digitale moderno):
 
 - ✅ **Decoder FT8** completo lato ricezione: sincronizzazione sugli array

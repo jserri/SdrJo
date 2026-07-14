@@ -269,6 +269,7 @@ struct AppState : public sdrjo::IModuleHost {
     // un thread a parte. L'audio arriva a 48 kHz e viene ricampionato dentro
     // il decoder.
     bool ft8On = false;
+    int ft8Mode = 0;                 // 0 = FT8 (15 s), 1 = FT4 (7.5 s)
     std::mutex ft8Mutex;              // protegge cattura e risultati
     std::vector<float> ft8Capture;    // audio dello slot corrente (48 kHz)
     long ft8CurSlot = -1;             // indice di slot in corso (epoch/15)
@@ -3709,15 +3710,32 @@ void updateScanner(AppState& app)
 
 void drawFt8Section(AppState& app)
 {
+    // Selettore modo FT8/FT4.
+    ImGui::TextUnformatted("Modo");
+    ImGui::SameLine();
+    int prevMode = app.ft8Mode;
+    ImGui::RadioButton("FT8", &app.ft8Mode, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("FT4", &app.ft8Mode, 1);
+    if (app.ft8Mode != prevMode) {
+        std::lock_guard<std::mutex> lk(app.ft8Mutex);
+        app.ft8Capture.clear();
+        app.ft8CurSlot = -1;   // riallinea agli slot del nuovo modo
+    }
+
     ImGui::TextWrapped(
-        "Metti la radio in USB sulla frequenza FT8 della banda (es. 14.074, "
-        "7.074, 10.136 MHz) con banda larga ~3 kHz. La decodifica parte da "
-        "sola alla fine di ogni finestra di 15 s (servono l'ora di sistema "
-        "corretta e i secondi allineati).");
+        "Metti la radio in USB sulla frequenza del modo (FT8: 14.074, 7.074, "
+        "10.136 MHz; FT4: 14.080, 7.0475 MHz) con banda larga ~3 kHz. La "
+        "decodifica parte da sola a fine finestra (15 s FT8 / 7.5 s FT4): "
+        "servono l'ora di sistema corretta e i secondi allineati.");
 
     // Stato dello slot corrente.
-    int sec = int(std::time(nullptr) % 15);
-    int toNext = 15 - sec;
+    double slotLen = (app.ft8Mode == 1) ? 7.5 : 15.0;
+    double nowS = double(std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count()) /
+                  1000.0;
+    int toNext = int(std::ceil(slotLen - std::fmod(nowS, slotLen)));
     if (app.ft8Busy.load())
         ImGui::TextColored(sdrjo::gui::palette().warn, "decodifica in corso...");
     else
@@ -3754,12 +3772,18 @@ void drawFt8Section(AppState& app)
             ImGui::TableNextColumn();
             ImGui::Text("%.0f", d.freqHz);
             ImGui::TableNextColumn();
-            // I messaggi CQ in evidenza.
-            if (d.message.rfind("CQ", 0) == 0)
-                ImGui::TextColored(sdrjo::gui::palette().ok, "%s",
-                                   d.message.c_str());
-            else
-                ImGui::TextUnformatted(d.message.c_str());
+            // Riga selezionabile: click = copia il messaggio negli appunti.
+            bool cq = d.message.rfind("CQ", 0) == 0;
+            if (cq)
+                ImGui::PushStyleColor(ImGuiCol_Text, sdrjo::gui::palette().ok);
+            if (ImGui::Selectable(d.message.c_str(), false,
+                                  ImGuiSelectableFlags_SpanAllColumns)) {
+                ImGui::SetClipboardText(d.message.c_str());
+                app.log("FT8", ("copiato: " + d.message).c_str());
+            }
+            if (cq) ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("click per copiare negli appunti");
         }
         ImGui::EndTable();
     }
@@ -3978,9 +4002,14 @@ void updateFt8(AppState& app)
         app.ft8CurSlot = -1;
         return;
     }
-    long slot = long(std::time(nullptr)) / 15;
+    const double slotLen = (app.ft8Mode == 1) ? 7.5 : 15.0; // FT4 / FT8
+    // Tempo assoluto con frazione di secondo (gli slot FT4 cadono su .5 s).
+    double now = double(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count()) /
+                 1000.0;
+    long slot = long(now / slotLen);
     if (app.ft8CurSlot < 0) {
-        // Primo avvio: inizia a catturare dall'inizio del prossimo slot.
         app.ft8CurSlot = slot;
         std::lock_guard<std::mutex> lk(app.ft8Mutex);
         app.ft8Capture.clear();
@@ -3998,13 +4027,19 @@ void updateFt8(AppState& app)
     app.ft8CurSlot = slot;
 
     // Decodifica solo se c'e' abbastanza audio e non ce n'e' gia' una in corso.
-    if (app.ft8Busy.load() || buf.size() < size_t(10 * 48000)) return;
+    size_t minSamples = size_t(slotLen * 0.6 * 48000.0);
+    if (app.ft8Busy.load() || buf.size() < minSamples) return;
     if (app.ft8Thread.joinable()) app.ft8Thread.join();
     app.ft8Busy.store(true);
-    app.ft8Thread = std::thread([&app, b = std::move(buf), doneSlot]() {
-        auto res = sdrjo::dsp::ft8::decodeAudio(b.data(), b.size(), 48000.0,
-                                                200.0, 3000.0);
-        std::time_t t = doneSlot * 15;
+    int mode = app.ft8Mode;
+    app.ft8Thread = std::thread([&app, b = std::move(buf), doneSlot, slotLen,
+                                 mode]() {
+        auto res = (mode == 1)
+                       ? sdrjo::dsp::ft8::decodeAudioFt4(b.data(), b.size(),
+                                                         48000.0, 200.0, 3000.0)
+                       : sdrjo::dsp::ft8::decodeAudio(b.data(), b.size(),
+                                                      48000.0, 200.0, 3000.0);
+        std::time_t t = std::time_t(doneSlot * slotLen);
         std::tm tm{};
 #if defined(_WIN32)
         gmtime_s(&tm, &t);
@@ -4013,6 +4048,32 @@ void updateFt8(AppState& app)
 #endif
         char lab[16];
         std::strftime(lab, sizeof(lab), "%H:%M:%S", &tm);
+
+        // JSON per il cockpit web (/api/ft8).
+        auto esc = [](const std::string& s) {
+            std::string o;
+            for (char c : s) {
+                if (c == '"' || c == '\\') o += '\\';
+                o += c;
+            }
+            return o;
+        };
+        std::string json = "{\"mode\":\"";
+        json += (mode == 1 ? "FT4" : "FT8");
+        json += "\",\"slot\":\"";
+        json += lab;
+        json += "\",\"decodes\":[";
+        for (size_t i = 0; i < res.size(); i++) {
+            char b[256];
+            std::snprintf(b, sizeof(b),
+                          "%s{\"db\":%d,\"dt\":%.1f,\"hz\":%.0f,\"msg\":\"%s\"}",
+                          i ? "," : "", int(res[i].snrDb), res[i].dtSec,
+                          res[i].freqHz, esc(res[i].message).c_str());
+            json += b;
+        }
+        json += "]}";
+        app.cockpit.setFt8Json(json);
+
         std::lock_guard<std::mutex> lk(app.ft8Mutex);
         app.ft8Decodes = std::move(res);
         app.ft8SlotLabel = lab;

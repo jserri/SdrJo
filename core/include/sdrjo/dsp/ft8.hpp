@@ -47,6 +47,11 @@ void encode174(const uint8_t bits77[77], uint8_t codeword174[174]);
 // CRC non torna.
 bool bpDecode(const float llr174[174], uint8_t bits77[77], int maxIter = 30);
 
+// Decoder a statistiche ordinate (OSD): fallback del BP per i segnali
+// deboli. norder = 0/1/2 (ordine dei pattern d'errore provati). Ritorna
+// false se non trova una codeword con CRC valido.
+bool osdDecode(const float llr174[174], uint8_t bits77[77], int norder = 2);
+
 // --- Modem ------------------------------------------------------------------
 
 // Sequenza dei 79 toni (0..7) per un payload di 77 bit.
@@ -66,5 +71,22 @@ std::vector<float> encodeAudio(const std::string& message, double f0Hz,
 std::vector<Decode> decodeAudio(const float* audio, size_t n,
                                 double sampleRate, double freqMin = 200.0,
                                 double freqMax = 3000.0);
+
+// --- FT4 --------------------------------------------------------------------
+// FT4 e' il "fratello veloce" di FT8: cicli da 7.5 s, 4-GFSK, 103 simboli
+// (4 array Costas 4x4 + 87 dati), stesso codice LDPC(174,91) ma con i bit
+// del messaggio mescolati (RVEC) prima della FEC.
+
+// 77 bit -> 103 toni (0..3) FT4.
+void ft4TonesFromBits(const uint8_t bits77[77], int tones[103]);
+
+// Audio 4-FSK a fase continua per un messaggio FT4 (per test/riferimento).
+std::vector<float> encodeAudioFt4(const std::string& message, double f0Hz,
+                                  double sampleRate = 12000.0);
+
+// Decodifica una finestra audio FT4 (~7.5 s).
+std::vector<Decode> decodeAudioFt4(const float* audio, size_t n,
+                                   double sampleRate, double freqMin = 200.0,
+                                   double freqMax = 3000.0);
 
 } // namespace sdrjo::dsp::ft8

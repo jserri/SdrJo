@@ -22,6 +22,20 @@ constexpr double kToneSpacing = 6.25;                 // Hz
 constexpr double kSymbolPeriod = 0.16;                // s
 constexpr uint16_t kCrcPoly = 0x2757;
 
+// --- Costanti FT4 ----------------------------------------------------------
+constexpr int kFt4Nsym = 103;
+constexpr int kFt4Ndata = 87;
+constexpr int kCostas4[4][4] = {
+    {0, 1, 3, 2}, {1, 0, 2, 3}, {2, 3, 1, 0}, {3, 2, 0, 1}};
+constexpr int kGray4[4] = {0, 1, 3, 2};
+constexpr double kFt4ToneSpacing = 12000.0 / 576.0;   // 20.833 Hz
+constexpr double kFt4SymbolPeriod = 576.0 / 12000.0;  // 0.048 s
+// Vettore di mescolamento applicato ai 77 bit prima della FEC (genft4).
+constexpr uint8_t kRvec[77] = {
+    0,1,0,0,1,0,1,0,0,1,0,1,1,1,1,0,1,0,0,0,1,0,0,1,1,0,1,1,0,1,0,0,1,0,1,1,0,
+    0,0,0,1,0,0,0,1,0,1,0,0,1,1,1,1,0,0,1,0,1,0,1,0,1,0,1,1,0,1,1,1,1,1,0,0,0,
+    1,0,1};
+
 // --- CRC-14 -----------------------------------------------------------------
 // Calcolata sui 77 bit + 5 zeri di padding, poi 14 zeri di aumento (come in
 // WSJT-X, boost augmented_crc<14,0x2757>).
@@ -170,6 +184,103 @@ bool bpDecode(const float llr174[174], uint8_t bits77[77], int maxIter)
         }
     }
     return false;
+}
+
+// --- OSD: ordered-statistics decoding --------------------------------------
+// Fallback del BP: rende sistematico il generatore sulle 91 posizioni piu'
+// affidabili, poi prova i pattern d'errore di peso <= norder su quelle,
+// scegliendo la codeword piu' vicina (con CRC valido).
+bool osdDecode(const float llr174[174], uint8_t bits77[77], int norder)
+{
+    const LdpcModel& m = model();
+    const int N = 174, K = 91;
+
+    double absrx[174];
+    uint8_t hdec[174];
+    for (int i = 0; i < N; i++) {
+        hdec[i] = llr174[i] >= 0 ? 1 : 0;
+        absrx[i] = std::fabs(double(llr174[i]));
+    }
+    int order[174];
+    for (int i = 0; i < N; i++) order[i] = i;
+    std::sort(order, order + N,
+              [&](int a, int b) { return absrx[a] > absrx[b]; });
+
+    // genmrb[i][c] = G_FULL[i][order[c]] con G_FULL = [I91 | GEN^T].
+    static thread_local std::vector<uint8_t> gm;
+    gm.assign(size_t(K) * N, 0);
+    auto G = [&](int i, int c) -> uint8_t& { return gm[size_t(i) * N + c]; };
+    for (int i = 0; i < K; i++)
+        for (int c = 0; c < N; c++) {
+            int col = order[c];
+            G(i, c) = (col < K) ? (i == col ? 1 : 0) : m.gen[col - K][i];
+        }
+    int indices[174];
+    for (int c = 0; c < N; c++) indices[c] = order[c];
+
+    // Eliminazione di Gauss su GF(2): identita' sulle prime K colonne.
+    for (int d = 0; d < K; d++) {
+        int col = -1;
+        for (int c = d; c < N; c++)
+            if (G(d, c)) { col = c; break; }
+        if (col < 0) return false;
+        if (col != d) {
+            for (int i = 0; i < K; i++) std::swap(G(i, d), G(i, col));
+            std::swap(indices[d], indices[col]);
+        }
+        for (int i = 0; i < K; i++) {
+            if (i == d || !G(i, d)) continue;
+            for (int c = 0; c < N; c++) G(i, c) ^= G(d, c);
+        }
+    }
+
+    double absrxP[174];
+    uint8_t hdecP[174];
+    for (int c = 0; c < N; c++) {
+        absrxP[c] = absrx[indices[c]];
+        hdecP[c] = hdec[indices[c]];
+    }
+    // Codeword d'ordine 0: c0 = (hdecP[:K] @ genmrb) % 2.
+    uint8_t c0[174];
+    for (int j = 0; j < N; j++) {
+        int s = 0;
+        for (int i = 0; i < K; i++) s ^= (hdecP[i] & G(i, j));
+        c0[j] = uint8_t(s);
+    }
+    auto dist = [&](const uint8_t* cw) {
+        double d = 0;
+        for (int c = 0; c < N; c++) if (cw[c] ^ hdecP[c]) d += absrxP[c];
+        return d;
+    };
+
+    uint8_t best[174];
+    std::memcpy(best, c0, N);
+    double bestD = dist(c0);
+
+    uint8_t cand[174];
+    if (norder >= 1) {
+        for (int i = 0; i < K; i++) {
+            for (int j = 0; j < N; j++) cand[j] = c0[j] ^ G(i, j);
+            double d = dist(cand);
+            if (d < bestD) { bestD = d; std::memcpy(best, cand, N); }
+        }
+    }
+    if (norder >= 2) {
+        for (int i = 0; i < K; i++)
+            for (int j = i + 1; j < K; j++) {
+                for (int k = 0; k < N; k++)
+                    cand[k] = c0[k] ^ G(i, k) ^ G(j, k);
+                double d = dist(cand);
+                if (d < bestD) { bestD = d; std::memcpy(best, cand, N); }
+            }
+    }
+
+    // Riporta la codeword nell'ordine originale e verifica il CRC.
+    uint8_t cw[174];
+    for (int c = 0; c < N; c++) cw[indices[c]] = best[c];
+    if (!crcOk(cw)) return false;
+    std::memcpy(bits77, cw, 77);
+    return true;
 }
 
 namespace {
@@ -565,10 +676,10 @@ std::vector<float> encodeAudio(const std::string& message, double f0Hz,
 // --- Decodifica di una finestra --------------------------------------------
 namespace {
 
-// Ricampiona linearmente a 12800 Hz (nsps = 2048, toni su bin interi).
-std::vector<float> resampleTo12800(const float* in, size_t n, double inRate)
+// Ricampiona linearmente a outRate Hz.
+std::vector<float> resampleTo(const float* in, size_t n, double inRate,
+                              double outRate)
 {
-    const double outRate = 12800.0;
     size_t outN = size_t(std::llround(double(n) * outRate / inRate));
     std::vector<float> out(outN);
     for (size_t j = 0; j < outN; j++) {
@@ -594,7 +705,7 @@ std::vector<Decode> decodeAudio(const float* audio, size_t n, double sampleRate,
     constexpr int kStep = kNsps / 4;            // passo di sincronismo (512)
     const double binHz = 12800.0 / kNsps;       // 6.25 Hz
 
-    std::vector<float> dd = resampleTo12800(audio, n, sampleRate);
+    std::vector<float> dd = resampleTo(audio, n, sampleRate, 12800.0);
     // Estendi a 15 s se serve.
     size_t need = size_t(15.0 * 12800.0);
     if (dd.size() < need) dd.resize(need, 0.0f);
@@ -726,7 +837,9 @@ std::vector<Decode> decodeAudio(const float* audio, size_t n, double sampleRate,
         for (int i = 0; i < 174; i++) llr[i] = float(2.83 * llr[i] / sigma);
 
         uint8_t bits[77];
-        if (!bpDecode(llr, bits, 30)) continue;
+        bool ok = bpDecode(llr, bits, 30);
+        if (!ok) ok = osdDecode(llr, bits, 2); // fallback segnali deboli
+        if (!ok) continue;
         std::string msg;
         if (!unpack77(bits, msg)) continue;
         if (msg.empty()) continue;
@@ -761,6 +874,268 @@ std::vector<Decode> decodeAudio(const float* audio, size_t n, double sampleRate,
         if (!merged) results.push_back(d);
     }
 
+    std::sort(results.begin(), results.end(),
+              [](const Decode& a, const Decode& b){ return a.sync > b.sync; });
+    return results;
+}
+
+// ===========================================================================
+// FT4
+// ===========================================================================
+void ft4TonesFromBits(const uint8_t bits77[77], int tones[103])
+{
+    uint8_t scr[77];
+    for (int i = 0; i < 77; i++) scr[i] = bits77[i] ^ kRvec[i];
+    uint8_t cw[174];
+    encode174(scr, cw);
+    int itmp[87];
+    for (int i = 0; i < 87; i++) {
+        int two = cw[2 * i] * 2 + cw[2 * i + 1];
+        itmp[i] = kGray4[two];
+    }
+    for (int i = 0; i < 4; i++) {
+        tones[i] = kCostas4[0][i];
+        tones[33 + i] = kCostas4[1][i];
+        tones[66 + i] = kCostas4[2][i];
+        tones[99 + i] = kCostas4[3][i];
+    }
+    for (int i = 0; i < 29; i++) tones[4 + i] = itmp[i];
+    for (int i = 0; i < 29; i++) tones[37 + i] = itmp[29 + i];
+    for (int i = 0; i < 29; i++) tones[70 + i] = itmp[58 + i];
+}
+
+std::vector<float> encodeAudioFt4(const std::string& message, double f0Hz,
+                                  double sampleRate)
+{
+    uint8_t bits[77];
+    if (!pack77(message, bits)) return {};
+    std::string chk;
+    if (!unpack77(bits, chk)) return {};
+    int tones[103];
+    ft4TonesFromBits(bits, tones);
+    int nsps = int(std::lround(sampleRate * kFt4SymbolPeriod));
+    std::vector<float> out(size_t(nsps) * kFt4Nsym);
+    double phase = 0.0;
+    const double twoPi = 6.283185307179586;
+    for (int s = 0; s < kFt4Nsym; s++) {
+        double f = f0Hz + tones[s] * kFt4ToneSpacing;
+        double dphi = twoPi * f / sampleRate;
+        for (int k = 0; k < nsps; k++) {
+            out[size_t(s) * nsps + k] = float(std::sin(phase));
+            phase += dphi;
+            if (phase > twoPi) phase -= twoPi;
+        }
+    }
+    return out;
+}
+
+namespace {
+
+// Ampiezze complesse dei 4 toni FT4 in un simbolo (DFT diretta a frequenza
+// esatta, con ricorrenza di fase). start = campione iniziale del simbolo.
+void ft4SymbolTones(const std::vector<float>& dd, size_t start, double f0,
+                    double fs, double ts, std::complex<double> out[4])
+{
+    std::complex<double> acc[4] = {}, ph[4], w[4];
+    const double twoPi = 6.283185307179586;
+    for (int t = 0; t < 4; t++) {
+        double f = f0 + t * ts;
+        w[t] = std::polar(1.0, -twoPi * f / fs);
+        ph[t] = std::complex<double>(1.0, 0.0);
+    }
+    const int nsps = 576;
+    for (int k = 0; k < nsps; k++) {
+        double x = (start + k < dd.size()) ? double(dd[start + k]) : 0.0;
+        for (int t = 0; t < 4; t++) { acc[t] += x * ph[t]; ph[t] *= w[t]; }
+    }
+    for (int t = 0; t < 4; t++) out[t] = acc[t];
+}
+
+// Correlazione di sincronismo FT4 (16 simboli Costas) a (f0, start).
+double ft4SyncScore(const std::vector<float>& dd, size_t start, double f0,
+                    double fs, double ts)
+{
+    const int nsps = 576;
+    double s = 0;
+    auto block = [&](int symBase, int ci) {
+        for (int i = 0; i < 4; i++) {
+            std::complex<double> ton[4];
+            size_t st = start + size_t(symBase + i) * nsps;
+            ft4SymbolTones(dd, st, f0, fs, ts, ton);
+            s += std::norm(ton[kCostas4[ci][i]]);
+        }
+    };
+    block(0, 0); block(33, 1); block(66, 2); block(99, 3);
+    return s;
+}
+
+} // namespace
+
+std::vector<Decode> decodeAudioFt4(const float* audio, size_t n,
+                                   double sampleRate, double freqMin,
+                                   double freqMax)
+{
+    std::vector<Decode> results;
+    if (n == 0) return results;
+    const double fs = 12000.0;
+    const int nsps = 576;
+    const double ts = fs / nsps;   // 20.833 Hz
+
+    std::vector<float> dd = resampleTo(audio, n, sampleRate, fs);
+    size_t need = size_t(7.5 * fs);
+    if (dd.size() < need) dd.resize(need, 0.0f);
+
+    // Spettrogramma grezzo per la ricerca dei candidati (FFT 1024, Hann,
+    // passo mezzo simbolo). Bin = 11.72 Hz.
+    const int nfft = 1024;
+    const int step = nsps / 2;     // 288
+    const double binHz = fs / nfft;
+    int nframes = int((dd.size() - nfft) / step) + 1;
+    if (nframes < 2 * kFt4Nsym) return results;
+    const int nbin = nfft / 2 + 1;
+    std::vector<float> hann(nsps);
+    for (int i = 0; i < nsps; i++)
+        hann[i] = 0.5f - 0.5f * std::cos(2.0f * float(M_PI) * i / (nsps - 1));
+    std::vector<std::vector<float>> P(nframes, std::vector<float>(nbin, 0.0f));
+    std::vector<cfloat> buf(nfft);
+    for (int f = 0; f < nframes; f++) {
+        size_t base = size_t(f) * step;
+        for (int i = 0; i < nfft; i++)
+            buf[i] = (i < nsps) ? cfloat(dd[base + i] * hann[i], 0.0f)
+                                : cfloat(0.0f, 0.0f);
+        fft(buf.data(), nfft);
+        for (int b = 0; b < nbin; b++)
+            P[f][b] = buf[b].real() * buf[b].real() + buf[b].imag() * buf[b].imag();
+    }
+
+    int binLo = std::max(1, int(freqMin / binHz));
+    int binHi = std::min(nbin - 8, int(freqMax / binHz));
+    int maxOff = nframes - 2 * (kFt4Nsym - 1) - 1;
+    if (maxOff < 1) maxOff = 1;
+
+    struct Cand { double f0; int off; float score; };
+    std::vector<Cand> cands;
+    const int syncPos[4] = {0, 33, 66, 99};
+    for (int fb = binLo; fb <= binHi; fb++) {
+        double f0 = fb * binHz;
+        for (int off = 0; off < maxOff; off++) {
+            float sig = 0, tot = 0;
+            for (int blk = 0; blk < 4; blk++) {
+                for (int i = 0; i < 4; i++) {
+                    int sy = syncPos[blk] + i;
+                    int fr = off + 2 * sy;
+                    if (fr >= nframes) { sig = -1; break; }
+                    for (int t = 0; t < 4; t++) {
+                        int bin = int(std::lround((f0 + t * ts) / binHz));
+                        if (bin < 0 || bin >= nbin) continue;
+                        float p = P[fr][bin];
+                        tot += p;
+                        if (t == kCostas4[blk][i]) sig += p;
+                    }
+                }
+            }
+            if (sig < 0 || tot <= 0) continue;
+            cands.push_back({f0, off, sig / (tot / 4.0f)});
+        }
+    }
+    if (cands.empty()) return results;
+    std::sort(cands.begin(), cands.end(),
+              [](const Cand& a, const Cand& b){ return a.score > b.score; });
+    std::vector<Cand> keep;
+    for (const auto& c : cands) {
+        if (c.score < 1.5f) break;
+        bool dup = false;
+        for (const auto& k : keep)
+            if (std::abs(k.f0 - c.f0) < 15.0 && std::abs(k.off - c.off) <= 2)
+                dup = true;
+        if (!dup) keep.push_back(c);
+        if (keep.size() >= 40) break;
+    }
+
+    int invGray4[4];
+    for (int v = 0; v < 4; v++) invGray4[kGray4[v]] = v;
+
+    for (const auto& c : keep) {
+        // Affinamento fine di frequenza e tempo con DFT diretta.
+        double bestF = c.f0;
+        size_t bestStart = size_t(c.off) * step;
+        double bestS = -1;
+        for (int df = -12; df <= 12; df++) {
+            double f0 = c.f0 + df * 2.0;
+            for (int dtn = -2; dtn <= 2; dtn++) {
+                long st = long(c.off) * step + long(dtn) * (nsps / 4);
+                if (st < 0) continue;
+                double s = ft4SyncScore(dd, size_t(st), f0, fs, ts);
+                if (s > bestS) { bestS = s; bestF = f0; bestStart = size_t(st); }
+            }
+        }
+
+        // Demodula i 103 simboli.
+        std::array<std::array<double, 4>, kFt4Nsym> mag;
+        for (int s = 0; s < kFt4Nsym; s++) {
+            std::complex<double> ton[4];
+            ft4SymbolTones(dd, bestStart + size_t(s) * nsps, bestF, fs, ts, ton);
+            for (int t = 0; t < 4; t++) mag[s][t] = std::abs(ton[t]);
+        }
+        // Verifica di sincronismo.
+        int nsync = 0;
+        for (int blk = 0; blk < 4; blk++)
+            for (int i = 0; i < 4; i++) {
+                int sy = syncPos[blk] + i;
+                int best = 0;
+                for (int t = 1; t < 4; t++) if (mag[sy][t] > mag[sy][best]) best = t;
+                if (best == kCostas4[blk][i]) nsync++;
+            }
+        if (nsync <= 9) continue;
+
+        // Soft-bit: 2 bit per simbolo dati.
+        float llr[174];
+        auto symLlr = [&](int sy, int j) {
+            for (int p = 0; p < 2; p++) {
+                double mx1 = -1e30, mx0 = -1e30;
+                for (int t = 0; t < 4; t++) {
+                    int val = invGray4[t];
+                    int bit = (val >> (1 - p)) & 1;
+                    if (bit) { if (mag[sy][t] > mx1) mx1 = mag[sy][t]; }
+                    else { if (mag[sy][t] > mx0) mx0 = mag[sy][t]; }
+                }
+                llr[2 * j + p] = float(mx1 - mx0);
+            }
+        };
+        int j = 0;
+        for (int i = 0; i < 29; i++) symLlr(4 + i, j++);
+        for (int i = 0; i < 29; i++) symLlr(37 + i, j++);
+        for (int i = 0; i < 29; i++) symLlr(70 + i, j++);
+
+        double mean = 0, var = 0;
+        for (int i = 0; i < 174; i++) mean += llr[i];
+        mean /= 174.0;
+        for (int i = 0; i < 174; i++) var += (llr[i] - mean) * (llr[i] - mean);
+        var /= 174.0;
+        double sigma = var > 0 ? std::sqrt(var) : 1.0;
+        for (int i = 0; i < 174; i++) llr[i] = float(2.83 * llr[i] / sigma);
+
+        uint8_t scr[77];
+        bool ok = bpDecode(llr, scr, 30);
+        if (!ok) ok = osdDecode(llr, scr, 2);
+        if (!ok) continue;
+        // Togli il mescolamento RVEC per tornare al messaggio.
+        uint8_t bits[77];
+        for (int i = 0; i < 77; i++) bits[i] = scr[i] ^ kRvec[i];
+        std::string msg;
+        if (!unpack77(bits, msg) || msg.empty()) continue;
+
+        Decode d;
+        d.freqHz = bestF;
+        d.dtSec = double(bestStart) / fs - 0.5;
+        d.snrDb = 0.0f;
+        d.sync = c.score;
+        d.message = msg;
+        bool merged = false;
+        for (auto& r : results)
+            if (r.message == msg) { if (c.score > r.sync) r = d; merged = true; break; }
+        if (!merged) results.push_back(d);
+    }
     std::sort(results.begin(), results.end(),
               [](const Decode& a, const Decode& b){ return a.sync > b.sync; });
     return results;

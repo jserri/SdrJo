@@ -4,6 +4,7 @@
 #include "sdrjo/dsp/ft8.hpp"
 #include "test_util.hpp"
 #include "ft8_vectors.hpp"
+#include "ft4_vectors.hpp"
 
 #include <cmath>
 #include <random>
@@ -151,6 +152,72 @@ int main()
         }
         CHECK(g0);
         CHECK(g1);
+    }
+
+    // 5) OSD: deve recuperare una codeword anche con qualche errore forte
+    //    (LLR di segno sbagliato) dove il solo hard-decision fallirebbe.
+    {
+        uint8_t ref[77];
+        for (int i = 0; i < 77; i++) ref[i] = uint8_t(kFt8Vectors[1].bits[i] - '0');
+        uint8_t cw[174];
+        ft8::encode174(ref, cw);
+        float llr[174];
+        for (int i = 0; i < 174; i++) llr[i] = cw[i] ? 3.0f : -3.0f;
+        // Errori realistici: pochi bit a bassa affidabilita' con segno
+        // sbagliato (e' lo scenario che l'OSD sa recuperare, ordinando per
+        // affidabilita' e ricodificando dai bit piu' sicuri).
+        for (int i = 0; i < 6; i++) llr[i * 23] = cw[i * 23] ? -0.2f : 0.2f;
+        uint8_t dec[77];
+        bool ok = ft8::osdDecode(llr, dec, 2);
+        CHECK(ok);
+        bool same = true;
+        for (int i = 0; i < 77; i++) if (dec[i] != ref[i]) same = false;
+        CHECK(same);
+    }
+
+    // 6) FT4: compatibilita' col protocollo (pack/unpack/toni bit-per-bit).
+    for (const auto& v : kFt4Vectors) {
+        uint8_t bits[77];
+        CHECK(ft8::pack77(v.msg, bits));
+        std::string mine;
+        for (int i = 0; i < 77; i++) mine += char('0' + bits[i]);
+        CHECK(mine == std::string(v.bits));
+
+        uint8_t ref[77];
+        for (int i = 0; i < 77; i++) ref[i] = uint8_t(v.bits[i] - '0');
+        int tones[103];
+        ft8::ft4TonesFromBits(ref, tones);
+        std::string tstr;
+        for (int i = 0; i < 103; i++) tstr += char('0' + tones[i]);
+        CHECK(tstr == std::string(v.tones));
+    }
+
+    // 7) FT4: catena completa su audio 4-FSK + rumore in una finestra 7.5 s.
+    {
+        int found = 0;
+        for (const auto& v : kFt4Vectors) {
+            auto wave = ft8::encodeAudioFt4(v.msg, 1200.0, 12000.0);
+            size_t total = size_t(7.5 * 12000.0);
+            std::vector<float> audio(total, 0.0f);
+            size_t start = size_t(0.5 * 12000.0);
+            std::mt19937 rng(777);
+            std::normal_distribution<double> nd(0.0, 0.15);
+            for (size_t i = 0; i < total; i++) {
+                double x = nd(rng);
+                if (i >= start && i - start < wave.size()) x += wave[i - start];
+                audio[i] = float(x);
+            }
+            auto res = ft8::decodeAudioFt4(audio.data(), audio.size(), 12000.0,
+                                           200.0, 3000.0);
+            bool got = false;
+            for (const auto& d : res)
+                if (d.message == std::string(v.back)) got = true;
+            if (got) found++;
+            else std::printf("  (FT4 non decodificato: %s)\n", v.msg);
+        }
+        std::printf("  decodificati %d/%d messaggi FT4\n", found,
+                    int(kFt4Vectors.size()));
+        CHECK(found == int(kFt4Vectors.size()));
     }
 
     return testResult("ft8");

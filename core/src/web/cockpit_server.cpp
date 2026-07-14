@@ -28,6 +28,17 @@ CockpitServer::CockpitServer()
                       return "{\"port\":" + std::to_string(wsPort_) +
                              ",\"token\":\"" + wsToken_ + "\"}";
                   });
+    server_.route("/api/ft8", "application/json",
+                  [this](const std::string&) {
+                      std::lock_guard<std::mutex> lk(devMutex_);
+                      return ft8Json_;
+                  });
+}
+
+void CockpitServer::setFt8Json(const std::string& json)
+{
+    std::lock_guard<std::mutex> lk(devMutex_);
+    ft8Json_ = json;
 }
 
 void CockpitServer::setVfoInfo(double freqHz, const std::string& mode)

@@ -139,6 +139,18 @@ const char* cockpitPageHtml()
   </div>
 </div>
 
+<div id="ft8panel" class="panel" style="display:none;margin-top:16px">
+  <h2 style="margin:0 0 8px;font-size:11px;letter-spacing:1.5px;
+      text-transform:uppercase;color:var(--dim)">
+    <span id="ft8mode">FT8</span> &middot; finestra <span id="ft8slot">&ndash;</span> UTC</h2>
+  <table id="ft8tab" style="width:100%;border-collapse:collapse;font-size:13px">
+    <thead><tr style="color:var(--dim);text-align:left">
+      <th style="width:48px">dB</th><th style="width:52px">DT</th>
+      <th style="width:64px">Hz</th><th>Messaggio</th></tr></thead>
+    <tbody id="ft8body"></tbody>
+  </table>
+</div>
+
 <h2 style="margin:22px 0 0;font-size:11px;letter-spacing:1.5px;
     text-transform:uppercase;color:var(--dim)">Moduli</h2>
 <div class="grid" id="cards"></div>
@@ -595,9 +607,24 @@ async function pollStatus() {
     ' Copia i moduli nella cartella <code>modules</code>.</div></div>';
 }
 
-pollStatus(); pollSpectrum();
+function esc(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+async function pollFt8(){
+  let d; try { d = await (await fetch("api/ft8")).json(); } catch(e){ return; }
+  const panel = document.getElementById("ft8panel");
+  if(!d.decodes || d.decodes.length===0){ if(!d.slot){ panel.style.display="none"; return; } }
+  panel.style.display="block";
+  document.getElementById("ft8mode").textContent = d.mode || "FT8";
+  document.getElementById("ft8slot").textContent = d.slot || "–";
+  document.getElementById("ft8body").innerHTML = (d.decodes||[]).map(x=>{
+    const cq = String(x.msg).startsWith("CQ");
+    return `<tr><td>${x.db>=0?'+':''}${x.db}</td><td>${(x.dt>=0?'+':'')}${x.dt.toFixed(1)}</td>`+
+      `<td>${x.hz.toFixed(0)}</td><td style="${cq?'color:var(--ok,#5fd48a)':''}">${esc(x.msg)}</td></tr>`;
+  }).join("") || '<tr><td colspan="4" style="color:var(--dim)">nessun segnale in questa finestra</td></tr>';
+}
+pollStatus(); pollSpectrum(); pollFt8();
 setInterval(pollStatus, 1500);
 setInterval(pollSpectrum, 200);
+setInterval(pollFt8, 2000);
 </script>
 </body>
 </html>

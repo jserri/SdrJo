@@ -53,6 +53,9 @@ public:
     // Stato del ricevitore d'ascolto, mostrato e comandato dal browser.
     void setVfoInfo(double freqHz, const std::string& mode);
 
+    // Ultimi decode FT8/FT4 (oggetto JSON gia' formattato), letti da /api/ft8.
+    void setFt8Json(const std::string& json);
+
     // Audio demodulato dal host (mono, 48 kHz): distribuito a tutti i
     // client collegati a /api/audio.wav, ognuno con la propria coda.
     void pushAudio(const float* mono, size_t n);
@@ -98,6 +101,7 @@ private:
     std::string vfoMode_ = "Spento";
     uint16_t wsPort_ = 0;
     std::string wsToken_;
+    std::string ft8Json_ = "{\"mode\":\"\",\"slot\":\"\",\"decodes\":[]}";
 
     // Code audio per-client (16 bit, 48 kHz mono).
     std::mutex audioMutex_;
