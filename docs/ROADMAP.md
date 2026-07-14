@@ -273,6 +273,19 @@ Fatti (17a tornata, sintonia col frequenzimetro come SDR#):
   grezzo, quindi basta poco: cosi' il segnale sintonizzato resta al centro
   dello spettro invece che fisso a ~60%.
 
+Fatti (29a tornata, Dispositivo compatto + spettro stile SDR++):
+
+- ✅ **Sottomenu Dispositivo richiudibili**: "Chiavetta" e "Registrazione"
+  (IQ + pianificata) ora sono header a tendina CHIUSI di default, cosi' la
+  colonna di sinistra resta compatta. Restano visibili solo frequenza,
+  sample rate e Avvia/Ferma.
+- ✅ **Traccia spettro anti-aliased**: la curva e' disegnata con una
+  polilinea unica sfumata (AddPolyline) invece di segmenti spezzati: linea
+  liscia e pulita come su SDR++/SDR#, con alone e riempimento a gradiente.
+- ✅ **Morbidezza (smoothing)**: nuovo cursore in "Regolazioni" che liscia
+  la traccia nel tempo (EMA) senza nascondere i segnali; il valore e'
+  salvato in sdrjo.cfg.
+
 Fatti (28a tornata, FT8 evoluto: sottrazione, log, marcatori, interazione):
 
 - ✅ **Sottrazione multi-passaggio** (il salto di sensibilita' piu' grosso):

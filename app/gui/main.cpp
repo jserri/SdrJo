@@ -224,6 +224,8 @@ struct AppState : public sdrjo::IModuleHost {
     bool specAvgOn = false;
     bool specMaxOn = false;
     std::vector<float> specAvg, specMax;
+    std::vector<float> specDisp;      // lisciamento temporale per il disegno
+    float specSmooth = 0.45f;         // 0 = istantaneo, 1 = molto morbido
 
     // Presa sull'audio demodulato per lo spettro audio (2048 campioni).
     std::mutex audioTapMutex;
@@ -480,6 +482,8 @@ void loadConfig(AppState& app)
             app.schedDurMin = std::clamp(iv, 1, 720);
         else if (std::sscanf(line, "sched_wav=%d", &iv) == 1)
             app.schedWav = iv != 0;
+        else if (std::sscanf(line, "spec_smooth=%lf", &v) == 1)
+            app.specSmooth = std::clamp(float(v), 0.0f, 0.9f);
     }
     std::fclose(f);
 }
@@ -495,7 +499,7 @@ void saveConfig(AppState& app)
                  "decoder_squelch=%.3f\nsnap_to_peak=%d\nwf_palette=%d\n"
                  "light_theme=%d\nui_density=%d\n"
                  "sched_enabled=%d\nsched_hour=%d\nsched_min=%d\n"
-                 "sched_dur_min=%d\nsched_wav=%d\n",
+                 "sched_dur_min=%d\nsched_wav=%d\nspec_smooth=%.2f\n",
                  app.stationLat, app.stationLon, app.freqMHz,
                  int(app.listenMode), app.listenBwHz, double(app.volume),
                  app.snapHz, double(app.uiScale), double(app.decoderSquelch),
@@ -1087,9 +1091,8 @@ void drawDeviceSection(AppState& app)
             app.rtl = nullptr;
         }
 
-        // Controlli della chiavetta (stile SDR++).
-        if (app.rtl) {
-            ImGui::SeparatorText("Chiavetta");
+        // Controlli della chiavetta (stile SDR++), in un sottomenu richiudibile.
+        if (app.rtl && ImGui::CollapsingHeader("Chiavetta")) {
             if (ImGui::Checkbox("AGC del tuner", &app.tunerAgc)) {
                 app.rtl->setGain(app.tunerAgc ? -1.0 : double(app.gainDb));
                 if (app.tunerAgc) app.gainDb = -1.0f;
@@ -1166,7 +1169,8 @@ void drawDeviceSection(AppState& app)
         }
 
 
-        ImGui::SeparatorText("Registrazione IQ");
+        if (ImGui::CollapsingHeader("Registrazione")) {
+        ImGui::SeparatorText("IQ");
         if (!app.recorder.isRecording()) {
             if (ImGui::Button("Registra")) {
                 char name[64];
@@ -1189,7 +1193,7 @@ void drawDeviceSection(AppState& app)
         // Registrazione pianificata: si arma per un orario e si ferma da
         // sola dopo la durata scelta. Comoda per registrare un passaggio
         // satellite o un bollettino a orario fisso senza stare al PC.
-        ImGui::SeparatorText("Registrazione pianificata");
+        ImGui::SeparatorText("Pianificata");
         bool schedChanged = false;
         schedChanged |= ImGui::Checkbox("Attiva pianificazione",
                                         &app.schedEnabled);
@@ -1231,6 +1235,7 @@ void drawDeviceSection(AppState& app)
                                     app.schedHour, app.schedMin);
             }
         }
+        } // fine sottomenu "Registrazione"
     }
 
     // Replay di una registrazione (disponibile anche senza hardware).
@@ -1847,6 +1852,11 @@ void drawSpectrumPanel(AppState& app)
         ImGui::SameLine();
         if (ImGui::SmallButton("Azzera max")) app.specMax.clear();
         ImGui::SameLine();
+        ImGui::SetNextItemWidth(90);
+        ImGui::SliderFloat("Morbidezza", &app.specSmooth, 0.0f, 0.9f, "%.2f");
+        helpTip("Lisciamento della traccia dello spettro nel tempo: piu' alto "
+                "= piu' fluido (come SDR++/SDR#), 0 = istantaneo.");
+        ImGui::SameLine();
         if (ImGui::SmallButton("Screenshot")) app.screenshotReq = true;
         helpTip("Salva un'immagine BMP della finestra accanto "
                 "all'eseguibile (nome con data e ora).");
@@ -2020,64 +2030,96 @@ void drawSpectrumPanel(AppState& app)
                     app.specMax[i] = std::max(app.specMax[i], raw[i]);
         }
 
+        // Lisciamento temporale del disegno (indipendente dalla "Media"):
+        // una EMA leggera rende la traccia fluida come su SDR++/SDR# senza
+        // nascondere i segnali. La sorgente e' raw (o la Media se attiva).
+        const float* base = (app.specAvgOn && app.specAvg.size() == n)
+                                ? app.specAvg.data()
+                                : raw;
+        const float* main = base;
+        if (app.specSmooth > 0.02f) {
+            float alpha = std::clamp(1.0f - app.specSmooth, 0.06f, 1.0f);
+            if (app.specDisp.size() != n)
+                app.specDisp.assign(base, base + n);
+            else
+                for (size_t i = 0; i < n; i++)
+                    app.specDisp[i] += alpha * (base[i] - app.specDisp[i]);
+            main = app.specDisp.data();
+        }
+
         // Mappa i pixel sui bin della finestra di vista (zoom incluso).
         const double startBin = (v0 - f0) / (f1 - f0) * double(n);
         const double binsPerPx = (v1 - v0) / (f1 - f0) * double(n) / w;
-        // Traccia moderna: riempimento a gradiente verticale (brillante
-        // sulla curva, sfuma verso il basso) + alone (glow) sotto la linea.
-        auto plotTrace = [&](const float* src, ImU32 line, ImU32 glow,
-                             ImU32 fillTop, ImU32 fillBot, bool withFill,
-                             float thickness) {
-            float prevY = 0;
-            for (int px = 0; px < int(w); px++) {
+        // Traccia moderna: riempimento a gradiente verticale + linea unica
+        // anti-aliased (AddPolyline), come nei migliori SDR desktop.
+        static std::vector<ImVec2> pts;
+        auto sampleAt = [&](int px) -> float {
+            if (binsPerPx >= 1.0) {
+                size_t b0 = size_t(std::max(0.0, startBin + px * binsPerPx));
+                size_t b1 = std::max(
+                    b0 + 1,
+                    size_t(std::max(0.0, startBin + (px + 1) * binsPerPx)));
                 float v = -160.0f;
-                if (binsPerPx >= 1.0) {
-                    // Vista larga: massimo dei bin che cadono nel pixel.
-                    size_t b0 =
-                        size_t(std::max(0.0, startBin + px * binsPerPx));
-                    size_t b1 = std::max(
-                        b0 + 1, size_t(std::max(
-                                    0.0, startBin + (px + 1) * binsPerPx)));
-                    for (size_t b = b0; b < b1 && b < n; b++)
-                        v = std::max(v, src[b]);
-                } else {
-                    // Zoom spinto: interpolazione lineare tra bin, cosi'
-                    // la traccia resta una linea liscia (niente gradini).
-                    double bp = startBin + (double(px) + 0.5) * binsPerPx -
-                                0.5;
-                    bp = std::clamp(bp, 0.0, double(n - 1));
-                    size_t b = size_t(bp);
-                    double fr = bp - double(b);
-                    float a = src[b];
-                    float c = src[std::min(b + 1, n - 1)];
-                    v = float(a * (1.0 - fr) + c * fr);
-                }
-                float y = yOf(v);
-                if (withFill)
-                    dl->AddRectFilledMultiColor(
-                        ImVec2(s0.x + px, y), ImVec2(s0.x + px + 1, s1.y),
-                        fillTop, fillTop, fillBot, fillBot);
-                if (px > 0) {
-                    ImVec2 a(s0.x + px - 1, prevY), c(s0.x + px, y);
-                    if (glow) dl->AddLine(a, c, glow, thickness * 3.2f);
-                    dl->AddLine(a, c, line, thickness);
-                }
-                prevY = y;
+                for (size_t b = b0; b < b1 && b < n; b++)
+                    v = std::max(v, main[b]);
+                return v;
             }
+            double bp = startBin + (double(px) + 0.5) * binsPerPx - 0.5;
+            bp = std::clamp(bp, 0.0, double(n - 1));
+            size_t b = size_t(bp);
+            double fr = bp - double(b);
+            return float(main[b] * (1.0 - fr) + main[std::min(b + 1, n - 1)] * fr);
         };
 
         const auto& pal = sdrjo::gui::palette();
         auto col = [](ImVec4 v, float a) {
             v.w = a; return ImGui::GetColorU32(v);
         };
-        if (app.specMaxOn && app.specMax.size() == n)
-            plotTrace(app.specMax.data(), col(pal.warn, 0.6f), 0, 0, 0, false,
-                      1.0f);
-        const float* main = (app.specAvgOn && app.specAvg.size() == n)
-                                ? app.specAvg.data()
-                                : raw;
-        plotTrace(main, col(pal.acc, 1.0f), col(pal.acc, 0.15f),
-                  col(pal.acc, 0.34f), col(pal.acc, 0.0f), true, 1.5f);
+
+        // Riempimento a gradiente sotto la curva (per colonna di pixel).
+        ImU32 fillTop = col(pal.acc, 0.34f), fillBot = col(pal.acc, 0.0f);
+        pts.clear();
+        pts.reserve(size_t(w) + 1);
+        for (int px = 0; px < int(w); px++) {
+            float y = yOf(sampleAt(px));
+            dl->AddRectFilledMultiColor(ImVec2(s0.x + px, y),
+                                        ImVec2(s0.x + px + 1, s1.y),
+                                        fillTop, fillTop, fillBot, fillBot);
+            pts.push_back(ImVec2(s0.x + px, y));
+        }
+        // Alone (glow) + linea principale, entrambe anti-aliased.
+        if (pts.size() >= 2) {
+            dl->AddPolyline(pts.data(), int(pts.size()), col(pal.acc, 0.16f),
+                            ImDrawFlags_None, 4.5f);
+            dl->AddPolyline(pts.data(), int(pts.size()), col(pal.acc, 1.0f),
+                            ImDrawFlags_None, 1.6f);
+        }
+
+        // Max-hold come linea sottile sopra (se attiva).
+        if (app.specMaxOn && app.specMax.size() == n) {
+            static std::vector<ImVec2> mpts;
+            mpts.clear();
+            for (int px = 0; px < int(w); px++) {
+                float v = -160.0f;
+                if (binsPerPx >= 1.0) {
+                    size_t b0 = size_t(std::max(0.0, startBin + px * binsPerPx));
+                    size_t b1 = std::max(
+                        b0 + 1,
+                        size_t(std::max(0.0, startBin + (px + 1) * binsPerPx)));
+                    for (size_t b = b0; b < b1 && b < n; b++)
+                        v = std::max(v, app.specMax[b]);
+                } else {
+                    double bp = startBin + (double(px) + 0.5) * binsPerPx - 0.5;
+                    bp = std::clamp(bp, 0.0, double(n - 1));
+                    size_t b = size_t(bp);
+                    v = app.specMax[b];
+                }
+                mpts.push_back(ImVec2(s0.x + px, yOf(v)));
+            }
+            if (mpts.size() >= 2)
+                dl->AddPolyline(mpts.data(), int(mpts.size()),
+                                col(pal.warn, 0.6f), ImDrawFlags_None, 1.0f);
+        }
     }
 
     // Marker del VFO di ascolto: banda evidenziata, bordi trascinabili.
